@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package fwdcim.v1;
+
+import "proto/v1/telemetry.proto";
+
+option go_package = "github.com/faberwork/fwdcim/proto/v1;v1";
+
+message PushResponse {
+  bool   accepted     = 1;
+  string reason       = 2; // populated on reject
+  uint32 queue_depth  = 3; // DCS ingest queue depth — backpressure signal
+}
+
+// BatchRequest carries N packets in a single RPC call. Used by EDR/IDR for
+// high-throughput batched ingest — far cheaper than per-packet streaming.
+message BatchRequest {
+  repeated TelemetryPacket packets = 1;
+}
+
+// BatchResponse reports per-batch results.
+message BatchResponse {
+  uint32 accepted    = 1;
+  uint32 rejected    = 2;
+  uint32 queue_depth = 3; // backpressure signal
+  string reason      = 4; // populated when accepted == 0 and rejected > 0
+}
+
+service IngestService {
+  // Push sends a single packet — used by IDR/EDR for low-rate metrics.
+  rpc Push(TelemetryPacket) returns (PushResponse);
+  // PushStream streams packets — used for high-throughput interface counters.
+  rpc PushStream(stream TelemetryPacket) returns (PushResponse);
+  // BatchPush ingests N packets in one unary RPC — preferred for high
+  // throughput. Cheaper than streaming because we amortize gRPC headers,
+  // proto framing, and DB batching across the whole batch.
+  rpc BatchPush(BatchRequest) returns (BatchResponse);
+}

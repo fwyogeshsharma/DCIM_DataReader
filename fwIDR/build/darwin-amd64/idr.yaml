@@ -1,0 +1,30 @@
+identity:
+  org_id:        "org-abc"
+  datacenter_id: "dc-east-1"
+  floor_id:      "floor-3"
+  network_id:    "net-compute"
+  group_id:      "grp-servers"
+  reader_id:     ""           # auto: idr-<version>-<hostname>
+
+dcs:
+  endpoint: "localhost:9090"
+  tls:
+    insecure: true            # dev only — set cert/key/ca for production
+
+queue:
+  path:      ""               # auto: /var/lib/fwdcim/idr/queue.db
+  max_bytes: 536870912        # 512 MB
+
+collectors:
+  interval_ms: 15000
+  enable:
+    - cpu
+    - memory
+    - disk
+    - network
+    - temperature
+    - os
+
+log:
+  level:  "info"
+  format: "console"           # console | json

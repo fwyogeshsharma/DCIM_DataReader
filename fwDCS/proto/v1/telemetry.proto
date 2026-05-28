@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package fwdcim.v1;
+
+option go_package = "github.com/faberwork/fwdcim/proto/v1;v1";
+
+// TelemetryPacket is the canonical envelope for every metric, event, log,
+// or alarm emitted by IDR or EDR and ingested by DCS.
+message TelemetryPacket {
+  string id            = 1;  // UUIDv7 — generated at source
+  string org_id        = 2;  // from reader config
+  string datacenter_id = 3;  // from reader config
+  string floor_id      = 4;  // from reader config
+  string network_id    = 5;  // from reader config
+  string group_id      = 6;  // from reader config
+  string source_type   = 7;  // "host" | "device"
+  string source_id     = 8;  // hostname, MAC, serial, mgmt IP
+  string reader_id     = 9;  // "idr-<version>" | "edr-<version>"
+  int64  timestamp_ns  = 10; // Unix nanoseconds, UTC
+  string name          = 11; // metric/event name  e.g. "sys.cpu_pct"
+  string tag           = 12; // secondary key — if_index for IF-MIB, "" otherwise
+  double value         = 13;
+  map<string, string> meta = 14; // if_name, vendor_mib, source (SNMP|gNMI), etc.
+  // kind: "metric" | "event" | "trap" | "alarm"
+  string kind          = 15;
+  // severity (events/traps only): "informational" | "minor" | "major" | "critical"
+  string severity      = 16;
+  bytes  signature     = 17; // ed25519 over canonical fields
+  uint64 nonce         = 18; // monotonic per source_id — replay protection
+}

@@ -1,0 +1,703 @@
+// Package forwarder implements the DCS→Aggregator incremental push loop.
+//
+// Design:
+//   - Runs in a background goroutine; wakes on a configurable interval.
+//   - Four independent cursors (devices, metrics, topology, events) stored in
+//     the forwarder_cursors table so a DCS restart resumes exactly where it
+//     left off without replaying data.
+//   - Each push cycle:
+//     1. Load cursors from DB.
+//     2. Query each table for rows newer than the cursor (ORDER BY ts/updated_at ASC, LIMIT N).
+//     3. Build a single Aggregator JSON payload: devices nested with their
+//     interfaces, addresses, and recent metrics; topology_links resolved
+//     to hostnames; events with source hostname.
+//     4. POST to the Aggregator endpoint with the required headers.
+//     5. On success advance each cursor to the latest timestamp in that batch.
+//     On HTTP 5xx or network error retry up to 3 times with backoff before
+//     giving up (the next tick will retry the same batch).
+//   - If all four tables return zero rows, the push is skipped to avoid empty
+//     requests.
+package forwarder
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/faberwork/fwdcs/internal/store"
+	"github.com/faberwork/fwdcs/pkg/config"
+)
+
+// ─── Aggregator payload structs ───────────────────────────────────────────────
+
+type aggPayload struct {
+	OrgID         string        `json:"org_id"`
+	DatacenterID  string        `json:"datacenter_id"`
+	FloorID       string        `json:"floor_id"`
+	NetworkID     string        `json:"network_id"`
+	GroupID       string        `json:"group_id"`
+	Devices       []aggDevice   `json:"devices"`
+	TopologyLinks []aggTopoLink `json:"topology_links"`
+	Events        []aggEvent    `json:"events"`
+}
+
+type aggDevice struct {
+	ID             string         `json:"id"`
+	Hostname       string         `json:"hostname"`
+	DeviceType     string         `json:"device_type"`
+	Vendor         string         `json:"vendor,omitempty"`
+	ModelName      string         `json:"model_name,omitempty"`
+	OSName         string         `json:"os_name,omitempty"`
+	OSVersion      string         `json:"os_version,omitempty"`
+	SysOID         string         `json:"sys_oid,omitempty"`
+	SysDescription string         `json:"sys_description,omitempty"`
+	SysLocation    string         `json:"sys_location,omitempty"`
+	MgmtIP         string         `json:"mgmt_ip,omitempty"`
+	ProdIP         string         `json:"prod_ip,omitempty"`
+	LoopbackIP     string         `json:"loopback_ip,omitempty"`
+	OOBIP          string         `json:"oob_ip,omitempty"`
+	SNMPEnabled    bool           `json:"snmp_enabled"`
+	GNMIEnabled    bool           `json:"gnmi_enabled"`
+	SNMPPort       int            `json:"snmp_port,omitempty"`
+	SNMPVersion    int            `json:"snmp_version,omitempty"`
+	GNMIPort       int            `json:"gnmi_port,omitempty"`
+	CollectorAgent string         `json:"collector_agent,omitempty"`
+	IsReachable    bool           `json:"is_reachable"`
+	Country        string         `json:"country,omitempty"`
+	DatacenterCity string         `json:"datacenter_city,omitempty"`
+	Datacenter     string         `json:"datacenter,omitempty"`
+	Room           string         `json:"room,omitempty"`
+	RackRow        *int           `json:"rack_row,omitempty"`
+	RackNum        *int           `json:"rack_num,omitempty"`
+	RackUnit       *int           `json:"rack_unit,omitempty"`
+	PowerDrawW     *int           `json:"power_draw_w,omitempty"`
+	Interfaces     []aggInterface `json:"interfaces,omitempty"`
+	Metrics        []aggMetric    `json:"metrics,omitempty"`
+}
+
+type aggInterface struct {
+	ID                string       `json:"id"`
+	DeviceID          string       `json:"device_id"`
+	InterfaceName     string       `json:"interface_name"`
+	InterfaceIndex    *int         `json:"interface_index,omitempty"`
+	Description       string       `json:"interface_description,omitempty"`
+	Type              string       `json:"interface_type,omitempty"`
+	MACAddress        string       `json:"interface_mac_address,omitempty"`
+	SpeedMbps         *int         `json:"speed_mbps,omitempty"`
+	AdminStatus       int          `json:"admin_status"`
+	OperationalStatus int          `json:"operational_status"`
+	AccessVlanID      *int         `json:"access_vlan_id,omitempty"`
+	MTUBytes          *int         `json:"mtu_bytes,omitempty"`
+	Addresses         []aggAddress `json:"addresses,omitempty"`
+}
+
+type aggAddress struct {
+	ID            string `json:"id"`
+	InterfaceID   string `json:"interface_id"`
+	Address       string `json:"address"`
+	AddressFamily string `json:"address_family,omitempty"`
+	IsPrimary     bool   `json:"is_primary"`
+	VRF           string `json:"vrf,omitempty"`
+}
+
+type aggMetric struct {
+	DeviceID          string          `json:"device_id"`
+	InterfaceID       string          `json:"interface_id,omitempty"`
+	MetricName        string          `json:"metric_name"`
+	Value             float64         `json:"value"`
+	Tag               string          `json:"tag,omitempty"`
+	Attributes        json.RawMessage `json:"attributes,omitempty"`
+	CollectorAgent    string          `json:"collector_agent,omitempty"`
+	CollectorProtocol string          `json:"collector_protocol,omitempty"`
+	InterfaceName     string          `json:"interface_name,omitempty"`
+	TS                string          `json:"ts,omitempty"` // RFC3339
+}
+
+type aggTopoLink struct {
+	ID             string `json:"id"`
+	Layer          string `json:"layer"`
+	SrcDeviceID    string `json:"src_device_id"`
+	SrcInterfaceID string `json:"src_interface_id,omitempty"`
+	SrcHostname    string `json:"src_hostname"`
+	SrcPortName    string `json:"src_port_name,omitempty"`
+	DstDeviceID    string `json:"dst_device_id"`
+	DstInterfaceID string `json:"dst_interface_id,omitempty"`
+	DstHostname    string `json:"dst_hostname"`
+	DstPortName    string `json:"dst_port_name,omitempty"`
+	LinkSpeedMbps  *int   `json:"link_speed_mbps,omitempty"`
+	LinkType       string `json:"link_type,omitempty"`
+	Protocol       string `json:"protocol,omitempty"`
+	Relation       string `json:"relation,omitempty"` // uplink (dst=parent) | downlink (dst=child) | peer
+	IsActive       bool   `json:"is_active"`
+}
+
+type aggEvent struct {
+	ID             string          `json:"id"`
+	DeviceID       string          `json:"device_id,omitempty"`
+	Hostname       string          `json:"hostname"`
+	Kind           string          `json:"kind"`
+	EventName      string          `json:"event_name"`
+	Severity       string          `json:"severity"`
+	TrapOID        string          `json:"trap_oid,omitempty"`
+	SourceIP       string          `json:"source_ip,omitempty"`
+	CollectorAgent string          `json:"collector_agent,omitempty"`
+	TS             string          `json:"ts"` // RFC3339
+	Payload        json.RawMessage `json:"payload,omitempty"`
+}
+
+// aggResponse is the Aggregator's success envelope.
+type aggResponse struct {
+	Success  bool   `json:"success"`
+	Message  string `json:"message,omitempty"`
+	Ingested struct {
+		Devices       int `json:"devices"`
+		TopologyLinks int `json:"topology_links"`
+		Events        int `json:"events"`
+	} `json:"ingested"`
+}
+
+// ─── Forwarder ────────────────────────────────────────────────────────────────
+
+// Forwarder pushes new data from DCS to the Aggregator on a configurable tick.
+type Forwarder struct {
+	db     *store.DB
+	cfg    config.AggregatorConfig
+	log    *zap.Logger
+	client *http.Client
+}
+
+// New constructs a Forwarder. Call Run in a goroutine to start it.
+func New(db *store.DB, cfg config.AggregatorConfig, log *zap.Logger) *Forwarder {
+	return &Forwarder{
+		db:  db,
+		cfg: cfg,
+		log: log,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+// Run loops until ctx is cancelled, pushing incremental batches to the
+// Aggregator on each tick.
+func (f *Forwarder) Run(ctx context.Context) {
+	interval := time.Duration(f.cfg.IntervalMs) * time.Millisecond
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+
+	// Short initial delay — let the ingest pipeline populate the DB before
+	// the first push so we don't send an empty payload on startup.
+	select {
+	case <-time.After(15 * time.Second):
+	case <-ctx.Done():
+		return
+	}
+
+	f.log.Info("aggregator forwarder started",
+		zap.String("endpoint", f.cfg.Endpoint),
+		zap.Duration("interval", interval))
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := f.push(ctx); err != nil {
+				f.log.Warn("aggregator forwarder push failed", zap.Error(err))
+			}
+		}
+	}
+}
+
+// push executes one full push cycle: query → build payload → POST → advance cursors.
+func (f *Forwarder) push(ctx context.Context) error {
+	batchLimit := f.cfg.BatchLimit
+	if batchLimit <= 0 {
+		batchLimit = 1000
+	}
+	metricLimit := batchLimit * 50 // metrics volume >> device volume
+
+	// ── 1. Load cursors ──────────────────────────────────────────────────────
+	devCursor, _ := f.db.GetForwarderCursor(ctx, "devices")
+	metricsCursor, _ := f.db.GetForwarderCursor(ctx, "metrics")
+	topoCursor, _ := f.db.GetForwarderCursor(ctx, "topology")
+	eventsCursor, _ := f.db.GetForwarderCursor(ctx, "events")
+
+	// ── 2. Query data ─────────────────────────────────────────────────────────
+	changedDevices, err := f.db.DevicesUpdatedSince(ctx,
+		f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID,
+		devCursor, batchLimit)
+	if err != nil {
+		return fmt.Errorf("devices query: %w", err)
+	}
+
+	recentMetrics, err := f.db.MetricsSince(ctx,
+		f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID,
+		metricsCursor, metricLimit)
+	if err != nil {
+		return fmt.Errorf("metrics query: %w", err)
+	}
+
+	topoLinks, err := f.db.TopologyLinksSince(ctx,
+		f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID,
+		topoCursor, batchLimit)
+	if err != nil {
+		return fmt.Errorf("topology query: %w", err)
+	}
+
+	events, err := f.db.EventsSince(ctx,
+		f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID,
+		eventsCursor, batchLimit)
+	if err != nil {
+		return fmt.Errorf("events query: %w", err)
+	}
+
+	// ── 3. Group metrics by device_id; hydrate extra devices ─────────────────
+	metricsByDevice := make(map[string][]store.FwdMetric, len(recentMetrics))
+	for _, m := range recentMetrics {
+		metricsByDevice[m.DeviceID] = append(metricsByDevice[m.DeviceID], m)
+	}
+
+	// Devices that only appear in the metrics delta (device row not updated)
+	// need to be fetched separately so we can include them in the payload.
+	changedIDs := make(map[string]bool, len(changedDevices))
+	for _, d := range changedDevices {
+		changedIDs[d.ID] = true
+	}
+	var extraIDs []string
+	for devID := range metricsByDevice {
+		if !changedIDs[devID] {
+			extraIDs = append(extraIDs, devID)
+		}
+	}
+	extraDevices, err := f.db.DevicesByIDs(ctx, extraIDs)
+	if err != nil {
+		return fmt.Errorf("extra devices query: %w", err)
+	}
+
+	allDevices := append(changedDevices, extraDevices...)
+
+	// Skip entirely when nothing changed.
+	if len(allDevices) == 0 && len(topoLinks) == 0 && len(events) == 0 {
+		return nil
+	}
+
+	// ── 3b. Hydrate topology-link endpoint devices ───────────────────────────
+	// The Aggregator drops any topology link whose src/dst hostname is not also
+	// present as a device in the SAME payload. At steady state the device delta
+	// is empty while topology links keep flowing, so without this the links are
+	// silently rejected (the "topology in DCS but 0 at Aggregator" symptom).
+	// Pull every link endpoint device (idempotent upsert at the Aggregator) so
+	// each same-scope link travels with both its devices.
+	seen := make(map[string]bool, len(allDevices))
+	for _, d := range allDevices {
+		seen[d.ID] = true
+	}
+	if len(topoLinks) > 0 {
+		hostSet := make(map[string]struct{}, len(topoLinks)*2)
+		for _, tl := range topoLinks {
+			if tl.SrcHostname != "" {
+				hostSet[tl.SrcHostname] = struct{}{}
+			}
+			if tl.DstHostname != "" {
+				hostSet[tl.DstHostname] = struct{}{}
+			}
+		}
+		hostnames := make([]string, 0, len(hostSet))
+		for h := range hostSet {
+			hostnames = append(hostnames, h)
+		}
+		linkDevices, err := f.db.DevicesByHostnames(ctx,
+			f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID, hostnames)
+		if err != nil {
+			return fmt.Errorf("link-endpoint devices query: %w", err)
+		}
+		for _, d := range linkDevices {
+			if !seen[d.ID] {
+				seen[d.ID] = true
+				allDevices = append(allDevices, d)
+			}
+		}
+	}
+
+	// ── 4. Fetch interfaces + addresses for all devices in scope ─────────────
+	allDeviceIDs := make([]string, 0, len(allDevices))
+	for _, d := range allDevices {
+		allDeviceIDs = append(allDeviceIDs, d.ID)
+	}
+
+	ifaces, err := f.db.InterfacesByDeviceIDs(ctx, allDeviceIDs)
+	if err != nil {
+		return fmt.Errorf("interfaces query: %w", err)
+	}
+
+	ifacesByDevice := make(map[string][]store.FwdInterface, len(allDevices))
+	ifaceIDs := make([]string, 0, len(ifaces))
+	for _, i := range ifaces {
+		ifacesByDevice[i.DeviceID] = append(ifacesByDevice[i.DeviceID], i)
+		ifaceIDs = append(ifaceIDs, i.ID)
+	}
+
+	addrs, err := f.db.AddressesByInterfaceIDs(ctx, ifaceIDs)
+	if err != nil {
+		return fmt.Errorf("addresses query: %w", err)
+	}
+	addrsByIface := make(map[string][]store.FwdAddress, len(ifaceIDs))
+	for _, a := range addrs {
+		addrsByIface[a.InterfaceID] = append(addrsByIface[a.InterfaceID], a)
+	}
+
+	// ── 5. Build per-scope payloads ───────────────────────────────────────────
+	// The Aggregator requires one (datacenter_id, floor_id) scope per payload
+	// and upserts devices by org+datacenter+floor+network+group+hostname. Our
+	// devices carry per-device dc/floor, so we group everything by that scope
+	// and emit one payload per group.
+	payloads := f.buildPayloads(
+		allDevices, ifacesByDevice, addrsByIface,
+		metricsByDevice, topoLinks, events,
+	)
+	if len(payloads) == 0 {
+		return nil
+	}
+
+	// ── 6. POST each scope in parallel. Scopes are disjoint (different
+	// datacenter/floor → different devices), so concurrent ingests don't conflict.
+	// If ANY scope fails we return an error and advance no cursors, so the next
+	// tick retries the whole batch — upserts are idempotent. ──────────────────
+	var (
+		mu       sync.Mutex
+		firstErr error
+		totDev   int
+		totTopo  int
+		totEv    int
+		wg       sync.WaitGroup
+	)
+	for _, payload := range payloads {
+		payload := payload
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := f.postWithRetry(ctx, payload)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				return
+			}
+			totDev += resp.Ingested.Devices
+			totTopo += resp.Ingested.TopologyLinks
+			totEv += resp.Ingested.Events
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+
+	f.log.Info("aggregator forwarder push ok",
+		zap.Int("scopes", len(payloads)),
+		zap.Int("devices", totDev),
+		zap.Int("topology_links", totTopo),
+		zap.Int("events", totEv))
+
+	// ── 7. Advance cursors (only when the batch was non-empty) ────────────────
+	if len(changedDevices) > 0 {
+		_ = f.db.SetForwarderCursor(ctx, "devices", changedDevices[len(changedDevices)-1].UpdatedAt)
+	}
+	if len(recentMetrics) > 0 {
+		_ = f.db.SetForwarderCursor(ctx, "metrics", recentMetrics[len(recentMetrics)-1].TS)
+	}
+	if len(topoLinks) > 0 {
+		_ = f.db.SetForwarderCursor(ctx, "topology", topoLinks[len(topoLinks)-1].UpdatedAt)
+	}
+	if len(events) > 0 {
+		_ = f.db.SetForwarderCursor(ctx, "events", events[len(events)-1].TS)
+	}
+
+	return nil
+}
+
+// scopeKey identifies one (datacenter_id, floor_id) Aggregator payload scope.
+type scopeKey struct{ dc, floor string }
+
+// buildPayloads groups all query results by (datacenter_id, floor_id) and
+// returns one aggPayload per scope. The Aggregator upserts devices by
+// org+datacenter+floor+network+group+hostname and requires topology link
+// endpoints to share the payload, so each scope is shipped independently.
+func (f *Forwarder) buildPayloads(
+	devices []store.FwdDevice,
+	ifacesByDevice map[string][]store.FwdInterface,
+	addrsByIface map[string][]store.FwdAddress,
+	metricsByDevice map[string][]store.FwdMetric,
+	topoLinks []store.FwdTopologyLink,
+	events []store.FwdEvent,
+) []*aggPayload {
+
+	groups := make(map[scopeKey]*aggPayload)
+	// hostname → scope, so topology links can be placed only when both endpoints
+	// resolve to the same (dc,floor) payload.
+	hostScope := make(map[string]scopeKey, len(devices))
+	for _, d := range devices {
+		hostScope[d.Hostname] = scopeKey{d.DatacenterID, d.FloorID}
+	}
+	getGroup := func(dc, floor string) *aggPayload {
+		k := scopeKey{dc, floor}
+		p := groups[k]
+		if p == nil {
+			p = &aggPayload{
+				OrgID:         f.cfg.OrgID,
+				DatacenterID:  dc,
+				FloorID:       floor,
+				NetworkID:     f.cfg.NetworkID,
+				GroupID:       f.cfg.GroupID,
+				Devices:       make([]aggDevice, 0),
+				TopologyLinks: make([]aggTopoLink, 0),
+				Events:        make([]aggEvent, 0),
+			}
+			groups[k] = p
+		}
+		return p
+	}
+
+	// Devices (with nested interfaces, addresses, metrics) → scope by dc/floor.
+	for _, d := range devices {
+		ad := aggDevice{
+			ID:             d.ID,
+			Hostname:       d.Hostname,
+			DeviceType:     d.DeviceType,
+			Vendor:         d.Vendor,
+			ModelName:      d.ModelName,
+			OSName:         d.OSName,
+			OSVersion:      d.OSVersion,
+			SysOID:         d.SysOID,
+			SysDescription: d.SysDescr,
+			SysLocation:    d.SysLocation,
+			MgmtIP:         d.MgmtIP,
+			ProdIP:         d.ProdIP,
+			LoopbackIP:     d.LoopbackIP,
+			OOBIP:          d.OOBIP,
+			SNMPEnabled:    d.SNMPEnabled,
+			GNMIEnabled:    d.GNMIEnabled,
+			SNMPPort:       d.SNMPPort,
+			SNMPVersion:    d.SNMPVersion,
+			GNMIPort:       d.GNMIPort,
+			CollectorAgent: d.CollectorAgent,
+			IsReachable:    d.IsReachable,
+			Country:        d.Country,
+			DatacenterCity: d.DatacenterCity,
+			Datacenter:     d.Datacenter,
+			Room:           d.Room,
+			RackRow:        d.RackRow,
+			RackNum:        d.RackNum,
+			RackUnit:       d.RackUnit,
+			PowerDrawW:     d.PowerDrawW,
+			Interfaces:     make([]aggInterface, 0),
+			Metrics:        make([]aggMetric, 0),
+		}
+		for _, iface := range ifacesByDevice[d.ID] {
+			ai := aggInterface{
+				ID:                iface.ID,
+				DeviceID:          iface.DeviceID,
+				InterfaceName:     iface.InterfaceName,
+				InterfaceIndex:    iface.InterfaceIndex,
+				Description:       iface.Description,
+				Type:              iface.Type,
+				MACAddress:        iface.MACAddress,
+				SpeedMbps:         iface.SpeedMbps,
+				AdminStatus:       iface.AdminStatus,
+				OperationalStatus: iface.OperationalStatus,
+				AccessVlanID:      iface.AccessVlanID,
+				MTUBytes:          iface.MTUBytes,
+				Addresses:         make([]aggAddress, 0),
+			}
+			for _, addr := range addrsByIface[iface.ID] {
+				ai.Addresses = append(ai.Addresses, aggAddress{
+					ID:            addr.ID,
+					InterfaceID:   addr.InterfaceID,
+					Address:       addr.Address,
+					AddressFamily: addr.AddressFamily,
+					IsPrimary:     addr.IsPrimary,
+					VRF:           addr.VRF,
+				})
+			}
+			ad.Interfaces = append(ad.Interfaces, ai)
+		}
+		for _, m := range metricsByDevice[d.ID] {
+			am := aggMetric{
+				DeviceID:          m.DeviceID,
+				InterfaceID:       m.InterfaceID,
+				MetricName:        m.MetricName,
+				Value:             m.Value,
+				Tag:               m.Tag,
+				CollectorAgent:    m.CollectorAgent,
+				CollectorProtocol: m.CollectorProtocol,
+				InterfaceName:     m.InterfaceName,
+				TS:                m.TS.UTC().Format(time.RFC3339),
+			}
+			if m.Attributes != "" && m.Attributes != "{}" {
+				am.Attributes = json.RawMessage(m.Attributes)
+			}
+			ad.Metrics = append(ad.Metrics, am)
+		}
+		g := getGroup(d.DatacenterID, d.FloorID)
+		g.Devices = append(g.Devices, ad)
+	}
+
+	// Topology links → only when BOTH endpoints resolve to the SAME scope and
+	// are present in this payload. The Aggregator requires both hostnames in one
+	// (dc,floor) payload and drops links otherwise, so cross-scope links
+	// (endpoints on different floors) cannot be represented and are skipped.
+	skippedCrossScope := 0
+	for _, tl := range topoLinks {
+		srcScope, okS := hostScope[tl.SrcHostname]
+		dstScope, okD := hostScope[tl.DstHostname]
+		if !okS || !okD || srcScope != dstScope {
+			skippedCrossScope++
+			continue
+		}
+		g := groups[srcScope] // exists: src device was added to it above
+		if g == nil {
+			skippedCrossScope++
+			continue
+		}
+		g.TopologyLinks = append(g.TopologyLinks, aggTopoLink{
+			ID:             tl.ID,
+			Layer:          tl.Layer,
+			SrcDeviceID:    tl.SrcDeviceID,
+			SrcInterfaceID: tl.SrcInterfaceID,
+			SrcHostname:    tl.SrcHostname,
+			SrcPortName:    tl.SrcPortName,
+			DstDeviceID:    tl.DstDeviceID,
+			DstInterfaceID: tl.DstInterfaceID,
+			DstHostname:    tl.DstHostname,
+			DstPortName:    tl.DstPortName,
+			LinkSpeedMbps:  tl.LinkSpeedMbps,
+			LinkType:       tl.LinkType,
+			Protocol:       tl.Protocol,
+			Relation:       tl.Relation,
+			IsActive:       tl.IsActive,
+		})
+	}
+	if skippedCrossScope > 0 {
+		f.log.Debug("forwarder: skipped cross-scope topology links (endpoints in different dc/floor)",
+			zap.Int("skipped", skippedCrossScope))
+	}
+
+	// Events → scope by device's dc/floor. Events with no resolved device
+	// (device_id NULL) have no scope and cannot be placed; skip them.
+	for _, ev := range events {
+		if ev.DatacenterID == "" && ev.FloorID == "" {
+			continue
+		}
+		ae := aggEvent{
+			ID:             ev.ID,
+			DeviceID:       ev.DeviceID,
+			Hostname:       ev.Hostname,
+			Kind:           ev.Kind,
+			EventName:      ev.EventName,
+			Severity:       ev.Severity,
+			TrapOID:        ev.TrapOID,
+			SourceIP:       ev.SourceIP,
+			CollectorAgent: ev.CollectorAgent,
+			TS:             ev.TS.UTC().Format(time.RFC3339),
+		}
+		if ev.Payload != "" && ev.Payload != "{}" {
+			ae.Payload = json.RawMessage(ev.Payload)
+		}
+		g := getGroup(ev.DatacenterID, ev.FloorID)
+		g.Events = append(g.Events, ae)
+	}
+
+	out := make([]*aggPayload, 0, len(groups))
+	for _, p := range groups {
+		out = append(out, p)
+	}
+	return out
+}
+
+// postWithRetry POSTs the payload to the Aggregator endpoint. Retries on
+// network errors and HTTP 5xx. Does not retry on 4xx (caller error).
+// Retry delays: 0s, 2s, 5s (3 attempts total).
+func (f *Forwarder) postWithRetry(ctx context.Context, payload *aggPayload) (*aggResponse, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
+
+	delays := []time.Duration{0, 2 * time.Second, 5 * time.Second}
+	var lastErr error
+
+	for attempt, delay := range delays {
+		if delay > 0 {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.cfg.Endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Ingest-Key", f.cfg.IngestKey)
+
+		resp, err := f.client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("attempt %d: POST: %w", attempt+1, err)
+			f.log.Warn("aggregator POST network error",
+				zap.Int("attempt", attempt+1),
+				zap.Error(err))
+			continue
+		}
+
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("attempt %d: HTTP %d: %s",
+				attempt+1, resp.StatusCode, truncate(string(respBody), 256))
+			f.log.Warn("aggregator returned error status",
+				zap.Int("attempt", attempt+1),
+				zap.Int("status", resp.StatusCode),
+				zap.String("body", truncate(string(respBody), 256)))
+			// Don't retry on 4xx — the payload is malformed or auth failed.
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				return nil, lastErr
+			}
+			continue
+		}
+
+		var ar aggResponse
+		if err := json.Unmarshal(respBody, &ar); err != nil {
+			return nil, fmt.Errorf("decode response: %w", err)
+		}
+		if !ar.Success {
+			return nil, fmt.Errorf("aggregator rejected: %s", ar.Message)
+		}
+		return &ar, nil
+	}
+
+	return nil, fmt.Errorf("all retries exhausted: %w", lastErr)
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}

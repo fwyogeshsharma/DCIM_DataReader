@@ -1,0 +1,162 @@
+package snmp
+
+import (
+	"fmt"
+	"hash/fnv"
+	"strings"
+	"time"
+
+	"github.com/gosnmp/gosnmp"
+
+	"github.com/faberwork/fwedr/internal/target"
+	"github.com/faberwork/fwedr/pkg/config"
+)
+
+// Client wraps a gosnmp session for one target.
+type Client struct {
+	g   *gosnmp.GoSNMP
+	cfg config.SNMPConfig
+}
+
+// ShardPort routes a device to one of N snmpsim responder ports by hashing its
+// community (= device IP): base + hash%N. Used by BOTH the poller and discovery
+// enrichment so a device's polls and walks hit the SAME responder and total load
+// is spread evenly — no single responder becomes a hotspot. shards<=1 disables
+// sharding → port 161 (original single-responder behavior).
+func ShardPort(community string, shards, base int) uint16 {
+	if shards <= 1 || base <= 0 {
+		return 161
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(community))
+	return uint16(base + int(h.Sum32()%uint32(shards)))
+}
+
+// NewClient creates and connects an SNMP session to the given target.
+func NewClient(t *target.Target, cfg config.SNMPConfig) (*Client, error) {
+	g := &gosnmp.GoSNMP{
+		Target:             t.IP,
+		Port:               ShardPort(t.Community, cfg.Shards, cfg.ShardBasePort),
+		Transport:          "udp",
+		Community:          t.Community,
+		Timeout:            time.Duration(cfg.Timeout) * time.Millisecond,
+		Retries:            cfg.Retries,
+		ExponentialTimeout: false,
+		MaxOids:            gosnmp.MaxOids,
+	}
+
+	switch t.SNMPVersion {
+	case 3:
+		g.Version = gosnmp.Version3
+		g.SecurityModel = gosnmp.UserSecurityModel
+		g.MsgFlags = gosnmp.AuthPriv
+		priv, auth := protoPriv(cfg.V3.PrivProtocol), protoAuth(cfg.V3.AuthProtocol)
+		g.SecurityParameters = &gosnmp.UsmSecurityParameters{
+			UserName:                 cfg.V3.Username,
+			AuthenticationProtocol:   auth,
+			AuthenticationPassphrase: cfg.V3.AuthPassword,
+			PrivacyProtocol:          priv,
+			PrivacyPassphrase:        cfg.V3.PrivPassword,
+		}
+	default:
+		g.Version = gosnmp.Version2c
+	}
+
+	if err := g.Connect(); err != nil {
+		return nil, fmt.Errorf("snmp connect %s: %w", t.IP, err)
+	}
+	return &Client{g: g, cfg: cfg}, nil
+}
+
+// Close releases the underlying UDP socket.
+func (c *Client) Close() { c.g.Conn.Close() }
+
+// Get fetches scalar OIDs (appends .0 if needed).
+func (c *Client) Get(oids []string) (*gosnmp.SnmpPacket, error) {
+	return c.g.Get(oids)
+}
+
+// Walk performs a BulkWalk under the given OID prefix.
+func (c *Client) Walk(oid string) ([]gosnmp.SnmpPDU, error) {
+	var pdus []gosnmp.SnmpPDU
+	err := c.g.BulkWalk(oid, func(pdu gosnmp.SnmpPDU) error {
+		pdus = append(pdus, pdu)
+		return nil
+	})
+	return pdus, err
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+func protoAuth(s string) gosnmp.SnmpV3AuthProtocol {
+	switch strings.ToUpper(s) {
+	case "SHA224":
+		return gosnmp.SHA224
+	case "SHA256":
+		return gosnmp.SHA256
+	case "SHA384":
+		return gosnmp.SHA384
+	case "SHA512":
+		return gosnmp.SHA512
+	case "SHA":
+		return gosnmp.SHA
+	default:
+		return gosnmp.MD5
+	}
+}
+
+func protoPriv(s string) gosnmp.SnmpV3PrivProtocol {
+	switch strings.ToUpper(s) {
+	case "AES192":
+		return gosnmp.AES192
+	case "AES256":
+		return gosnmp.AES256
+	case "DES":
+		return gosnmp.DES
+	default:
+		return gosnmp.AES
+	}
+}
+
+// ToFloat64 converts a gosnmp PDU value to float64.
+func ToFloat64(pdu gosnmp.SnmpPDU) float64 {
+	switch v := pdu.Value.(type) {
+	case uint:
+		return float64(v)
+	case uint32:
+		return float64(v)
+	case uint64:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int32:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case float32:
+		return float64(v)
+	case float64:
+		return v
+	}
+	return 0
+}
+
+// LastOIDComponent returns the last numeric component of a dotted OID string.
+// e.g. "1.3.6.1.2.1.2.2.1.10.5" → "5"
+func LastOIDComponent(oid string) string {
+	i := strings.LastIndex(oid, ".")
+	if i < 0 {
+		return oid
+	}
+	return oid[i+1:]
+}
+
+// OIDColumn strips the last component, returning the column OID prefix.
+// e.g. "1.3.6.1.2.1.2.2.1.10.5" → "1.3.6.1.2.1.2.2.1.10"
+func OIDColumn(oid string) string {
+	i := strings.LastIndex(oid, ".")
+	if i < 0 {
+		return oid
+	}
+	return oid[:i]
+}

@@ -1,0 +1,63 @@
+identity:
+  org_id:     "faber"
+  network_id: "net-prod"
+  group_id:   "grp-core"
+  reader_id:  ""
+  # datacenter_id and floor_id come from topology JSON per device — not set here
+
+dcs:
+  endpoint: "localhost:9090"
+  tls:
+    insecure: true
+
+queue:
+  max_bytes: 536870912  # 512 MB
+
+# Simulator topology file — EDR reads device IPs, datacenter, country, city,
+# rack, room etc. from this JSON. Required to populate location columns in DB.
+topology_file: "C:\\Users\\Faber\\Desktop\\fwDCIM\\Datacenter_Network_Simulator\\topologies\\dual_dc_enterprise.json"
+
+# Subnet discovery — only active when topology_file is "".
+discovery:
+  subnets:
+    - "192.168.1.0/24"
+    - "192.168.2.0/24"
+  snmp_agent: "127.0.0.1"
+  seed_ip:    "192.168.1.6"
+  interval_hours: 1
+
+snmp:
+  community:           "public"
+  version:             2
+  poll_interval_ms:    30000
+  timeout_ms:          5000   # sim is slow under load; give walks time to complete instead of timing out + retrying
+  retries:             0      # don't double-hit a slow single-process simulator
+  trap_addr:           ":162"
+  max_concurrent:      8      # safe now that load is spread across `shards` responders + sockets are reused per target
+  rate_limit_per_sec:  50
+  breaker_threshold:   3
+  breaker_cooldown_ms: 30000
+  # Sharding: run N snmpsim responders (see scripts/run_snmp_shards.ps1) so the
+  # single-process wedge goes away and EDR can poll concurrently. Shard 0 = port
+  # 161 (enrichment/discovery target it), shards 1..N-1 = shard_base_port+i.
+  # Set shards: 1 to disable (everything on 161 — original behavior).
+  shards:              4
+  shard_base_port:     16100   # → responders on 16100, 16101, 16102, 16103 (poller + enrichment both shard here; nothing on 161)
+  # Let edr.exe launch the snmpsim responders itself (sim/test only). Set false
+  # in production. Uses high ports only, so the simulator GUI's 161 won't conflict.
+  shard_spawn:          true
+  shard_responder_path: "C:\\Users\\Faber\\Desktop\\fwDCIM\\Datacenter_Network_Simulator\\.venv\\Scripts\\snmpsim-command-responder.exe"
+  shard_data_dir:       "C:\\Users\\Faber\\Desktop\\fwDCIM\\Datacenter_Network_Simulator\\datasets\\snmp"
+
+gnmi:
+  enabled:          false   # simulator has no gNMI servers; SNMP-only. Set true when gNMI endpoints exist.
+  port:             57400
+  poll_interval_ms: 30000
+  tls:
+    insecure: true
+  username: ""
+  password: ""
+
+log:
+  level:  "info"
+  format: "json"
