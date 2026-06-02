@@ -455,6 +455,34 @@ func (f *Forwarder) push(ctx context.Context) error {
 // scopeKey identifies one (datacenter_id, floor_id) Aggregator payload scope.
 type scopeKey struct{ dc, floor string }
 
+// scopeFallback is the last-resort value for an empty datacenter_id/floor_id
+// when no default is configured. The Aggregator requires both keys non-empty,
+// so coalescing guarantees every row is forwarded rather than wedging the push.
+const scopeFallback = "unknown"
+
+// dcOrDefault / floorOrDefault coalesce an empty scope key to the configured
+// default (falling back to scopeFallback) so no device or event is ever shipped
+// with an empty datacenter_id/floor_id.
+func (f *Forwarder) dcOrDefault(dc string) string {
+	if dc != "" {
+		return dc
+	}
+	if f.cfg.DefaultDatacenterID != "" {
+		return f.cfg.DefaultDatacenterID
+	}
+	return scopeFallback
+}
+
+func (f *Forwarder) floorOrDefault(floor string) string {
+	if floor != "" {
+		return floor
+	}
+	if f.cfg.DefaultFloorID != "" {
+		return f.cfg.DefaultFloorID
+	}
+	return scopeFallback
+}
+
 // buildPayloads groups all query results by (datacenter_id, floor_id) and
 // returns one aggPayload per scope. The Aggregator upserts devices by
 // org+datacenter+floor+network+group+hostname and requires topology link
@@ -473,7 +501,7 @@ func (f *Forwarder) buildPayloads(
 	// resolve to the same (dc,floor) payload.
 	hostScope := make(map[string]scopeKey, len(devices))
 	for _, d := range devices {
-		hostScope[d.Hostname] = scopeKey{d.DatacenterID, d.FloorID}
+		hostScope[d.Hostname] = scopeKey{f.dcOrDefault(d.DatacenterID), f.floorOrDefault(d.FloorID)}
 	}
 	getGroup := func(dc, floor string) *aggPayload {
 		k := scopeKey{dc, floor}
@@ -577,7 +605,7 @@ func (f *Forwarder) buildPayloads(
 			}
 			ad.Metrics = append(ad.Metrics, am)
 		}
-		g := getGroup(d.DatacenterID, d.FloorID)
+		g := getGroup(f.dcOrDefault(d.DatacenterID), f.floorOrDefault(d.FloorID))
 		g.Devices = append(g.Devices, ad)
 	}
 
@@ -621,12 +649,10 @@ func (f *Forwarder) buildPayloads(
 			zap.Int("skipped", skippedCrossScope))
 	}
 
-	// Events → scope by device's dc/floor. Events with no resolved device
-	// (device_id NULL) have no scope and cannot be placed; skip them.
+	// Events → scope by device's dc/floor. Empty dc/floor (e.g. device_id NULL
+	// or a device with no scope) coalesces to the configured default so the
+	// event is still forwarded rather than dropped.
 	for _, ev := range events {
-		if ev.DatacenterID == "" && ev.FloorID == "" {
-			continue
-		}
 		ae := aggEvent{
 			ID:             ev.ID,
 			DeviceID:       ev.DeviceID,
@@ -647,7 +673,7 @@ func (f *Forwarder) buildPayloads(
 		if ev.Payload != "" && ev.Payload != "{}" {
 			ae.Payload = json.RawMessage(ev.Payload)
 		}
-		g := getGroup(ev.DatacenterID, ev.FloorID)
+		g := getGroup(f.dcOrDefault(ev.DatacenterID), f.floorOrDefault(ev.FloorID))
 		g.Events = append(g.Events, ae)
 	}
 

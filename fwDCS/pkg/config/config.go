@@ -56,6 +56,15 @@ type AggregatorConfig struct {
 	OrgID      string `yaml:"org_id"`
 	NetworkID  string `yaml:"network_id"`
 	GroupID    string `yaml:"group_id"`
+
+	// Fallback scope keys used when a device/event row carries an empty
+	// datacenter_id or floor_id. The Aggregator rejects payloads with empty
+	// datacenter_id/floor_id, so without a fallback those rows would wedge the
+	// whole push (no cursor advances). Empty values default to "unknown" so
+	// every row is forwarded regardless. Set explicitly to bucket unscoped
+	// devices under a chosen name.
+	DefaultDatacenterID string `yaml:"default_datacenter_id"`
+	DefaultFloorID      string `yaml:"default_floor_id"`
 }
 
 // ─── sub-structs ────────────────────────────────────────────────────────────
