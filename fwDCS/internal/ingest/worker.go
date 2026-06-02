@@ -203,6 +203,16 @@ func (p *Pipeline) process(ctx context.Context, pkt *v1.TelemetryPacket) (store.
 				}
 			}
 		}
+		// Link traps (linkDown/linkUp): correlate to the EXACT topology_links row,
+		// flip is_active for the whole link, and write ONE enriched event per real
+		// transition (the peer's duplicate trap is suppressed). If handleLinkTrap
+		// took ownership we're done; otherwise (not a link trap, or no topology
+		// match) fall through and store the trap as a plain event so nothing is lost.
+		if deviceID != "" && (pkt.Name == "linkDown" || pkt.Name == "linkUp") {
+			if p.handleLinkTrap(ctx, deviceID, sourceHostname, pkt) {
+				return store.MetricRow{}, false
+			}
+		}
 		if err := p.db.WriteEvent(ctx, deviceID, sourceHostname, pkt); err != nil {
 			p.log.Debug("event write failed", zap.Error(err))
 		}
@@ -271,8 +281,15 @@ func (p *Pipeline) writeInterfaceAddress(ctx context.Context, pkt *v1.TelemetryP
 	}
 	ifaceID, _ := p.db.InterfaceIDByDeviceAndIndex(ctx, deviceID, idx)
 	if ifaceID == "" {
-		// Interface row not yet upserted (gNMI stream or TierMedium walk hasn't
-		// arrived). Skip silently — next enrichment cycle retries.
+		// Interface row not built yet (the MEDIUM walk hasn't reached this device —
+		// common under a serial/one-shot walk, where the enrichment pass outruns
+		// interface creation). CREATE it from the ifIndex now so the address is not
+		// lost; the MEDIUM walk later fills in the real name/speed/status, matched
+		// by ifIndex (so no duplicate). This decouples interface_addresses from
+		// MEDIUM-walk timing — both tables populate regardless of order.
+		ifaceID, _ = p.db.UpsertInterface(ctx, deviceID, "if"+strconv.Itoa(idx), idx, 0, 0, 0)
+	}
+	if ifaceID == "" {
 		return
 	}
 	addr := pkt.Meta["address"]
@@ -323,6 +340,77 @@ func (p *Pipeline) lookupOrRegister(ctx context.Context, pkt *v1.TelemetryPacket
 		p.devCache.Put(key, id)
 	}
 	return id
+}
+
+// handleLinkTrap correlates a linkDown/linkUp trap to its EXACT topology_links row
+// (single source of truth — never a guessed neighbour), flips is_active for the
+// whole physical link, and writes ONE enriched event per real transition: the
+// event carries the peer endpoint + link_id in dedicated columns so the UI can
+// render a single "src:port <-> dst:port DOWN" entry. The peer's duplicate trap
+// (and same-state repeats) cause no transition and are suppressed.
+//
+// Returns true when it took ownership (wrote the enriched event, or intentionally
+// suppressed the duplicate). Returns false when the trap couldn't be correlated to
+// a link — the caller then stores it as a plain event so nothing is lost. We never
+// fall back to another link of this device.
+func (p *Pipeline) handleLinkTrap(ctx context.Context, deviceID, sourceHostname string, pkt *v1.TelemetryPacket) bool {
+	down := pkt.Name == "linkDown"
+
+	// Interface identity from the trap: IF-MIB ifIndex varbind + ifName.
+	ifIndex := -1
+	if v := pkt.Meta["vb.1.3.6.1.2.1.2.2.1.1.1"]; v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			ifIndex = n
+		}
+	}
+	ifName := pkt.Meta["vb.1.3.6.1.2.1.2.2.1.2.1"]
+
+	row, found, err := p.db.CorrelateLinkByPort(ctx, deviceID, ifIndex, ifName)
+	if err != nil {
+		p.log.Debug("link correlation failed", zap.Error(err))
+		return false // let the plain event through
+	}
+	if !found {
+		p.log.Warn("link trap: no exact topology_links match; storing plain event",
+			zap.String("trap_device_id", deviceID),
+			zap.Int("if_index", ifIndex),
+			zap.String("if_name", ifName))
+		return false
+	}
+
+	changed, err := p.db.SetLinkActive(ctx, row, down)
+	if err != nil {
+		p.log.Debug("set link active failed", zap.Error(err))
+		return false // fall back to a plain event rather than lose the trap
+	}
+	if !changed {
+		// Peer's duplicate trap or a same-state repeat → one event per transition.
+		return true
+	}
+
+	// Canonical orientation: always present the link in the topology row's FIXED
+	// direction (row.Src → row.Dst), regardless of which endpoint's trap arrived
+	// first. The simulator fires the trap from BOTH ends of a link; whichever won
+	// the dedup above would otherwise become "source", flipping src/dst between
+	// linkDown and linkUp for the same link_id. Writing the row's canonical
+	// direction keeps the orientation stable across down/up. The device that
+	// actually reported is preserved in meta (reported_by + udp_src/community/
+	// source_ip) so the reporter isn't lost.
+	pkt.Meta["reported_by"] = sourceHostname
+	pkt.Meta["src_port_name"] = row.SrcPort
+	pkt.Meta["dst_device_id"] = row.DstDeviceID
+	pkt.Meta["dst_hostname"] = row.DstHostname
+	pkt.Meta["dst_port_name"] = row.DstPort
+	pkt.Meta["link_id"] = row.LinkID
+	if err := p.db.WriteEvent(ctx, row.SrcDeviceID, row.SrcHostname, pkt); err != nil {
+		p.log.Debug("link event write failed", zap.Error(err))
+	}
+	p.log.Info("link event",
+		zap.String("src_hostname", row.SrcHostname),
+		zap.String("dst_hostname", row.DstHostname),
+		zap.String("reported_by", sourceHostname),
+		zap.Bool("down", down))
+	return true
 }
 
 func (p *Pipeline) lookupOrUpsertInterface(ctx context.Context, deviceID string, pkt *v1.TelemetryPacket) string {

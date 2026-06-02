@@ -61,6 +61,7 @@ func run(cfgPath string, forceRediscover bool) error {
 	if err := rp.Validate(); err != nil {
 		return fmt.Errorf("identity: %w", err)
 	}
+	configureSNMPSocketLimit(cfg.SNMP)
 
 	if cfg.Identity.ReaderID == "" {
 		host, _ := os.Hostname()
@@ -227,11 +228,9 @@ func run(cfgPath string, forceRediscover bool) error {
 						zap.Int("count", len(found)))
 				}
 			}
-			// Background enrichment: walks ipAdEntAddr per target at a paced
-			// rate so the sim never sees a burst. Updates ProdIP/OOBIP/
-			// LoopbackIP, then emits a fresh registration packet so DCS sees
-			// the new IPs without restarting EDR.
-			go enrichTargetsBackground(ctx, found, cfg, signer, pktCh, persistPath, log)
+			// Interface IP addresses + ProdIP/OOBIP/LoopbackIP are now derived by the
+			// poller's pooled MEDIUM walk (snmp.Collector.collectInterfaceAddresses),
+			// so no separate enrichment pass is started here.
 		}
 	}
 	// Strip gNMI capability when gNMI is globally disabled (e.g. SNMP-only
@@ -259,12 +258,50 @@ func run(cfgPath string, forceRediscover bool) error {
 	// before TierFast can run for every target.
 	emitRegistrationPackets(targets, cfg.Identity, signer, pktCh, log)
 
-	// Background enrichment: walks ipAdEntAddr per target (paced) to populate
-	// interface_addresses. In discovery mode this runs inside the sweep block;
-	// in topology mode we must start it here so the interface_addresses table
-	// is populated regardless of how targets were loaded.
-	// Pass "" for persistPath — topology mode does not use targets.json.
-	go enrichTargetsBackground(ctx, targets, cfg, signer, pktCh, "", log)
+	// Interface IP addresses are collected by the poller's pooled MEDIUM walk
+	// (see snmp.Collector.collectInterfaceAddresses) — folded in there so it reuses
+	// the persistent pooled socket. The old standalone enrichment pass opened a
+	// fresh socket per device and got starved by the single responder, so it is no
+	// longer started here.
+
+	// Power topology links. Production links come from LLDP on network devices
+	// Topology links from the simulator JSON — the complete, authoritative
+	// port → connected-device relation, available instantly (no waiting on the
+	// LLDP walk). DCS builds topology_links from these, so a link-down trap can
+	// immediately find the peer and write ONE merged event. Covers all layers
+	// (network/management/power). When EDR sources topology from the JSON, the
+	// LLDP topology tier is disabled (snmp.walk_topology:false) to avoid duplicate
+	// rows. Re-emitted on the topology interval so rows stay fresh and links to
+	// not-yet-registered devices retry.
+	if cfg.TopologyFile != "" {
+		if links, err := topology.LoadTopologyLinks(cfg.TopologyFile); err != nil {
+			log.Warn("topology links load failed", zap.Error(err))
+		} else if len(links) > 0 {
+			go func() {
+				// Let discovery-time registrations land first so DCS can resolve
+				// both endpoints (links to unknown devices are dropped).
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+				topoIv := time.Duration(cfg.SNMP.TopologyIntervalMs) * time.Millisecond
+				if topoIv <= 0 {
+					topoIv = 10 * time.Minute
+				}
+				for {
+					n := emitTopologyLinks(links, cfg.Identity, signer, pktCh, log)
+					log.Info("topology links emitted from JSON",
+						zap.Int("emitted", n), zap.Int("total", len(links)))
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(topoIv):
+					}
+				}
+			}()
+		}
+	}
 
 	// SNMP trap receiver
 	if cfg.SNMP.TrapAddr != "" {
@@ -294,9 +331,10 @@ func run(cfgPath string, forceRediscover bool) error {
 
 	// Background rediscovery loop — picks up devices that were not yet up
 	// when EDR started, and new devices that appear between full sweep cycles.
-	// Runs every IntervalHours; falls back to every 60s when no targets are
-	// known (the dead-simulator startup case).
-	if len(cfg.Discovery.Subnets) > 0 {
+	// Runs every IntervalHours. Disabled when interval_hours <= 0 (rediscovery is
+	// then manual only, via restart with --rediscover) so EDR stays idle after the
+	// one-shot walk.
+	if len(cfg.Discovery.Subnets) > 0 && cfg.Discovery.IntervalHours > 0 {
 		known := make(map[string]struct{}, len(targets))
 		for _, t := range targets {
 			known[t.SourceID()] = struct{}{}
@@ -434,7 +472,7 @@ func enrichTargetsBackground(
 		if t.ProdIP != oldPrimary || t.OOBIP != "" || t.LoopbackIP != "" {
 			emitRegistrationPackets([]*target.Target{t}, cfg.Identity, signer, out, log)
 		}
-		emitInterfaceAddressPackets(t, ifaceAddrs, cfg.Identity, signer, out, log)
+		emitInterfaceAddressPackets(ctx, t, ifaceAddrs, cfg.Identity, signer, out, log)
 		enriched++
 	}
 	if persistPath != "" {
@@ -449,6 +487,7 @@ func enrichTargetsBackground(
 // per (ifindex, ip) tuple. DCS routes the kind to UpsertInterfaceAddress
 // without needing a bespoke RPC. Skipped silently when ifAddrs is empty.
 func emitInterfaceAddressPackets(
+	ctx context.Context,
 	t *target.Target,
 	ifAddrs []discovery.InterfaceAddress,
 	id config.IdentityConfig,
@@ -508,12 +547,14 @@ func emitInterfaceAddressPackets(
 			Signature:    sig,
 			Nonce:        nonce,
 		}
+		// Blocking send: interface_address packets are low-volume inventory data and
+		// must NOT be dropped under load. A non-blocking send raced the gNMI/metric
+		// flood and silently discarded every address (interface_addresses stayed
+		// empty). Wait for queue space; bail only on shutdown.
 		select {
 		case out <- pkt:
-		default:
-			log.Warn("interface_address packet dropped — channel full",
-				zap.String("target", t.SourceID()),
-				zap.String("address", a.Address))
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -600,7 +641,97 @@ func emitRegistrationPackets(
 				zap.String("target", t.SourceID()))
 		}
 	}
-	log.Info("discovery-time registration packets emitted", zap.Int("count", len(targets)))
+	// Debug, not Info: enrichment re-emits one registration per target (count:1),
+	// which floods the console. The startup count is already implied by
+	// "edr targets loaded".
+	log.Debug("registration packets emitted", zap.Int("count", len(targets)))
+}
+
+// emitTopologyLinks sends one Kind="topology" packet per topology-JSON edge
+// (network/management/power). DCS (worker → WriteTopologyLink) resolves the source
+// device by Meta["mgmt_ip"] and the destination by Meta["remote_mgmt_ip"] (stable,
+// rename-proof), then writes a topology_links row carrying Meta["layer"]. This is
+// the authoritative port → connected-device relation a link-down trap looks up to
+// merge the two endpoint traps into one event.
+//
+// Returns the number of packets accepted into the publish channel. A packet whose
+// endpoints aren't in the DCS devices table yet resolves to no row and is silently
+// dropped DCS-side; the periodic re-emit (see caller) retries until both endpoints
+// have registered.
+func emitTopologyLinks(
+	links []topology.LinkEdge,
+	id config.IdentityConfig,
+	signer *packet.Signer,
+	out chan<- *v1.TelemetryPacket,
+	log *zap.Logger,
+) int {
+	now := time.Now().UnixNano()
+	emitted := 0
+	for _, e := range links {
+		dcID := id.DatacenterID
+		if e.SrcDatacenterID != "" {
+			dcID = e.SrcDatacenterID
+		}
+		floorID := id.FloorID
+		if e.SrcFloorID != "" {
+			floorID = e.SrcFloorID
+		}
+
+		// Port name = the raw 0-based JSON iface index, because the simulator's
+		// linkDown trap carries iface_index = edge.src_iface (0-based, topology.py).
+		// Storing the SAME value as src_port_name lets the trap correlate to this
+		// edge by index alone — no dependence on the interfaces table or vendor
+		// port-name strings. (local/remote_port_index below stay +1 = the real
+		// 1-based ifIndex, used only to resolve interface_id for display.)
+		srcPort := strconv.Itoa(e.SrcPortIndex)
+		dstPort := strconv.Itoa(e.DstPortIndex)
+
+		meta := map[string]string{
+			"layer":              e.Layer,
+			"mgmt_ip":            e.SrcMgmtIP, // stable src identity — DCS resolves by mgmt_ip first
+			"remote_sys_name":    e.DstHost,
+			"remote_mgmt_ip":     e.DstMgmtIP, // stable dst identity — rename-proof peer resolution
+			"remote_port_id":     dstPort,
+			"local_port_index":   strconv.Itoa(e.SrcPortIndex + 1),
+			"remote_port_index":  strconv.Itoa(e.DstPortIndex + 1),
+			"hostname":           e.SrcHost,
+			"collector_agent":    "EDR",
+			"collector_protocol": "TOPO",
+		}
+
+		pid := packet.NewID()
+		nonce := signer.NextNonce()
+		const name = "topology.link"
+		canonical := packet.CanonicalBytes(pid, e.SrcHost, now, name, srcPort, 0, nonce)
+		sig := signer.Sign(canonical)
+		pkt := &v1.TelemetryPacket{
+			Id:           pid,
+			OrgId:        id.OrgID,
+			DatacenterId: dcID,
+			FloorId:      floorID,
+			NetworkId:    id.NetworkID,
+			GroupId:      id.GroupID,
+			SourceType:   "device",
+			SourceId:     e.SrcHost,
+			ReaderId:     id.ReaderID,
+			TimestampNs:  now,
+			Name:         name,
+			Tag:          srcPort,
+			Value:        0,
+			Meta:         meta,
+			Kind:         "topology",
+			Signature:    sig,
+			Nonce:        nonce,
+		}
+		select {
+		case out <- pkt:
+			emitted++
+		default:
+			log.Warn("topology link packet dropped — channel full",
+				zap.String("src", e.SrcHost), zap.String("dst", e.DstHost), zap.String("layer", e.Layer))
+		}
+	}
+	return emitted
 }
 
 func defaultQueuePath() string {
@@ -608,6 +739,20 @@ func defaultQueuePath() string {
 		return `C:\ProgramData\fwdcim\edr\queue.db`
 	}
 	return "/var/lib/fwdcim/edr/queue.db"
+}
+
+func configureSNMPSocketLimit(cfg config.SNMPConfig) {
+	maxConc := cfg.MaxConcurrent
+	if maxConc <= 0 {
+		maxConc = 1
+	}
+	effCap := maxConc
+	if cfg.Shards > 1 {
+		if shardCap := cfg.Shards * 2; shardCap < effCap {
+			effCap = shardCap
+		}
+	}
+	snmp.ConfigureSocketLimit(effCap)
 }
 
 func buildLogger(level, format string) *zap.Logger {

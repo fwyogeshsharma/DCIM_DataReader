@@ -93,7 +93,8 @@ const (
 	OIDAPCNetBotzSensorType = "1.3.6.1.4.1.318.1.1.10.4.2.2.1.11"
 
 	// IP-MIB — ipAddrTable
-	OIDIpAdEntAddr = "1.3.6.1.2.1.4.20.1.1" // ipAdEntAddr: OID suffix is the IP address
+	OIDIpAdEntAddr    = "1.3.6.1.2.1.4.20.1.1" // ipAdEntAddr: OID suffix is the IP address
+	OIDIpAdEntIfIndex = "1.3.6.1.2.1.4.20.1.2" // ipAdEntIfIndex: value is the ifIndex; suffix is the IP
 
 	// LLDP-MIB (IEEE 802.1AB-2009) — lldpRemTable indexed by timeMark.portNum.remIdx
 	OIDLLDPRemChassisId = "1.0.8802.1.1.2.1.4.1.1.5"

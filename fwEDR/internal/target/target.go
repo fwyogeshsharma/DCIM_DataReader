@@ -1,7 +1,11 @@
 // Package target defines the Target type representing one polled device.
 package target
 
-import "github.com/faberwork/fwedr/pkg/config"
+import (
+	"sync"
+
+	"github.com/faberwork/fwedr/pkg/config"
+)
 
 // Capability flags for a target device.
 type Capability uint8
@@ -32,8 +36,9 @@ type Target struct {
 	GNMIIP     string
 
 	Hostname   string
-	DeviceType string // router|switch|server|firewall|load_balancer|ups|pdu|floor_pdu|oob_switch|sensor
-	Vendor     string // cisco|juniper|arista|apc|raritan|vertiv|eaton|generic
+	hostMu     sync.RWMutex // guards live Hostname updates (SNMP sysName adoption)
+	DeviceType string       // router|switch|server|firewall|load_balancer|ups|pdu|floor_pdu|oob_switch|sensor
+	Vendor     string       // cisco|juniper|arista|apc|raritan|vertiv|eaton|generic
 	Labels     map[string]string
 
 	SNMPVersion int    // 2 or 3
@@ -122,8 +127,24 @@ func (t *Target) ClearCap(c Capability) { t.Caps &^= c }
 
 // SourceID returns the canonical source identifier (hostname or IP).
 func (t *Target) SourceID() string {
-	if t.Hostname != "" {
-		return t.Hostname
+	t.hostMu.RLock()
+	h := t.Hostname
+	t.hostMu.RUnlock()
+	if h != "" {
+		return h
 	}
 	return t.IP
+}
+
+// SetHostname adopts a new hostname — e.g. the live SNMP sysName — so a device
+// rename at the source propagates downstream (DCS keys device identity on
+// mgmt_ip and treats hostname as a mutable attribute, so the row updates in
+// place). No-op when empty or unchanged.
+func (t *Target) SetHostname(name string) {
+	if name == "" {
+		return
+	}
+	t.hostMu.Lock()
+	t.Hostname = name
+	t.hostMu.Unlock()
 }

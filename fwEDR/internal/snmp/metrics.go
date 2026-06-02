@@ -2,6 +2,7 @@ package snmp
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,13 @@ type Collector struct {
 	client *Client
 	base   basePacket
 	signer *packet.Signer
+
+	// mgmtPort, when > 0, is the simulator SET management agent port (e.g. 1161).
+	// When set, collectSystem reads sysName from it (live device name) so renames
+	// reflect immediately instead of waiting on the lazily-patched 161 .snmprec.
+	// 0 in production — real devices have no such agent.
+	mgmtPort      int
+	mgmtTimeoutMs int
 }
 
 type basePacket struct {
@@ -26,17 +34,22 @@ type basePacket struct {
 }
 
 // NewCollector creates a Collector. The caller must Close() when done.
+// mgmtPort/mgmtTimeoutMs configure the optional live-sysName read against the
+// simulator SET agent (0 = disabled / production).
 func NewCollector(
 	t *target.Target,
 	client *Client,
 	orgID, dcID, floorID, netID, grpID, readerID string,
 	signer *packet.Signer,
+	mgmtPort, mgmtTimeoutMs int,
 ) *Collector {
 	return &Collector{
-		target: t,
-		client: client,
-		base:   basePacket{orgID, dcID, floorID, netID, grpID, readerID},
-		signer: signer,
+		target:        t,
+		client:        client,
+		base:          basePacket{orgID, dcID, floorID, netID, grpID, readerID},
+		signer:        signer,
+		mgmtPort:      mgmtPort,
+		mgmtTimeoutMs: mgmtTimeoutMs,
 	}
 }
 
@@ -49,10 +62,14 @@ func NewCollector(
 type Tier int
 
 const (
-	TierFast     Tier = iota // sys.uptime only — 1 Get per device
-	TierMedium               // interface state (admin/oper/speed) — 3 walks per device
-	TierSlow                 // interface counters, server HR/UCD, UPS, sensors
-	TierTopology             // LLDP neighbor walks — separate tier, fired once after discovery + periodic refresh
+	TierFast        Tier = iota // sys.uptime only — 1 Get per device
+	TierMedium                  // interface state (admin/oper/speed) — 3 walks per device
+	TierSlow                    // interface counters, server HR/UCD, UPS, sensors
+	TierTopology                // LLDP neighbor walks — separate tier, fired once after discovery + periodic refresh
+	TierEnvironment             // environment sensors ONLY (temperature/humidity) for sensor/PDU devices — light, for the heatmap without the heavy SLOW counter walk
+
+	// NumTiers is the count of Tier values; keep tier-indexed arrays sized to it.
+	NumTiers = int(TierEnvironment) + 1
 )
 
 // Collect runs the MIB walks for the given tier and returns metric packets.
@@ -75,6 +92,12 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 			return nil, err
 		}
 		pkts = append(pkts, ifPkts...)
+		// Interface IP addresses (ipAddrTable) — folded in here so it reuses the
+		// pooled persistent socket instead of the old standalone enrichment pass,
+		// which opened a fresh socket per device and got starved by the single
+		// responder (interface_addresses stayed empty). Best-effort: never fails the
+		// tier.
+		pkts = append(pkts, c.collectInterfaceAddresses()...)
 	case TierSlow:
 		ifPkts, err := c.collectInterfacesCounters()
 		if err != nil {
@@ -98,9 +121,31 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 				pkts = append(pkts, p...)
 			}
 		}
+	case TierEnvironment:
+		// Light, heatmap-focused tier: ONLY the environment sensor walk, and only
+		// for devices that carry sensors. No interface counters / HR / UCD — so it
+		// adds minimal SNMP load. Errors are non-fatal (returns what it has).
+		switch c.target.DeviceType {
+		case "sensor", "pdu", "floor_pdu":
+			if p, err := c.collectSensors(); err == nil {
+				pkts = append(pkts, p...)
+			}
+		}
 	case TierTopology:
 		switch c.target.DeviceType {
 		case "router", "switch", "firewall", "load_balancer":
+			// Production fabric: these advertise production-layer neighbors in
+			// LLDP. collectLLDP tags them layer="network".
+			if p, err := c.collectLLDP(); err == nil {
+				pkts = append(pkts, p...)
+			}
+		case "oob_switch":
+			// Management plane: the simulator advertises the device↔OOB
+			// (management-layer) links ONLY in each OOB switch's LLDP table —
+			// production devices keep their OOB port off their LLDP. Without
+			// walking OOB switches the management links are never discovered and
+			// every link lands as "network". collectLLDP tags these "management"
+			// (DeviceType == "oob_switch" branch in the layer classifier).
 			if p, err := c.collectLLDP(); err == nil {
 				pkts = append(pkts, p...)
 			}
@@ -116,6 +161,31 @@ func (c *Collector) collectSystem() ([]*v1.TelemetryPacket, error) {
 	pkt, err := c.client.Get([]string{OIDSysUpTime, OIDSysName, OIDSysDescr})
 	if err != nil {
 		return nil, err
+	}
+	// Adopt the live sysName as the hostname FIRST, so the uptime packet built
+	// below already carries the current name. A device renamed at the source
+	// (e.g. in the simulator) thus propagates to the DB without an EDR restart or
+	// a topology-file edit. DCS keys identity on mgmt_ip, so the row is renamed
+	// in place rather than duplicated.
+	var sysName string
+	for _, p := range pkt.Variables {
+		if strings.TrimPrefix(p.Name, ".") == OIDSysName {
+			sysName = PDUString(p)
+		}
+	}
+	// Simulator: the 161 .snmprec sysName is patched lazily (rename-time patch is
+	// conditional; the periodic shard-sync lags minutes), so a rename can take
+	// minutes to appear here. The SET management agent on mgmt_port serves the
+	// LIVE in-memory device name, so prefer it when configured — renames then
+	// reflect on the very next FAST poll. Falls back to the 161 sysName on any
+	// failure. mgmt_port = 0 (production) skips this entirely.
+	if c.mgmtPort > 0 {
+		if live, ok := MgmtSysName(c.target.IP, uint16(c.mgmtPort), c.target.Community, c.mgmtTimeoutMs); ok {
+			sysName = live
+		}
+	}
+	if sysName != "" {
+		c.target.SetHostname(sysName)
 	}
 	var pkts []*v1.TelemetryPacket
 	for _, p := range pkt.Variables {
@@ -141,6 +211,100 @@ func (c *Collector) collectInterfacesStatus() ([]*v1.TelemetryPacket, error) {
 // Used by the SLOW tier — runs every 5min. ~10 walks per device.
 func (c *Collector) collectInterfacesCounters() ([]*v1.TelemetryPacket, error) {
 	return c.walkIfMap(IfMetricCounters)
+}
+
+// collectInterfaceAddresses walks the IP address table (ipAdEntAddr + ipAdEntIfIndex)
+// and emits one interface_address packet per (ifIndex, IP). DCS routes these to
+// interface_addresses. Best-effort: returns nil on any walk error so it never
+// fails the MEDIUM tier. Also derives prod/oob/loopback IPs onto the target so the
+// device row's address columns populate.
+func (c *Collector) collectInterfaceAddresses() []*v1.TelemetryPacket {
+	addrPDUs, err := c.client.Walk(OIDIpAdEntAddr)
+	if err != nil || len(addrPDUs) == 0 {
+		return nil
+	}
+	idxPDUs, _ := c.client.Walk(OIDIpAdEntIfIndex)
+	ipToIdx := make(map[string]int, len(idxPDUs))
+	for _, p := range idxPDUs {
+		if ip := ipSuffix(p.Name, OIDIpAdEntIfIndex); ip != "" {
+			ipToIdx[ip] = int(ToFloat64(p))
+		}
+	}
+
+	var prodIP, oobIP string
+	var pkts []*v1.TelemetryPacket
+	for _, p := range addrPDUs {
+		ip := ipSuffix(p.Name, OIDIpAdEntAddr)
+		if ip == "" {
+			continue
+		}
+		if strings.HasPrefix(ip, "10.") && prodIP == "" {
+			prodIP = ip
+		}
+		if strings.HasPrefix(ip, "172.") && oobIP == "" {
+			oobIP = ip
+		}
+		meta := c.hostMeta()
+		meta["interface_index"] = strconv.Itoa(ipToIdx[ip])
+		meta["address"] = ip
+		meta["address_family"] = "ipv4"
+		pkts = append(pkts, c.newInterfaceAddress(ip, meta))
+	}
+
+	// Backfill target IPs so the device row's prod/oob/loopback columns fill in.
+	if prodIP != "" {
+		c.target.ProdIP = prodIP
+	}
+	if oobIP != "" {
+		c.target.OOBIP = oobIP
+	}
+	switch c.target.DeviceType {
+	case "router", "switch", "firewall", "load_balancer":
+		if prodIP != "" {
+			c.target.LoopbackIP = prodIP
+		}
+	}
+	return pkts
+}
+
+// ipSuffix returns the dotted-IP suffix of an ipAddrTable OID (the part after the
+// column prefix), e.g. "1.3.6.1.2.1.4.20.1.1.10.50.0.8" → "10.50.0.8".
+func ipSuffix(oidName, columnPrefix string) string {
+	name := strings.TrimPrefix(oidName, ".")
+	pfx := strings.TrimPrefix(columnPrefix, ".") + "."
+	if !strings.HasPrefix(name, pfx) {
+		return ""
+	}
+	return strings.TrimPrefix(name, pfx)
+}
+
+// newInterfaceAddress builds a Kind="interface_address" packet (DCS upserts it
+// into interface_addresses by device + ifIndex).
+func (c *Collector) newInterfaceAddress(addr string, meta map[string]string) *v1.TelemetryPacket {
+	now := time.Now().UnixNano()
+	id := packet.NewID()
+	nonce := c.signer.NextNonce()
+	canonical := packet.CanonicalBytes(id, c.target.SourceID(), now, "interface.address", addr, 0, nonce)
+	sig := c.signer.Sign(canonical)
+	return &v1.TelemetryPacket{
+		Id:           id,
+		OrgId:        c.base.orgID,
+		DatacenterId: c.base.dcID,
+		FloorId:      c.base.floorID,
+		NetworkId:    c.base.netID,
+		GroupId:      c.base.grpID,
+		SourceType:   "device",
+		SourceId:     c.target.SourceID(),
+		ReaderId:     c.base.readerID,
+		TimestampNs:  now,
+		Name:         "interface.address",
+		Tag:          addr,
+		Value:        0,
+		Meta:         meta,
+		Kind:         "interface_address",
+		Signature:    sig,
+		Nonce:        nonce,
+	}
 }
 
 // walkIfMap is the shared driver for both interface walks. Resolves the
@@ -604,6 +768,20 @@ func (c *Collector) collectLLDP() ([]*v1.TelemetryPacket, error) {
 		}
 	}
 
+	// lldpRemChassisId carries the neighbor's MANAGEMENT IP (the simulator encodes
+	// chassis-id = neighbor.mgmt_ip with subtype network-address). This is a STABLE
+	// identifier: unlike lldpRemSysName it never changes when a device is renamed.
+	// DCS resolves the link's far end by this mgmt_ip first (hostname only as
+	// fallback), so renames and name/shard-sync lag no longer drop links.
+	remChassis := make(map[string]string)
+	if pdus5, err5 := c.client.Walk(OIDLLDPRemChassisId); err5 == nil {
+		for _, p := range pdus5 {
+			if suf := oidSuffix(p.Name, OIDLLDPRemChassisId); suf != "" {
+				remChassis[suf] = PDUString(p)
+			}
+		}
+	}
+
 	// Local port name resolution — three levels of fallback:
 	//   1. lldpLocPortId   (portNum → port identifier string)
 	//   2. lldpLocPortDesc (portNum → port description)
@@ -658,7 +836,24 @@ func (c *Collector) collectLLDP() ([]*v1.TelemetryPacket, error) {
 		meta["local_port_index"] = strconv.Itoa(portNumInt + 1)
 		meta["remote_sys_name"] = remoteSysName
 		meta["remote_port_id"] = remPortIds[suf]
-		meta["layer"] = "network"
+		// Stable far-end identifier (mgmt IP from lldpRemChassisId). Only set when
+		// it parses as an IP — real devices may use a MAC chassis-id subtype, which
+		// we ignore so DCS falls back to hostname resolution.
+		if ch := remChassis[suf]; ch != "" && net.ParseIP(ch) != nil {
+			meta["remote_mgmt_ip"] = ch
+		}
+		// Classify the link layer so the UI can render the production fabric only.
+		// A link is "management" when either endpoint is an out-of-band management
+		// switch (OOB-SW-*) or this device is itself an OOB switch — i.e. it rides
+		// the management network, not the production data-plane. Everything else is
+		// "network" (production). Without this, mgmt links were all tagged "network"
+		// and inflated the topology past the real production link count.
+		layer := "network"
+		if c.target.DeviceType == "oob_switch" ||
+			strings.Contains(strings.ToUpper(remoteSysName), "OOB") {
+			layer = "management"
+		}
+		meta["layer"] = layer
 
 		pkts = append(pkts, c.newTopology("lldp.neighbor", localPort, meta))
 	}

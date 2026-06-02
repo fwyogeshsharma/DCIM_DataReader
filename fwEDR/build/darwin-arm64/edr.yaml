@@ -23,8 +23,9 @@ discovery:
     - "192.168.1.0/24"
     - "192.168.2.0/24"
   snmp_agent: "127.0.0.1"
-  seed_ip:    "192.168.1.6"
-  interval_hours: 1
+  seed_ip:    "192.168.0.7"
+  interval_hours: 0      # 0 = no auto-rediscovery; EDR stays idle after the one-shot walk (manual rediscovery via --rediscover)
+  enrich:         true   # one-time post-walk ipAdEntAddr pass — populates interface_addresses + OOB/loopback IPs (its log noise is demoted to Debug)
 
 snmp:
   community:           "public"
@@ -32,27 +33,41 @@ snmp:
   poll_interval_ms:    30000
   timeout_ms:          5000   # sim is slow under load; give walks time to complete instead of timing out + retrying
   retries:             0      # don't double-hit a slow single-process simulator
-  trap_addr:           ":162"
-  max_concurrent:      8      # safe now that load is spread across `shards` responders + sockets are reused per target
-  rate_limit_per_sec:  50
+  trap_addr:           "127.0.0.1:162"
+  max_concurrent:      4      # GLOBAL concurrent SNMP socket cap (all tiers). Clamped to shards*2 in shard mode. Low on Windows to avoid WSAENOBUFS socket exhaustion.
+  rate_limit_per_sec:  20     # global SNMP req/sec token bucket — keep modest for the single-process shard responders.
+  walk_medium:         true   # interface state (also builds interfaces table — needed for link-event interface correlation)
+  walk_topology:       false  # topology comes from the JSON (instant, complete) — skip slow LLDP topology walk and avoid duplicate rows
+  walk_slow:           false  # SKIP heavy counter/HR/UPS/sensor walks — biggest SNMP load, not needed for inventory or link topology
+  walk_sensors:        true   # environment sensors ONLY (temperature/humidity from sensor+PDU devices) for the heatmap — light, independent of walk_slow
   breaker_threshold:   3
   breaker_cooldown_ms: 30000
-  # Sharding: run N snmpsim responders (see scripts/run_snmp_shards.ps1) so the
-  # single-process wedge goes away and EDR can poll concurrently. Shard 0 = port
-  # 161 (enrichment/discovery target it), shards 1..N-1 = shard_base_port+i.
-  # Set shards: 1 to disable (everything on 161 — original behavior).
-  shards:              4
-  shard_base_port:     16100   # → responders on 161, 16101, 16102, 16103
-  # Let edr.exe launch the snmpsim responders itself (sim/test only). Set false
-  # in production. When true, stop the simulator GUI's SNMP first (port 161).
-  shard_spawn:          true
-  shard_responder_path: "C:\\Users\\Faber\\Desktop\\fwDCIM\\Datacenter_Network_Simulator\\.venv\\Scripts\\snmpsim-command-responder.exe"
-  shard_data_dir:       "C:\\Users\\Faber\\Desktop\\fwDCIM\\Datacenter_Network_Simulator\\datasets\\snmp"
+  metrics_log_interval_ms: 0   # 0 = no periodic "snmp poll metrics" log line (quiet once idle)
+  # DECOUPLED: EDR is a pure external collector. It polls the simulator's OWN
+  # snmpsim responder on 127.0.0.1:161 — that process listens on 0.0.0.0:161 and
+  # routes each request to the right device by the SNMP community (= device mgmt
+  # IP), exactly as a real NMS would poll real hardware. EDR no longer spawns its
+  # own responders, so it has ZERO dependency on simulator file paths and does not
+  # double the socket load (which caused WSAENOBUFS). SNMP is one-shot inventory
+  # only (system + interfaces); gNMI proxy carries all ongoing telemetry.
+  shards:              1       # no sharding — single shared responder on 161, community routes per device
+  shard_base_port:     16100   # unused when shards=1
+  shard_spawn:          false  # NEVER launch responders — collector stays independent of the simulator
+  shard_responder_path: ""     # unused
+  shard_data_dir:       ""     # unused
 
 gnmi:
-  enabled:          false   # simulator has no gNMI servers; SNMP-only. Set true when gNMI endpoints exist.
-  port:             57400
-  poll_interval_ms: 30000
+  enabled:          true    # ongoing telemetry source after the one-shot SNMP discovery walk
+  # Preferred path: ONE aggregated subscription to the proxy streams telemetry,
+  # status and alarms for ALL devices over a single connection (no per-device gNMI
+  # connections). Devices are resolved from each notification's prefix.target.
+  proxy_addr:       "127.0.0.1:50051"
+  # Temporary fallback: if the proxy is unreachable, EDR opens direct per-device
+  # gNMI on fallback_port, then automatically tears it down and returns to the
+  # single proxy subscription once the proxy recovers.
+  fallback_port:    57400
+  proxy_probe_interval_ms: 5000   # how often to re-check the proxy while in fallback
+  poll_interval_ms: 30000         # gNMI SAMPLE interval — periodic status/counters
   tls:
     insecure: true
   username: ""

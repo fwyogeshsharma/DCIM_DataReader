@@ -24,6 +24,10 @@ type DB struct {
 	pool *pgxpool.Pool
 }
 
+// Pool exposes the underlying connection pool for integration test harnesses
+// (e.g. cmd/linktest) that need ad-hoc read queries. Not used by the pipeline.
+func (db *DB) Pool() *pgxpool.Pool { return db.pool }
+
 // New creates a DB, runs schema migrations, and returns a ready store.
 func New(ctx context.Context, dsn string) (*DB, error) {
 	pool, err := pgxpool.New(ctx, dsn)
@@ -136,6 +140,63 @@ func (db *DB) UpsertDevice(ctx context.Context, pkt *v1.TelemetryPacket) error {
 	rackRow := nilIfZeroInt(atoi(pkt.Meta["rack_row"]))
 	rackNum := nilIfZeroInt(atoi(pkt.Meta["rack_num"]))
 	rackUnit := nilIfZeroInt(atoi(pkt.Meta["rack_unit"]))
+
+	// Rename-safe identity: a device is the same box as long as its mgmt_ip is
+	// the same, regardless of hostname. So when we already have a row for this
+	// mgmt_ip, UPDATE it in place (including the hostname) — this makes renaming a
+	// device in the simulator update the existing row instead of inserting a
+	// duplicate. We fall through to the INSERT path only when mgmt_ip is new or
+	// empty (first sight). hostname's unique index is untouched: updating one
+	// row's hostname to a new, non-colliding value never trips it.
+	mgmtIP := pkt.Meta["mgmt_ip"]
+	if mgmtIP != "" {
+		tag, err := db.pool.Exec(ctx, `
+			UPDATE devices SET
+				hostname        = $7,
+				device_type     = $8,
+				vendor          = COALESCE(NULLIF($9,''),  vendor),
+				model_name      = COALESCE(NULLIF($10,''), model_name),
+				os_name         = COALESCE(NULLIF($11,''), os_name),
+				os_version      = COALESCE(NULLIF($12,''), os_version),
+				sys_description = COALESCE(NULLIF($13,''), sys_description),
+				prod_ip         = COALESCE(NULLIF($14,'')::INET, prod_ip),
+				loopback_ip     = COALESCE(NULLIF($15,'')::INET, loopback_ip),
+				oob_ip          = COALESCE(NULLIF($16,'')::INET, oob_ip),
+				snmp_enabled    = $17 OR snmp_enabled,
+				gnmi_enabled    = $18 OR gnmi_enabled,
+				collector_agent = $19,
+				country         = COALESCE(NULLIF($20,''), country),
+				datacenter_city = COALESCE(NULLIF($21,''), datacenter_city),
+				datacenter      = COALESCE(NULLIF($22,''), datacenter),
+				room            = COALESCE(NULLIF($23,''), room),
+				rack_row        = COALESCE($24::SMALLINT, rack_row),
+				rack_num        = COALESCE($25::SMALLINT, rack_num),
+				rack_unit       = COALESCE($26::SMALLINT, rack_unit),
+				is_reachable    = TRUE,
+				last_seen_at    = now(),
+				updated_at      = now(),
+				datacenter_id   = COALESCE(NULLIF($2,''), datacenter_id),
+				floor_id        = COALESCE(NULLIF($3,''), floor_id),
+				network_id      = COALESCE(NULLIF($4,''), network_id),
+				group_id        = COALESCE(NULLIF($5,''), group_id)
+			WHERE org_id=$1 AND mgmt_ip = $6::INET`,
+			pkt.OrgId, pkt.DatacenterId, pkt.FloorId, pkt.NetworkId, pkt.GroupId,
+			mgmtIP, hostname, deviceType,
+			pkt.Meta["vendor"], pkt.Meta["model_name"], pkt.Meta["os_name"],
+			pkt.Meta["platform_version"], pkt.Meta["sys_description"],
+			pkt.Meta["prod_ip"], pkt.Meta["loopback_ip"], pkt.Meta["oob_ip"],
+			snmpEnabled, gnmiEnabled, collectorAgent,
+			pkt.Meta["country"], pkt.Meta["datacenter_city"], pkt.Meta["datacenter"], pkt.Meta["room"],
+			rackRow, rackNum, rackUnit,
+		)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() > 0 {
+			return nil
+		}
+		// no existing row for this mgmt_ip → first sight; fall through to INSERT.
+	}
 
 	_, err := db.pool.Exec(ctx, `
 		INSERT INTO devices (
@@ -445,11 +506,25 @@ func (db *DB) WriteEvent(ctx context.Context, deviceID, sourceHostname string, p
 	if agent == "" {
 		agent = collectorAgentFromReaderID(pkt.ReaderId)
 	}
+	// Link correlation columns (peer endpoint + link id) are populated by
+	// handleLinkTrap via pkt.Meta for a linkDown/linkUp that resolved to a
+	// topology_links row; they are empty (→ NULL) for every other event. This lets
+	// the UI render one "A:portA <-> B:portB DOWN" entry from the events stream
+	// without a separate table.
 	_, err := db.pool.Exec(ctx, `
-		INSERT INTO events (device_id, source_hostname, ts, kind, event_name, severity, trap_oid, source_ip, event_payload, collector_agent)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8,'')::INET, $9, $10)`,
+		INSERT INTO events (device_id, source_hostname, src_port_name,
+		                    dst_device_id, dst_hostname, dst_port_name, link_id,
+		                    ts, kind, event_name, severity, trap_oid, source_ip, event_payload, collector_agent)
+		VALUES ($1, $2, NULLIF($3,''),
+		        NULLIF($4,'')::UUID, NULLIF($5,''), NULLIF($6,''), NULLIF($7,'')::UUID,
+		        $8, $9, $10, $11, $12, NULLIF($13,'')::INET, $14, $15)`,
 		nilIfEmpty(deviceID),
 		nilIfEmpty(sourceHostname),
+		pkt.Meta["src_port_name"],
+		pkt.Meta["dst_device_id"],
+		pkt.Meta["dst_hostname"],
+		pkt.Meta["dst_port_name"],
+		pkt.Meta["link_id"],
 		ts,
 		pkt.Kind,
 		pkt.Name,
@@ -460,6 +535,137 @@ func (db *DB) WriteEvent(ctx context.Context, deviceID, sourceHostname string, p
 		agent,
 	)
 	return err
+}
+
+// LinkRow is one topology_links row resolved verbatim — its two endpoints are
+// the AUTHORITATIVE devices for the link. Src/Dst follow the row's own column
+// order (NOT trap-relative); no neighbor is ever inferred.
+type LinkRow struct {
+	LinkID      string
+	Layer       string
+	SrcDeviceID string
+	SrcHostname string
+	SrcPort     string
+	DstDeviceID string
+	DstHostname string
+	DstPort     string
+}
+
+// CorrelateLinkByPort finds the EXACT topology_links row that owns the interface
+// named in a link trap, for the device that sent it. topology_links is the single
+// source of truth: a (device, port) pair belongs to exactly one network link, so
+// the match is unique.
+//
+// PORT NUMBERING — the critical detail. topology_links.src_/dst_port_name store
+// the 0-based interface index (the simulator/EDR JSON edge port). A trap, however,
+// carries the IF-MIB ifIndex which is 1-based: EDR's loader documents
+// "src_iface/dst_iface are 0-based; +1 = SNMP ifIndex". So the trap's raw ifIndex
+// is ONE MORE than the stored port_name. Matching the raw ifIndex against
+// port_name lands on the NEIGHBOURING link (the FW2-instead-of-FW1 bug). We must
+// match the 0-based port, derived as:
+//  1. the trailing digits of ifName  (e.g. "eth3" -> "3") — explicit identity, or
+//  2. ifIndex - 1                     (1-based ifIndex back to the 0-based port).
+//
+// The raw ifIndex is never used as a key.
+//
+// There is deliberately NO fallback: we never pick "the device's only other
+// link", never scan for another active edge, never guess a neighbour. If no row
+// matches, found=false and the caller records nothing (the raw trap still lands
+// in `events`).
+func (db *DB) CorrelateLinkByPort(ctx context.Context, deviceID string, ifIndex int, ifName string) (LinkRow, bool, error) {
+	var r LinkRow
+	match := func(port string) (bool, error) {
+		if port == "" {
+			return false, nil
+		}
+		err := db.pool.QueryRow(ctx, `
+			SELECT id::text, layer,
+			       src_device_id::text, dst_device_id::text,
+			       src_port_name, dst_port_name
+			FROM topology_links
+			WHERE layer='network' AND (
+			      (src_device_id=$1::uuid AND src_port_name=$2)
+			   OR (dst_device_id=$1::uuid AND dst_port_name=$2))
+			LIMIT 1`,
+			deviceID, port).Scan(&r.LinkID, &r.Layer, &r.SrcDeviceID, &r.DstDeviceID, &r.SrcPort, &r.DstPort)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return false, nil
+			}
+			return false, err
+		}
+		return r.LinkID != "", nil
+	}
+
+	// Build 0-based port candidates in priority order; raw ifIndex is excluded.
+	for _, port := range portCandidates(ifIndex, ifName) {
+		ok, err := match(port)
+		if err != nil {
+			return LinkRow{}, false, err
+		}
+		if ok {
+			_ = db.pool.QueryRow(ctx, `SELECT hostname FROM devices WHERE id=$1::uuid`, r.SrcDeviceID).Scan(&r.SrcHostname)
+			_ = db.pool.QueryRow(ctx, `SELECT hostname FROM devices WHERE id=$1::uuid`, r.DstDeviceID).Scan(&r.DstHostname)
+			return r, true, nil
+		}
+	}
+	return LinkRow{}, false, nil
+}
+
+// portCandidates returns the 0-based port_name keys to try for a link trap, in
+// priority order, de-duplicated. ifName's trailing digits first ("eth3" -> "3"),
+// then ifIndex-1 (1-based SNMP ifIndex back to the 0-based port). The raw ifIndex
+// is intentionally NOT a candidate — it is off by one from port_name.
+func portCandidates(ifIndex int, ifName string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	add(trailingDigits(ifName))
+	if ifIndex >= 1 {
+		add(strconv.Itoa(ifIndex - 1))
+	}
+	return out
+}
+
+// trailingDigits returns the trailing run of digits in s ("eth3" -> "3",
+// "Gi0/12" -> "12", "eth" -> ""). Used to recover the 0-based port index from an
+// interface name.
+func trailingDigits(s string) string {
+	i := len(s)
+	for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
+		i--
+	}
+	return s[i:]
+}
+
+// SetLinkActive flips topology_links.is_active for the WHOLE physical link — BOTH
+// directed rows of the device pair, so an A→B / B→A pair never goes half-stale.
+// Only the two devices in `row` are used; no neighbour is inferred.
+//
+// changed reports whether is_active actually transitioned (false = already in the
+// desired state, e.g. the peer's duplicate trap or a same-state repeat). The
+// caller uses that to write exactly ONE enriched link event per real transition.
+func (db *DB) SetLinkActive(ctx context.Context, row LinkRow, down bool) (changed bool, err error) {
+	layer := row.Layer
+	if layer == "" {
+		layer = "network"
+	}
+	desired := !down
+	tag, e := db.pool.Exec(ctx, `
+		UPDATE topology_links SET is_active=$3, updated_at=now()
+		WHERE layer=$4 AND is_active <> $3 AND (
+		      (src_device_id=$1::uuid AND dst_device_id=$2::uuid)
+		   OR (src_device_id=$2::uuid AND dst_device_id=$1::uuid))`,
+		row.SrcDeviceID, row.DstDeviceID, desired, layer)
+	if e != nil {
+		return false, e
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // ─── device state ─────────────────────────────────────────────────────────────
@@ -518,8 +724,10 @@ func (db *DB) UpsertLinks(ctx context.Context, links []TopologyLink) error {
 				link_type         = COALESCE(EXCLUDED.link_type,         topology_links.link_type),
 				protocol          = EXCLUDED.protocol,
 				-- relation is owned by RecomputeHierarchy (BFS); preserve it
-				-- across LLDP re-polls so the spanning-tree classification sticks.
-				is_active         = TRUE,
+				-- across re-polls so the spanning-tree classification sticks.
+				-- is_active is owned by the link-state machine (linkDown/linkUp traps,
+				-- LinkStateChange) — NEVER reset it here, or a periodic topology
+				-- re-emit would silently flip a broken link back to UP.
 				updated_at        = now()`,
 			l.Layer, l.SrcDeviceID, l.SrcPortName, l.DstDeviceID, l.DstPortName,
 			nilIfEmpty(l.SrcInterfaceID), nilIfEmpty(l.DstInterfaceID),
@@ -536,21 +744,39 @@ func (db *DB) UpsertLinks(ctx context.Context, links []TopologyLink) error {
 // WriteTopologyLink resolves LLDP neighbor hostnames to device UUIDs,
 // resolves interface UUIDs for both endpoints, and upserts the link row.
 func (db *DB) WriteTopologyLink(ctx context.Context, pkt *v1.TelemetryPacket) error {
-	srcID, _ := db.DeviceIDBySource(ctx,
-		pkt.OrgId, pkt.DatacenterId, pkt.FloorId,
-		pkt.NetworkId, pkt.GroupId, pkt.SourceId)
+	// Resolve the SOURCE device. Prefer the stable mgmt_ip (rename-proof) over the
+	// hostname: the polling device carries its own mgmt_ip in Meta, and IP is
+	// unique within a tenant, so dc/floor are left blank. Hostname (SourceId) is
+	// the fallback for any packet without mgmt_ip.
+	srcID := ""
+	if mip := pkt.Meta["mgmt_ip"]; mip != "" {
+		srcID, _ = db.DeviceIDByIP(ctx, pkt.OrgId, "", "", pkt.NetworkId, pkt.GroupId, mip)
+	}
+	if srcID == "" {
+		srcID, _ = db.DeviceIDBySource(ctx,
+			pkt.OrgId, pkt.DatacenterId, pkt.FloorId,
+			pkt.NetworkId, pkt.GroupId, pkt.SourceId)
+	}
 	if srcID == "" {
 		return nil
 	}
-	remSysName := pkt.Meta["remote_sys_name"]
-	if remSysName == "" {
-		return nil
+
+	// Resolve the DESTINATION (LLDP neighbor). Prefer the stable mgmt_ip carried in
+	// remote_mgmt_ip (from lldpRemChassisId) — this is what fixes both the missing
+	// links and rename-breaks-correlation: name-only resolution silently dropped a
+	// link whenever the advertised neighbor name didn't exactly match devices.hostname
+	// (rename, shard-sync lag, etc.). Hostname is the fallback. dc/floor blank so
+	// cross-DC links resolve.
+	dstID := ""
+	if rmip := pkt.Meta["remote_mgmt_ip"]; rmip != "" {
+		dstID, _ = db.DeviceIDByIP(ctx, pkt.OrgId, "", "", pkt.NetworkId, pkt.GroupId, rmip)
 	}
-	// Destination may be in a different datacenter than the source (cross-DC
-	// LLDP links). DeviceIDByOrgAndHostname searches by org/network/group only —
-	// no datacenter_id filter — so it resolves correctly for multi-DC topologies.
-	dstID, _ := db.DeviceIDByOrgAndHostname(ctx,
-		pkt.OrgId, pkt.NetworkId, pkt.GroupId, remSysName)
+	if dstID == "" {
+		if remSysName := pkt.Meta["remote_sys_name"]; remSysName != "" {
+			dstID, _ = db.DeviceIDByOrgAndHostname(ctx,
+				pkt.OrgId, pkt.NetworkId, pkt.GroupId, remSysName)
+		}
+	}
 	if dstID == "" {
 		return nil
 	}
@@ -658,6 +884,15 @@ func (db *DB) DeviceIDByIP(ctx context.Context,
 // of mgmt_ip / prod_ip / loopback_ip / oob_ip. Resolution order favours
 // mgmt_ip — the canonical operator-facing IP — so trap sources that carry the
 // management address (e.g. sim trap community) resolve first.
+// dc/floor are applied ONLY when non-empty. A trap packet carries no per-device
+// scope today — the trap receiver uses the global identity, whose
+// datacenter_id/floor_id are blank (per-device DC/floor ride only on polled
+// metrics from the topology). The old hard filter `datacenter_id=$2 AND
+// floor_id=$3` matched zero devices against blank values, so events.device_id
+// and source_hostname stayed NULL. The conditional below resolves by
+// org+network+group+IP when scope is absent, and tightens to the exact DC/floor
+// the moment a future trap (or simulator) supplies them — no assumption either
+// way. IPs are unique within a tenant, so this stays correct in both modes.
 func (db *DB) DeviceByIP(ctx context.Context,
 	orgID, dcID, floorID, netID, grpID, ip string) (string, string, bool) {
 
@@ -668,8 +903,9 @@ func (db *DB) DeviceByIP(ctx context.Context,
 	err := db.pool.QueryRow(ctx, `
 		SELECT id, hostname
 		FROM   devices
-		WHERE  org_id=$1 AND datacenter_id=$2 AND floor_id=$3
-		  AND  network_id=$4 AND group_id=$5
+		WHERE  org_id=$1 AND network_id=$4 AND group_id=$5
+		  AND  ($2='' OR datacenter_id=$2)
+		  AND  ($3='' OR floor_id=$3)
 		  AND  ($6::INET IN (mgmt_ip, prod_ip, loopback_ip, oob_ip))
 		ORDER BY ($6::INET = mgmt_ip)     DESC,
 		         ($6::INET = prod_ip)     DESC,

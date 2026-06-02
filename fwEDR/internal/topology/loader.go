@@ -20,10 +20,40 @@ var gnmiCapable = map[string]bool{
 
 type topoFile struct {
 	Nodes []topoNode `json:"nodes"`
+	Edges []topoEdge `json:"edges"`
 }
 
 type topoNode struct {
+	ID     string     `json:"id"` // node id referenced by edge src/dst
 	Device topoDevice `json:"device"`
+}
+
+// topoEdge maps one entry of the topology JSON "edges" array. The simulator tags
+// every edge with a layer: "production" (data-plane fabric, also discoverable via
+// LLDP), "management" (device ↔ OOB switch), or "power" (floor PDU → UPS → rack
+// PDU → device). src/dst reference node ids; src_iface/dst_iface are 0-based
+// interface-list positions on each endpoint.
+type topoEdge struct {
+	Src      string `json:"src"`
+	Dst      string `json:"dst"`
+	SrcIface int    `json:"src_iface"`
+	DstIface int    `json:"dst_iface"`
+	Layer    string `json:"layer"`
+}
+
+// LinkEdge is a topology edge resolved from node ids to device hostnames, ready
+// to be emitted as a DCS topology packet. Carries the source device's
+// datacenter/floor so the packet routes into the correct tenant scope.
+type LinkEdge struct {
+	SrcHost         string
+	DstHost         string
+	SrcMgmtIP       string // stable identifiers — DCS resolves endpoints by mgmt_ip first
+	DstMgmtIP       string
+	SrcDatacenterID string
+	SrcFloorID      string
+	Layer           string // "network" | "management" | "power"
+	SrcPortIndex    int    // 0-based; +1 = SNMP ifIndex
+	DstPortIndex    int
 }
 
 // topoDevice maps the simulator topology JSON "device" object.
@@ -127,6 +157,70 @@ func LoadTargets(path string) ([]config.TargetConfig, error) {
 			tc.GNMIIP = mgmtIP // connect to per-device gNMI server on mgmt IP
 		}
 		out = append(out, tc)
+	}
+	return out, nil
+}
+
+// LoadTopologyLinks parses a simulator topology JSON and returns ALL edges
+// (production/management/power) resolved from node ids to device hostnames +
+// mgmt IPs. The simulator topology JSON is the complete, authoritative source of
+// the port → connected-device relation, available instantly at startup — no
+// dependence on the (slow, sometimes incomplete) LLDP walk. DCS builds
+// topology_links from these, so a link-down trap can immediately look up the peer
+// and write a single merged event.
+//
+// The sim's "production" layer is mapped to DCS's "network" layer value.
+func LoadTopologyLinks(path string) ([]LinkEdge, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("topology: open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	var topo topoFile
+	if err := json.NewDecoder(f).Decode(&topo); err != nil {
+		return nil, fmt.Errorf("topology: decode %s: %w", path, err)
+	}
+
+	type nodeInfo struct{ host, mgmtIP, dc, floor string }
+	idx := make(map[string]nodeInfo, len(topo.Nodes))
+	for _, n := range topo.Nodes {
+		if n.ID == "" || n.Device.Name == "" {
+			continue
+		}
+		// mgmt_ip = explicit field, else snmp_community (sim ≤ v2.1 convention).
+		mgmtIP := n.Device.MgmtIPExplicit
+		if mgmtIP == "" {
+			mgmtIP = n.Device.SNMPCommunity
+		}
+		idx[n.ID] = nodeInfo{host: n.Device.Name, mgmtIP: mgmtIP, dc: n.Device.Datacenter, floor: n.Device.Floor}
+	}
+
+	out := make([]LinkEdge, 0, len(topo.Edges))
+	for _, e := range topo.Edges {
+		layer := e.Layer
+		if layer == "production" {
+			layer = "network" // DCS layer convention
+		}
+		if layer != "network" && layer != "management" && layer != "power" {
+			continue
+		}
+		s, ok1 := idx[e.Src]
+		d, ok2 := idx[e.Dst]
+		if !ok1 || !ok2 || s.host == "" || d.host == "" {
+			continue
+		}
+		out = append(out, LinkEdge{
+			SrcHost:         s.host,
+			DstHost:         d.host,
+			SrcMgmtIP:       s.mgmtIP,
+			DstMgmtIP:       d.mgmtIP,
+			SrcDatacenterID: s.dc,
+			SrcFloorID:      s.floor,
+			Layer:           layer,
+			SrcPortIndex:    e.SrcIface,
+			DstPortIndex:    e.DstIface,
+		})
 	}
 	return out, nil
 }

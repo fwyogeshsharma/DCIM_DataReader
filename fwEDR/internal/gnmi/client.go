@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,20 +42,34 @@ var platformPaths = []string{
 	"/components/component[name=*]/state/temperature",
 }
 
-// Subscriber maintains one gNMI connection per target.
+// Subscriber maintains one gNMI subscription. In single mode it subscribes to one
+// device (used for the direct :57400 fallback). In aggregated mode it holds ONE
+// subscription to the proxy with an empty prefix.target — the proxy streams every
+// device in that single connection — and resolves each notification to its device
+// via the prefix.target carried on the wire.
 type Subscriber struct {
-	target *target.Target
+	target *target.Target // single mode: the one device
+	base   basePacket     // single mode: that device's routing keys
 	cfg    config.GNMIConfig
-	base   basePacket
 	signer *packet.Signer
 	log    *zap.Logger
+
+	aggregated bool                           // true → one subscription for all devices
+	resolve    func(ip string) *deviceBinding // aggregated mode: prefix.target → device
 }
 
 type basePacket struct {
 	orgID, dcID, floorID, netID, grpID, readerID string
 }
 
-// NewSubscriber creates a Subscriber for one target.
+// deviceBinding pairs a device with its packet routing keys, resolved per
+// notification in aggregated mode.
+type deviceBinding struct {
+	t    *target.Target
+	base basePacket
+}
+
+// NewSubscriber creates a single-device Subscriber (direct mode / fallback).
 func NewSubscriber(
 	t *target.Target,
 	cfg config.GNMIConfig,
@@ -63,18 +79,48 @@ func NewSubscriber(
 ) *Subscriber {
 	return &Subscriber{
 		target: t,
-		cfg:    cfg,
 		base:   basePacket{orgID, dcID, floorID, netID, grpID, readerID},
+		cfg:    cfg,
 		signer: signer,
 		log:    log,
 	}
+}
+
+// NewAggregator creates a Subscriber that holds ONE subscription to the proxy and
+// fans every device's telemetry out of that single stream. resolve maps a
+// notification's prefix.target (device mgmt/prod IP) to the device + routing keys.
+func NewAggregator(
+	cfg config.GNMIConfig,
+	resolve func(ip string) *deviceBinding,
+	signer *packet.Signer,
+	log *zap.Logger,
+) *Subscriber {
+	return &Subscriber{
+		cfg:        cfg,
+		signer:     signer,
+		log:        log,
+		aggregated: true,
+		resolve:    resolve,
+	}
+}
+
+// binding resolves the device for a notification. Aggregated mode looks up by the
+// wire prefix.target; single mode always returns its one device.
+func (s *Subscriber) binding(ip string) *deviceBinding {
+	if s.aggregated {
+		if s.resolve == nil {
+			return nil
+		}
+		return s.resolve(ip)
+	}
+	return &deviceBinding{t: s.target, base: s.base}
 }
 
 // Subscribe opens a gNMI ONCE subscription and returns decoded metrics.
 // Use ONCE (not STREAM) for one-shot polling fallback. Prefer RunStream for
 // long-lived collection — it bypasses the SNMP simulator entirely.
 func (s *Subscriber) Subscribe(ctx context.Context) ([]*v1.TelemetryPacket, error) {
-	addr := fmt.Sprintf("%s:%d", s.target.GNMIIP, s.cfg.Port)
+	addr := s.dialAddr()
 	conn, err := s.dial(addr)
 	if err != nil {
 		return nil, err
@@ -88,15 +134,18 @@ func (s *Subscriber) Subscribe(ctx context.Context) ([]*v1.TelemetryPacket, erro
 		ctx = metadata.NewOutgoingContext(ctx, md)
 	}
 
-	paths := append(interfacePaths, systemPaths...)
-	paths = append(paths, platformPaths...)
-
+	// Root subscription — see RunStream for why per-leaf wildcard paths return
+	// nothing against the simulator's gNMI proxy.
 	subList := &gnmipb.SubscriptionList{
 		Mode:         gnmipb.SubscriptionList_ONCE,
-		Subscription: pathsToSubs(paths, gnmipb.SubscriptionMode_SAMPLE, 0),
+		Subscription: []*gnmipb.Subscription{{Path: &gnmipb.Path{}}},
 	}
-	if s.target.ProdIP != "" {
-		subList.Prefix = &gnmipb.Path{Target: s.target.ProdIP}
+	// Aggregated mode sends NO prefix.target → the proxy streams every device in
+	// this one subscription. Single mode pins the subscription to its device.
+	if !s.aggregated {
+		if tgt := s.gnmiTarget(); tgt != "" {
+			subList.Prefix = &gnmipb.Path{Target: tgt}
+		}
 	}
 	req := &gnmipb.SubscribeRequest{
 		Request: &gnmipb.SubscribeRequest_Subscribe{
@@ -134,7 +183,7 @@ func (s *Subscriber) Subscribe(ctx context.Context) ([]*v1.TelemetryPacket, erro
 // the function returns nil if ctx is done, otherwise the error — the caller
 // reconnects with backoff.
 func (s *Subscriber) RunStream(ctx context.Context, out chan<- *v1.TelemetryPacket) error {
-	addr := fmt.Sprintf("%s:%d", s.target.GNMIIP, s.cfg.Port)
+	addr := s.dialAddr()
 	conn, err := s.dial(addr)
 	if err != nil {
 		return fmt.Errorf("gnmi dial %s: %w", addr, err)
@@ -153,39 +202,29 @@ func (s *Subscriber) RunStream(ctx context.Context, out chan<- *v1.TelemetryPack
 		sampleNs = 30 * uint64(time.Second)
 	}
 
-	subs := make([]*gnmipb.Subscription, 0, len(interfacePaths)+len(systemPaths)+len(platformPaths))
-	// Counters → SAMPLE every sampleNs
-	for _, p := range []string{
-		"/interfaces/interface[name=*]/state/counters",
-		"/system/state/uptime",
-		"/system/cpus/cpu[index=ALL]/state",
-		"/system/memory/state",
-		"/components/component[name=*]/state/temperature",
-	} {
-		subs = append(subs, &gnmipb.Subscription{
-			Path:           parsePath(p),
+	// Subscribe to the device ROOT (empty path). The simulator's gNMI proxy
+	// returns the whole OpenConfig device tree as a single JSON-IETF subtree and
+	// does NOT resolve wildcard list keys ([name=*]) — a per-leaf wildcard path
+	// matches nothing and yields zero updates. decodeNotification walks the root
+	// tree and extracts interface counters/status, system CPU/memory/uptime and
+	// component temperatures. In STREAM mode the server re-pushes the full
+	// snapshot every sample interval (it does not honor per-sub ON_CHANGE), so
+	// status changes arrive on the next sample.
+	subList := &gnmipb.SubscriptionList{
+		Mode: gnmipb.SubscriptionList_STREAM,
+		Subscription: []*gnmipb.Subscription{{
+			Path:           &gnmipb.Path{}, // root
 			Mode:           gnmipb.SubscriptionMode_SAMPLE,
 			SampleInterval: sampleNs,
-		})
+		}},
+		UpdatesOnly: false,
 	}
-	// Status → ON_CHANGE for immediate link-state transitions
-	for _, p := range []string{
-		"/interfaces/interface[name=*]/state/oper-status",
-		"/interfaces/interface[name=*]/state/admin-status",
-	} {
-		subs = append(subs, &gnmipb.Subscription{
-			Path: parsePath(p),
-			Mode: gnmipb.SubscriptionMode_ON_CHANGE,
-		})
-	}
-
-	subList := &gnmipb.SubscriptionList{
-		Mode:         gnmipb.SubscriptionList_STREAM,
-		Subscription: subs,
-		UpdatesOnly:  false,
-	}
-	if s.target.ProdIP != "" {
-		subList.Prefix = &gnmipb.Path{Target: s.target.ProdIP}
+	// Aggregated mode sends NO prefix.target → the proxy streams every device in
+	// this one subscription. Single mode pins the subscription to its device.
+	if !s.aggregated {
+		if tgt := s.gnmiTarget(); tgt != "" {
+			subList.Prefix = &gnmipb.Path{Target: tgt}
+		}
 	}
 
 	stream, err := client.Subscribe(ctx)
@@ -233,13 +272,31 @@ func (s *Subscriber) RunStream(ctx context.Context, out chan<- *v1.TelemetryPack
 // ─── decoding ────────────────────────────────────────────────────────────────
 
 func (s *Subscriber) decodeNotification(n *gnmipb.Notification) []*v1.TelemetryPacket {
-	var pkts []*v1.TelemetryPacket
 	ts := time.Unix(0, n.GetTimestamp()).UTC().UnixNano()
-	if ts == 0 {
+	if ts <= 0 {
 		ts = time.Now().UnixNano()
 	}
 
+	// Resolve which device this notification belongs to. Aggregated mode keys on
+	// the wire prefix.target; single mode ignores it and uses its one device.
+	b := s.binding(n.GetPrefix().GetTarget())
+	if b == nil || b.t == nil {
+		return nil // unknown device behind the proxy — skip
+	}
+
+	var pkts []*v1.TelemetryPacket
 	for _, upd := range n.GetUpdate() {
+		// Simulator (and any JSON-IETF target) delivers a JSON subtree per update —
+		// not a scalar leaf. Walk the OpenConfig tree and emit one packet per leaf.
+		if raw := jsonBytesOf(upd.GetVal()); len(raw) > 0 {
+			var root map[string]any
+			if err := json.Unmarshal(raw, &root); err == nil {
+				pkts = append(pkts, s.emitTree(b, root, ts)...)
+				continue
+			}
+			// not a JSON object — fall through to scalar handling
+		}
+		// Scalar fallback: real OpenConfig targets that encode leaf values directly.
 		pathStr := pathToString(upd.GetPath())
 		val, ok := extractValue(upd.GetVal())
 		if !ok {
@@ -249,47 +306,273 @@ func (s *Subscriber) decodeNotification(n *gnmipb.Notification) []*v1.TelemetryP
 		if name == "" {
 			continue
 		}
-		meta := map[string]string{
-			"hostname":           s.target.SourceID(),
-			"mgmt_ip":            s.target.MgmtIP,
-			"prod_ip":            s.target.ProdIP,
-			"loopback_ip":        s.target.LoopbackIP,
-			"device_type":        s.target.DeviceType,
-			"vendor":             s.target.Vendor,
-			"collector_agent":    "EDR",
-			"collector_protocol": "GNMI",
-			"gnmi_path":          pathStr,
-		}
-		for k, v := range s.target.Labels {
-			meta[k] = v
-		}
-
-		id := packet.NewID()
-		nonce := s.signer.NextNonce()
-		canonical := packet.CanonicalBytes(id, s.target.SourceID(), ts, name, tag, val, nonce)
-		sig := s.signer.Sign(canonical)
-
-		pkts = append(pkts, &v1.TelemetryPacket{
-			Id:           id,
-			OrgId:        s.base.orgID,
-			DatacenterId: s.base.dcID,
-			FloorId:      s.base.floorID,
-			NetworkId:    s.base.netID,
-			GroupId:      s.base.grpID,
-			SourceType:   "device",
-			SourceId:     s.target.SourceID(),
-			ReaderId:     s.base.readerID,
-			TimestampNs:  ts,
-			Name:         name,
-			Tag:          tag,
-			Value:        val,
-			Meta:         meta,
-			Kind:         "metric",
-			Signature:    sig,
-			Nonce:        nonce,
-		})
+		pkts = append(pkts, s.newPkt(b, name, tag, val, ts, pathStr))
 	}
 	return pkts
+}
+
+// emitTree walks an OpenConfig device tree (the JSON-IETF subtree the simulator
+// returns for a root subscription) and emits a metric packet per recognised leaf:
+// interface counters + admin/oper status, system CPU/memory/uptime, and component
+// temperatures. Unknown subtrees (lldp, network-instances) are ignored.
+func (s *Subscriber) emitTree(b *deviceBinding, root map[string]any, ts int64) []*v1.TelemetryPacket {
+	var out []*v1.TelemetryPacket
+	add := func(name, tag string, v float64) {
+		out = append(out, s.newPkt(b, name, tag, v, ts, name))
+	}
+
+	// ── interfaces ──
+	if arr, ok := dig(root, "openconfig-interfaces:interfaces", "interface").([]any); ok {
+		for _, it := range arr {
+			m, _ := it.(map[string]any)
+			if m == nil {
+				continue
+			}
+			name, _ := m["name"].(string)
+			st, _ := m["state"].(map[string]any)
+			if name == "" || st == nil {
+				continue
+			}
+			if c, ok := st["counters"].(map[string]any); ok {
+				counters := [...]struct {
+					key, metric string
+				}{
+					{"in-octets", "interface.bytes_received_hc"},
+					{"out-octets", "interface.bytes_sent_hc"},
+					{"in-unicast-pkts", "interface.packets_received_unicast"},
+					{"out-unicast-pkts", "interface.packets_sent_unicast"},
+					{"in-errors", "interface.errors_received"},
+					{"out-errors", "interface.errors_sent"},
+					{"in-discards", "interface.discards_received"},
+					{"out-discards", "interface.discards_sent"},
+				}
+				for _, cc := range counters {
+					if v, ok := num(c[cc.key]); ok {
+						add(cc.metric, name, v)
+					}
+				}
+			}
+			if v, ok := statusVal(st["oper-status"]); ok {
+				add("interface.operational_status", name, v)
+			}
+			if v, ok := statusVal(st["admin-status"]); ok {
+				add("interface.admin_status", name, v)
+			}
+		}
+	}
+
+	// ── system ──
+	if sys, ok := dig(root, "openconfig-system:system").(map[string]any); ok {
+		if st, ok := sys["state"].(map[string]any); ok {
+			// OpenConfig system uptime is in seconds; DCS liveness uses centiseconds.
+			if v, ok := num(st["uptime"]); ok {
+				add("system.uptime_centiseconds", "", v*100)
+			}
+		}
+		if mem, ok := dig(sys, "memory", "state").(map[string]any); ok {
+			total, hasTotal := num(mem["physical"])
+			if hasTotal {
+				add("system.memory_total_bytes", "", total)
+			}
+			if free, ok := num(mem["free"]); ok && hasTotal {
+				add("system.memory_used_bytes", "", total-free)
+			}
+			if v, ok := num(mem["utilized"]); ok {
+				add("system.memory_utilization_percent", "", v)
+			}
+		}
+		if cpus, ok := dig(sys, "cpus", "cpu").([]any); ok {
+			for _, it := range cpus {
+				m, _ := it.(map[string]any)
+				if m == nil {
+					continue
+				}
+				idx := fmt.Sprintf("%v", m["index"])
+				if tot, ok := dig(m, "state", "total").(map[string]any); ok {
+					if v, ok := num(tot["instant"]); ok {
+						add("system.cpu_utilization_percent", idx, v)
+					}
+				}
+			}
+		}
+	}
+
+	// ── component temperatures ──
+	if arr, ok := dig(root, "openconfig-platform:components", "component").([]any); ok {
+		for _, it := range arr {
+			m, _ := it.(map[string]any)
+			if m == nil {
+				continue
+			}
+			name, _ := m["name"].(string)
+			if name == "" {
+				continue
+			}
+			if tmp, ok := dig(m, "state", "temperature").(map[string]any); ok {
+				if v, ok := num(tmp["instant"]); ok {
+					add("environment.temperature_c", name, v)
+				}
+				// Alarm state carried in the telemetry tree — surfaced through the
+				// proxy as a 0/1 metric so threshold breaches are visible in near
+				// real time without a separate trap channel.
+				if a, present := tmp["alarm-status"]; present {
+					add("environment.temperature_alarm", name, boolVal(a))
+				}
+			}
+		}
+	}
+
+	return out
+}
+
+// newPkt builds one signed gNMI metric packet for the resolved device.
+func (s *Subscriber) newPkt(b *deviceBinding, name, tag string, val float64, ts int64, gnmiPath string) *v1.TelemetryPacket {
+	t := b.t
+	meta := map[string]string{
+		"hostname":           t.SourceID(),
+		"mgmt_ip":            t.MgmtIP,
+		"prod_ip":            t.ProdIP,
+		"loopback_ip":        t.LoopbackIP,
+		"device_type":        t.DeviceType,
+		"vendor":             t.Vendor,
+		"collector_agent":    "EDR",
+		"collector_protocol": "GNMI",
+		"gnmi_path":          gnmiPath,
+	}
+	for k, v := range t.Labels {
+		meta[k] = v
+	}
+	id := packet.NewID()
+	nonce := s.signer.NextNonce()
+	canonical := packet.CanonicalBytes(id, t.SourceID(), ts, name, tag, val, nonce)
+	sig := s.signer.Sign(canonical)
+	return &v1.TelemetryPacket{
+		Id:           id,
+		OrgId:        b.base.orgID,
+		DatacenterId: b.base.dcID,
+		FloorId:      b.base.floorID,
+		NetworkId:    b.base.netID,
+		GroupId:      b.base.grpID,
+		SourceType:   "device",
+		SourceId:     t.SourceID(),
+		ReaderId:     b.base.readerID,
+		TimestampNs:  ts,
+		Name:         name,
+		Tag:          tag,
+		Value:        val,
+		Meta:         meta,
+		Kind:         "metric",
+		Signature:    sig,
+		Nonce:        nonce,
+	}
+}
+
+// boolVal coerces an OpenConfig boolean (bool or "true"/"false") to 1/0.
+func boolVal(v any) float64 {
+	switch x := v.(type) {
+	case bool:
+		if x {
+			return 1
+		}
+	case string:
+		if strings.EqualFold(strings.TrimSpace(x), "true") {
+			return 1
+		}
+	}
+	return 0
+}
+
+// dialAddr returns the gNMI endpoint to connect to: the shared proxy when
+// configured (simulator), otherwise the per-device gNMI server.
+func (s *Subscriber) dialAddr() string {
+	if s.cfg.ProxyAddr != "" {
+		return s.cfg.ProxyAddr
+	}
+	if s.target != nil {
+		return fmt.Sprintf("%s:%d", s.target.GNMIIP, s.cfg.Port)
+	}
+	return ""
+}
+
+// gnmiTarget is the subscription prefix.target used to select this device behind
+// the proxy. The simulator keys gNMI data by mgmt IP.
+func (s *Subscriber) gnmiTarget() string {
+	switch {
+	case s.target.MgmtIP != "":
+		return s.target.MgmtIP
+	case s.target.ProdIP != "":
+		return s.target.ProdIP
+	default:
+		return s.target.GNMIIP
+	}
+}
+
+// jsonBytesOf returns the JSON payload from a gNMI TypedValue regardless of which
+// encoding field carries it. The simulator's gNMI stack encodes its JSON-IETF
+// value into the field the OpenConfig Go proto decodes as proto_bytes (a gNMI
+// proto-version skew), so we accept json_ietf_val, json_val, and proto_bytes.
+func jsonBytesOf(tv *gnmipb.TypedValue) []byte {
+	if tv == nil {
+		return nil
+	}
+	if b := tv.GetJsonIetfVal(); len(b) > 0 {
+		return b
+	}
+	if b := tv.GetJsonVal(); len(b) > 0 {
+		return b
+	}
+	if b := tv.GetProtoBytes(); len(b) > 0 {
+		return b
+	}
+	return nil
+}
+
+// dig walks nested map[string]any by successive keys, returning the value at the
+// end of the chain or nil if any step is missing or not an object.
+func dig(m map[string]any, keys ...string) any {
+	var cur any = m
+	for _, k := range keys {
+		cm, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur = cm[k]
+	}
+	return cur
+}
+
+// num coerces a JSON-IETF value (float64 or quoted-number string — gNMI encodes
+// 64-bit counters as strings) to float64.
+func num(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case json.Number:
+		f, err := x.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	}
+	return 0, false
+}
+
+// statusVal maps an OpenConfig admin/oper-status string to 1 (up) or 0 (down).
+func statusVal(v any) (float64, bool) {
+	str, ok := v.(string)
+	if !ok {
+		return 0, false
+	}
+	switch strings.ToUpper(strings.TrimSpace(str)) {
+	case "UP", "ENABLED":
+		return 1, true
+	case "DOWN", "DISABLED":
+		return 0, true
+	}
+	return 0, false
 }
 
 // mapPath converts a gNMI path string to (metricName, tag).

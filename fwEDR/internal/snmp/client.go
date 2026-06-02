@@ -71,6 +71,85 @@ func NewClient(t *target.Target, cfg config.SNMPConfig) (*Client, error) {
 // Close releases the underlying UDP socket.
 func (c *Client) Close() { c.g.Conn.Close() }
 
+// SetCommunity overrides the v2c community for subsequent Get/Walk calls. This
+// lets ONE pooled session (keyed by the responder socket, e.g. 127.0.0.1:16100)
+// serve many simulator devices — gosnmp sends the community in every PDU, so the
+// caller swaps it per device under the session's serializing lock instead of
+// opening a separate UDP socket per device (which exhausts the Windows socket
+// pool → WSAENOBUFS).
+func (c *Client) SetCommunity(community string) { c.g.Community = community }
+
+// ProbeMgmt does one cheap sysName Get against ip:port (the simulator's SNMP SET
+// management agent, typically 1161). That agent serves on its own UDP socket,
+// independent of the shared snmpsim responder on 161, so it answers even when 161
+// is wedged under heavy-walk load. A successful response means the device is alive
+// and the 161 timeout was transient overload — not a real outage. Uses a short
+// timeout and no retries so a FAST miss isn't slowed materially. Returns false on
+// any connect/Get error. SIMULATOR-ONLY: real devices have no such agent, so the
+// caller must gate this behind mgmt_port > 0 (off in production).
+func ProbeMgmt(ip string, port uint16, community string, timeoutMs int) bool {
+	if timeoutMs <= 0 {
+		timeoutMs = 1000
+	}
+	g := &gosnmp.GoSNMP{
+		Target:    ip,
+		Port:      port,
+		Transport: "udp",
+		Community: community,
+		Version:   gosnmp.Version2c,
+		Timeout:   time.Duration(timeoutMs) * time.Millisecond,
+		Retries:   0,
+		MaxOids:   gosnmp.MaxOids,
+	}
+	if err := g.Connect(); err != nil {
+		return false
+	}
+	defer g.Conn.Close()
+	res, err := g.Get([]string{OIDSysName})
+	if err != nil || res == nil || len(res.Variables) == 0 {
+		return false
+	}
+	// Any well-formed varbind (even noSuchObject) proves the agent is responsive.
+	return true
+}
+
+// MgmtSysName does one sysName (1.3.6.1.2.1.1.5.0) Get against the simulator's SET
+// management agent (ip:port, typically 1161) and returns the value. That agent
+// serves the LIVE in-memory device name, so a rename shows up instantly — unlike
+// the main snmpsim responder on 161, whose .snmprec sysName is patched lazily
+// (rename-time patch is conditional, and the periodic StateStore sync is sharded
+// and lags minutes). Returns ("", false) on any error or a non-name response.
+// SIMULATOR-ONLY: gated by mgmt_port > 0; real devices have no such agent.
+func MgmtSysName(ip string, port uint16, community string, timeoutMs int) (string, bool) {
+	if timeoutMs <= 0 {
+		timeoutMs = 1000
+	}
+	g := &gosnmp.GoSNMP{
+		Target:    ip,
+		Port:      port,
+		Transport: "udp",
+		Community: community,
+		Version:   gosnmp.Version2c,
+		Timeout:   time.Duration(timeoutMs) * time.Millisecond,
+		Retries:   0,
+		MaxOids:   gosnmp.MaxOids,
+	}
+	if err := g.Connect(); err != nil {
+		return "", false
+	}
+	defer g.Conn.Close()
+	res, err := g.Get([]string{OIDSysName})
+	if err != nil || res == nil || len(res.Variables) == 0 {
+		return "", false
+	}
+	s := PDUString(res.Variables[0])
+	switch s {
+	case "", "noSuchObject", "noSuchInstance", "endOfMibView":
+		return "", false
+	}
+	return s, true
+}
+
 // Get fetches scalar OIDs (appends .0 if needed).
 func (c *Client) Get(oids []string) (*gosnmp.SnmpPacket, error) {
 	return c.g.Get(oids)

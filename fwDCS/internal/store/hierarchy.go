@@ -63,11 +63,16 @@ func (db *DB) RecomputeHierarchy(ctx context.Context,
 	sort.Strings(allIDs) // deterministic iteration
 
 	// ── 2. Load edges → undirected adjacency ──────────────────────────────────
+	// Production fabric only. management (device↔OOB) and power (PDU/UPS chain)
+	// links also live in topology_links now; including them would make an OOB
+	// switch or floor PDU a graph super-hub and wreck core/spine/leaf inference
+	// and parent/child relations. The spanning tree is a production concept.
 	edgeRows, err := db.pool.Query(ctx, `
 		SELECT tl.src_device_id, tl.dst_device_id
 		FROM topology_links tl
 		JOIN devices sd ON sd.id = tl.src_device_id
-		WHERE sd.org_id=$1 AND sd.network_id=$2 AND sd.group_id=$3`,
+		WHERE sd.org_id=$1 AND sd.network_id=$2 AND sd.group_id=$3
+		  AND tl.layer = 'network'`,
 		orgID, netID, grpID)
 	if err != nil {
 		return "", 0, fmt.Errorf("hierarchy: load edges: %w", err)

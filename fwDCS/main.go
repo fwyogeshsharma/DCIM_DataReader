@@ -153,6 +153,16 @@ func run(cfgPath string) error {
 		}
 	}
 
+	// Optional external classifier rules (lookup tables / weights / thresholds).
+	// Empty path → compiled-in defaults.
+	if cfg.Topology.RoleRulesPath != "" {
+		if err := store.LoadRoleRules(cfg.Topology.RoleRulesPath); err != nil {
+			log.Warn("role rules load failed — using defaults", zap.Error(err))
+		} else {
+			log.Info("role classifier rules loaded", zap.String("path", cfg.Topology.RoleRulesPath))
+		}
+	}
+
 	// Topology hierarchy runner — periodically rebuilds the parent-child
 	// spanning tree (BFS over topology_links) so devices.parent_device_id stays
 	// current. Tenant scope comes from the aggregator/identity config.
@@ -177,6 +187,18 @@ func run(cfgPath string) error {
 				}
 				log.Info("topology hierarchy recomputed",
 					zap.String("root", root), zap.Int("devices", n))
+
+				// Fabric-role classification runs right after the graph is rebuilt,
+				// so neighbor device_types (Signal 3) are current.
+				if cfg.Topology.ClassifyRoles {
+					nr, cerr := db.ClassifyRoles(ctx,
+						cfg.Aggregator.OrgID, cfg.Aggregator.NetworkID, cfg.Aggregator.GroupID)
+					if cerr != nil {
+						log.Warn("device role classify failed", zap.Error(cerr))
+					} else {
+						log.Info("device roles classified", zap.Int("changed", nr))
+					}
+				}
 			}
 			run()
 			for {

@@ -28,6 +28,8 @@ type DCSConfig struct {
 type TopologyConfig struct {
 	Root                string `yaml:"root"`                  // root device hostname OR any of its IPs; empty = auto (highest-degree)
 	RecomputeIntervalMs int    `yaml:"recompute_interval_ms"` // hierarchy recompute cadence (default 30000)
+	ClassifyRoles       bool   `yaml:"classify_roles"`        // infer device_role (core/spine/leaf/...) after each recompute (default true)
+	RoleRulesPath       string `yaml:"role_rules_path"`       // optional YAML overriding classifier lookup tables; empty = compiled defaults
 }
 
 // IngestConfig tunes the async ingest pipeline.
@@ -104,6 +106,7 @@ func LoadDCS(path string) (*DCSConfig, error) {
 	cfg.Aggregator.IntervalMs = 5000
 	cfg.Aggregator.BatchLimit = 1000
 	cfg.Topology.RecomputeIntervalMs = 30000
+	cfg.Topology.ClassifyRoles = true // default on; YAML can set false explicitly
 	if err := loadYAML(path, cfg); err != nil {
 		return nil, err
 	}

@@ -90,16 +90,24 @@ func NewTrapReceiver(
 // Listen binds the UDP socket and blocks, sending decoded packets to out.
 // Returns on error or when the connection is closed.
 func (r *TrapReceiver) Listen() error {
-	addr, err := net.ResolveUDPAddr("udp", r.addr)
+	// Bind IPv4 explicitly for a wildcard/empty host. A bare ":162" resolves to
+	// the IPv6 wildcard [::]:162, which on Windows does NOT receive IPv4 datagrams
+	// — so traps sent to 127.0.0.1:162 (the simulator, and most real agents) were
+	// silently dropped. Forcing udp4 + 0.0.0.0 makes the receiver catch them.
+	network, listenAddr := "udp", r.addr
+	if host, port, err := net.SplitHostPort(r.addr); err == nil && (host == "" || host == "0.0.0.0" || host == "*") {
+		network, listenAddr = "udp4", "0.0.0.0:"+port
+	}
+	addr, err := net.ResolveUDPAddr(network, listenAddr)
 	if err != nil {
 		return err
 	}
-	conn, err := net.ListenUDP("udp", addr)
+	conn, err := net.ListenUDP(network, addr)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	r.log.Info("snmp trap receiver listening", zap.String("addr", r.addr))
+	r.log.Info("snmp trap receiver listening", zap.String("addr", listenAddr), zap.String("network", network))
 
 	buf := make([]byte, 65535)
 	for {
@@ -109,6 +117,7 @@ func (r *TrapReceiver) Listen() error {
 		}
 		raw := make([]byte, n)
 		copy(raw, buf[:n])
+		r.log.Debug("trap datagram received", zap.String("src", src.String()), zap.Int("bytes", n))
 		go r.handle(raw, src.IP.String())
 	}
 }

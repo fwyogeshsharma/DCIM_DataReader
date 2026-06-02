@@ -48,6 +48,9 @@ type FwdDevice struct {
 	RackNum        *int
 	RackUnit       *int
 	PowerDrawW     *int
+	DeviceRole     string   // fabric role (core/spine/leaf/...) — migration 003
+	RoleConfidence *float64 // 0.0–1.0, nil when never classified
+	RoleSource     string   // inferred|suggested|unclassified|override
 	UpdatedAt      time.Time
 }
 
@@ -65,6 +68,7 @@ const fwdDeviceCols = `
 	COALESCE(country,''), COALESCE(datacenter_city,''),
 	COALESCE(datacenter,''), COALESCE(room,''),
 	rack_row, rack_num, rack_unit, power_draw_w,
+	COALESCE(device_role,''), role_confidence, COALESCE(role_source,''),
 	updated_at`
 
 func scanFwdDevice(rows pgx.Rows) (FwdDevice, error) {
@@ -77,6 +81,7 @@ func scanFwdDevice(rows pgx.Rows) (FwdDevice, error) {
 		&d.IsReachable,
 		&d.Country, &d.DatacenterCity, &d.Datacenter, &d.Room,
 		&d.RackRow, &d.RackNum, &d.RackUnit, &d.PowerDrawW,
+		&d.DeviceRole, &d.RoleConfidence, &d.RoleSource,
 		&d.UpdatedAt)
 	return d, err
 }
@@ -150,18 +155,25 @@ type FwdTopologyLink struct {
 // datacenter/floor for per-scope payload grouping (empty when device_id NULL).
 type FwdEvent struct {
 	ID             string
-	DeviceID       string // empty when device_id NULL
+	DeviceID       string // source device — empty when device_id NULL
 	DatacenterID   string
 	FloorID        string
-	Hostname       string
+	Hostname       string // source hostname
 	Kind           string
 	EventName      string
 	Severity       string
 	TrapOID        string
 	SourceIP       string // empty string when not set
 	CollectorAgent string
-	TS             time.Time
-	Payload        string // raw JSONB text — already valid JSON
+	// Link-event enrichment — set only for a correlated linkDown/linkUp; empty
+	// otherwise. Lets the UI render one "src:port <-> dst:port" entry.
+	SrcPortName string
+	DstDeviceID string
+	DstHostname string
+	DstPortName string
+	LinkID      string
+	TS          time.Time
+	Payload     string // raw JSONB text — already valid JSON
 }
 
 // ─── Device queries ───────────────────────────────────────────────────────────
@@ -411,29 +423,66 @@ func (db *DB) TopologyLinksSince(ctx context.Context,
 
 // ─── Events query ─────────────────────────────────────────────────────────────
 
-// EventsSince returns events with ts > since. source_hostname is preferred;
-// falls back to the joined device hostname when only device_id is set. Events
-// with device_id IS NULL (pre-discovery traps) pass through unfiltered.
+// EventsSince returns events with ts > since, resolved to a forwardable device.
+// A trap often arrives with device_id IS NULL (it fired before the device was
+// discovered, or carried no resolvable agent address). The forwarder groups
+// every payload by (datacenter_id, floor_id), so an event with no owning device
+// has no scope and was being silently dropped. Here we recover the owning device
+// — and therefore the scope — for NULL-device events by matching, in order:
+//  1. device_id  (already set)
+//  2. source_hostname → devices.hostname  (trap names the device)
+//  3. source_ip       → any of the device's IP columns
+//
+// Events that still resolve to no device are omitted: without a scope they can
+// never be placed in a per-scope payload anyway.
 func (db *DB) EventsSince(ctx context.Context,
 	orgID, netID, grpID string,
 	since time.Time, limit int) ([]FwdEvent, error) {
 
 	rows, err := db.pool.Query(ctx, `
-		SELECT e.id, COALESCE(e.device_id::text, ''),
-		       COALESCE(d.datacenter_id, ''), COALESCE(d.floor_id, ''),
-		       COALESCE(e.source_hostname, d.hostname, ''),
+		SELECT e.id,
+		       COALESCE(e.device_id::text, dh.id::text, dip.id::text, ''),
+		       COALESCE(d.datacenter_id, dh.datacenter_id, dip.datacenter_id, ''),
+		       COALESCE(d.floor_id, dh.floor_id, dip.floor_id, ''),
+		       COALESCE(e.source_hostname, d.hostname, dh.hostname, dip.hostname, ''),
 		       e.kind, e.event_name, e.severity,
 		       COALESCE(e.trap_oid, ''),
 		       COALESCE(e.source_ip::text, ''),
 		       e.collector_agent,
+		       COALESCE(e.src_port_name, ''),
+		       COALESCE(e.dst_device_id::text, ''),
+		       COALESCE(e.dst_hostname, ''),
+		       COALESCE(e.dst_port_name, ''),
+		       COALESCE(e.link_id::text, ''),
 		       e.ts,
 		       COALESCE(e.event_payload::text, '{}')
 		FROM events e
 		LEFT JOIN devices d ON d.id = e.device_id
+		-- resolve by trap-reported hostname when device_id is unset
+		LEFT JOIN LATERAL (
+		    SELECT x.id, x.datacenter_id, x.floor_id, x.hostname
+		    FROM devices x
+		    WHERE e.device_id IS NULL
+		      AND e.source_hostname IS NOT NULL AND e.source_hostname <> ''
+		      AND x.hostname = e.source_hostname
+		      AND x.org_id=$1 AND x.network_id=$2 AND x.group_id=$3
+		    LIMIT 1
+		) dh ON TRUE
+		-- else resolve by source IP against any of the device's IP columns
+		LEFT JOIN LATERAL (
+		    SELECT x.id, x.datacenter_id, x.floor_id, x.hostname
+		    FROM devices x
+		    WHERE e.device_id IS NULL AND dh.id IS NULL
+		      AND e.source_ip IS NOT NULL
+		      AND x.org_id=$1 AND x.network_id=$2 AND x.group_id=$3
+		      AND e.source_ip IN (x.mgmt_ip, x.prod_ip, x.oob_ip, x.loopback_ip)
+		    LIMIT 1
+		) dip ON TRUE
 		WHERE e.ts > $4
 		  AND (
-		      e.device_id IS NULL
-		      OR (d.org_id=$1 AND d.network_id=$2 AND d.group_id=$3)
+		      (d.org_id=$1 AND d.network_id=$2 AND d.group_id=$3)
+		      OR dh.id IS NOT NULL
+		      OR dip.id IS NOT NULL
 		  )
 		ORDER BY e.ts ASC
 		LIMIT $5`,
@@ -449,7 +498,9 @@ func (db *DB) EventsSince(ctx context.Context,
 		if err := rows.Scan(&ev.ID, &ev.DeviceID,
 			&ev.DatacenterID, &ev.FloorID,
 			&ev.Hostname, &ev.Kind, &ev.EventName, &ev.Severity,
-			&ev.TrapOID, &ev.SourceIP, &ev.CollectorAgent, &ev.TS, &ev.Payload); err != nil {
+			&ev.TrapOID, &ev.SourceIP, &ev.CollectorAgent,
+			&ev.SrcPortName, &ev.DstDeviceID, &ev.DstHostname, &ev.DstPortName, &ev.LinkID,
+			&ev.TS, &ev.Payload); err != nil {
 			return nil, err
 		}
 		out = append(out, ev)

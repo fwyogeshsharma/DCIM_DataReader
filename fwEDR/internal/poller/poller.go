@@ -13,7 +13,10 @@ package poller
 
 import (
 	"context"
+	"fmt"
+	"hash/fnv"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,12 +41,45 @@ type Poller struct {
 	out      chan<- *v1.TelemetryPacket
 	log      *zap.Logger
 
-	snmpSem  chan struct{} // semaphore: caps simultaneous SNMP UDP sockets
-	limiter  *rateLimiter  // global SNMP token bucket
-	breakers sync.Map      // map[targetKey]*circuitBreaker
-	conns    sync.Map      // map[targetKey]*targetConn — reused SNMP sessions
+	// socketSem is the SINGLE global cap on concurrent SNMP UDP sockets. EVERY tier
+	// (fast + heavy) must hold a token before snmp.NewClient or any SNMP UDP op, so
+	// total in-flight sockets never exceeds its size — this is what prevents the
+	// Windows WSAENOBUFS ("lacked sufficient buffer space") socket exhaustion.
+	socketCap int
+	// heavySem caps the heavy tiers (Medium/Slow/Topology) BELOW the global cap so
+	// the cheap FAST liveness Get is always guaranteed a free socket slot and can't
+	// be starved behind a burst of BulkWalks. Heavy tiers take heavySem AND
+	// socketSem; fast takes only socketSem.
+	heavySem chan struct{}
+	limiter  *rateLimiter // global SNMP token bucket
 
-	health *healthMonitor // global pause/resume based on breaker ratio
+	// Separate circuit breakers per target. The FAST liveness probe and the heavy
+	// walks must NOT share a breaker: heavy BulkWalks time out first under an
+	// overloaded responder and, on a shared breaker, would open it and silence the
+	// heartbeat — flipping a reachable device "offline". liveBreakers gates only the
+	// FAST tier (tolerant threshold); heavyBreakers gates Medium/Slow/Topology.
+	liveBreakers  sync.Map // map[targetKey]*circuitBreaker — FAST heartbeat
+	heavyBreakers sync.Map // map[targetKey]*circuitBreaker — Medium/Slow/Topology
+	conns         sync.Map // map[connKey]*connPool — pooled SNMP sessions per responder endpoint
+
+	// pooled is true when many targets share one responder endpoint (the simulator
+	// case: all devices polled at 127.0.0.1:161, routed by community). There we keep
+	// a SMALL pool of persistent sockets to that one endpoint and spread devices
+	// across them (community swapped per poll) — concurrent walks against the single
+	// responder WITHOUT a socket-per-device (which churns hundreds of sockets and
+	// exhausts the Windows pool → WSAENOBUFS). Real devices have distinct IPs → each
+	// endpoint gets its own single-socket pool.
+	pooled bool
+	// poolSize is the number of concurrent sockets per shared responder endpoint
+	// (= the global socket cap in pooled mode, 1 otherwise). Spreading devices over
+	// poolSize sockets lets that many walks run concurrently against the one
+	// responder instead of serializing every device through a single socket.
+	poolSize int
+
+	metrics  *pollMetrics // poll/timeout counters, summarized periodically
+	throttle *logThrottle // rate-limits repeated connect/gnmi warnings per target
+
+	health *healthMonitor // global pause/resume based on heavy-breaker ratio
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc // tracks running target goroutines by SourceID
@@ -64,17 +100,73 @@ func New(
 	if maxConc <= 0 {
 		maxConc = 50
 	}
+	// Effective global socket cap. In simulator sharding mode the SNMP load is
+	// spread across only `shards` responder processes (16100..), so a handful of
+	// sockets saturates them; clamp the global cap to shards*2 so EDR never opens
+	// more UDP sockets than the simulator (and the Windows socket pool) can absorb.
+	effCap := maxConc
+	if snmpCfg.Shards > 1 {
+		if c := snmpCfg.Shards * 2; c < effCap {
+			effCap = c
+		}
+	}
+	if effCap < 1 {
+		effCap = 1
+	}
+	// Reserve at least one socket slot for the FAST heartbeat by capping heavy
+	// tiers one below the global cap.
+	heavyCap := effCap - 1
+	if heavyCap < 1 {
+		heavyCap = 1
+	}
+	// Pool sockets when multiple targets resolve to the SAME responder endpoint —
+	// the simulator case, where every device is polled at 127.0.0.1:161 and routed
+	// by community. Then one persistent socket per endpoint is shared across all
+	// devices (community swapped per poll) instead of a socket per device, which
+	// churns hundreds of sockets and exhausts the Windows pool (WSAENOBUFS). Real
+	// devices have distinct IPs → no collisions → one socket per device as before.
+	pooled := false
+	endpoints := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		k := fmt.Sprintf("%s:%d", t.IP, snmp.ShardPort(t.Community, snmpCfg.Shards, snmpCfg.ShardBasePort))
+		if _, dup := endpoints[k]; dup {
+			pooled = true
+			break
+		}
+		endpoints[k] = struct{}{}
+	}
+	// In pooled (shared-responder) mode, run effCap concurrent sockets to the one
+	// endpoint so up to effCap devices walk in parallel against it — clearing the
+	// head-of-line serialization that made the single-socket walk time out. One
+	// socket otherwise (real devices: one endpoint each).
+	poolSize := 1
+	if pooled {
+		poolSize = effCap
+	}
+	log.Info("snmp socket cap",
+		zap.Int("max_concurrent", maxConc),
+		zap.Int("shards", snmpCfg.Shards),
+		zap.Int("effective_global_sockets", effCap),
+		zap.Int("heavy_sockets", heavyCap),
+		zap.Bool("pooled_sockets", pooled),
+		zap.Int("pool_size", poolSize))
+	snmp.ConfigureSocketLimit(effCap)
 	p := &Poller{
-		targets:  targets,
-		snmpCfg:  snmpCfg,
-		gnmiCfg:  gnmiCfg,
-		identity: identity,
-		signer:   signer,
-		out:      out,
-		log:      log,
-		snmpSem:  make(chan struct{}, maxConc),
-		health:   newHealthMonitor(len(targets), log),
-		running:  make(map[string]context.CancelFunc),
+		targets:   targets,
+		snmpCfg:   snmpCfg,
+		gnmiCfg:   gnmiCfg,
+		identity:  identity,
+		signer:    signer,
+		out:       out,
+		log:       log,
+		socketCap: effCap,
+		heavySem:  make(chan struct{}, heavyCap),
+		health:    newHealthMonitor(len(targets), log),
+		running:   make(map[string]context.CancelFunc),
+		metrics:   &pollMetrics{},
+		throttle:  newLogThrottle(time.Duration(snmpCfg.LogThrottleMs) * time.Millisecond),
+		pooled:    pooled,
+		poolSize:  poolSize,
 	}
 	if snmpCfg.RateLimitPerSec > 0 {
 		p.limiter = newRateLimiter(snmpCfg.RateLimitPerSec)
@@ -87,8 +179,20 @@ func New(
 func (p *Poller) Run(ctx context.Context) {
 	p.rootCtx = ctx
 
-	// Global health monitor — pauses SNMP polling when too many breakers are open.
-	go p.health.run(ctx, &p.breakers)
+	// Global health monitor — pauses heavy SNMP walks when too many heavy
+	// breakers are open. The FAST heartbeat is exempt (see pollSNMP).
+	go p.health.run(ctx, &p.heavyBreakers)
+
+	// Periodic poll/timeout metrics summary (item: simulator-instability visibility).
+	go p.metricsLoop(ctx)
+
+	// SNMP one-shot discovery walks build the inventory first. gNMI telemetry is
+	// started ONLY after this wave finishes (see startGNMIAfterDiscovery) — the
+	// architecture is: SNMP walk once for discovery, THEN gNMI subscriptions for
+	// ongoing telemetry. Starting gNMI concurrently floods the pipeline with the
+	// initial full-tree snapshot during discovery.
+	var walkWG sync.WaitGroup
+	walkWG.Add(len(p.targets))
 
 	var wg sync.WaitGroup
 	for _, t := range p.targets {
@@ -98,11 +202,18 @@ func (p *Poller) Run(ctx context.Context) {
 		p.running[t.SourceID()] = cancel
 		p.mu.Unlock()
 		wg.Add(1)
+		var once sync.Once
 		go func() {
 			defer wg.Done()
-			p.runTarget(tCtx, t)
+			// Guarantee the discovery signal fires exactly once even if the target
+			// goroutine returns before its first walk (e.g. ctx cancel during jitter).
+			defer once.Do(walkWG.Done)
+			p.runTarget(tCtx, t, func() { once.Do(walkWG.Done) })
 		}()
 	}
+
+	// Start gNMI once SNMP discovery has completed (or a safety timeout elapses).
+	go p.startGNMIAfterDiscovery(ctx, &walkWG)
 	// Block here until shutdown is signalled.
 	<-ctx.Done()
 
@@ -122,97 +233,157 @@ func (p *Poller) Run(ctx context.Context) {
 	p.closeConns()
 }
 
-func (p *Poller) runTarget(ctx context.Context, t *target.Target) {
-	fastInterval := time.Duration(p.snmpCfg.FastIntervalMs) * time.Millisecond
-	mediumInterval := time.Duration(p.snmpCfg.MediumIntervalMs) * time.Millisecond
-	slowInterval := time.Duration(p.snmpCfg.SlowIntervalMs) * time.Millisecond
-	topoInterval := time.Duration(p.snmpCfg.TopologyIntervalMs) * time.Millisecond
-	if topoInterval <= 0 {
-		topoInterval = 10 * time.Minute
+// startGNMIAfterDiscovery blocks until the SNMP discovery walk wave completes
+// (every target has attempted its first walk) or a safety timeout elapses, then
+// starts the single aggregated gNMI subscription. This enforces the ordering
+// "SNMP walk once for discovery → gNMI for ongoing telemetry" so gNMI's initial
+// snapshot does not contend with discovery for the pipeline. The timeout ensures
+// a few unreachable devices can't hold telemetry off forever.
+func (p *Poller) startGNMIAfterDiscovery(ctx context.Context, walkWG *sync.WaitGroup) {
+	done := make(chan struct{})
+	go func() {
+		walkWG.Wait()
+		close(done)
+	}()
+	const maxWait = 5 * time.Minute
+	select {
+	case <-done:
+		p.log.Info("snmp discovery walk complete — starting gNMI telemetry subscription")
+	case <-time.After(maxWait):
+		p.log.Warn("snmp discovery still in progress after timeout — starting gNMI telemetry anyway",
+			zap.Duration("waited", maxWait))
+	case <-ctx.Done():
+		return
 	}
+	gnmi.NewManager(p.targets, p.gnmiCfg, p.identity, p.signer, p.log).Run(ctx, p.out)
+}
 
-	fastTicker := time.NewTicker(fastInterval)
-	defer fastTicker.Stop()
-	mediumTicker := time.NewTicker(mediumInterval)
-	defer mediumTicker.Stop()
-	slowTicker := time.NewTicker(slowInterval)
-	defer slowTicker.Stop()
-	topoTicker := time.NewTicker(topoInterval)
-	defer topoTicker.Stop()
+// runTarget drives one device under the event-driven model: a single full SNMP
+// walk to build inventory, then it stops and relies on SNMP traps for ongoing
+// state/topology events. Continuous tiered polling was removed — it was the
+// steady-state load that destabilized the simulator. A periodic full re-walk is
+// available (rewalk_interval_ms > 0) for lightweight inventory/topology refresh.
+func (p *Poller) runTarget(ctx context.Context, t *target.Target, firstWalkDone func()) {
+	// gNMI is handled centrally by the aggregated gNMI Manager (one proxy
+	// subscription for all devices). It is started by Run ONLY after this SNMP
+	// discovery walk wave finishes — firstWalkDone() signals that this target has
+	// attempted its initial walk. Running gNMI concurrently would flood the
+	// pipeline with telemetry during discovery.
 
-	// gNMI: long-lived STREAM subscription, not periodic polling. Counters
-	// arrive on SAMPLE intervals, link state changes arrive ON_CHANGE. This
-	// bypasses SNMPSim entirely for network devices that support gNMI.
-	// Stream opens are spread across a 30 s window so we don't burst-accept
-	// against the simulator's per-device gNMI servers all at once.
-	if t.Has(target.CapGNMI) {
-		go func() {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Duration(rand.Int63n(int64(30 * time.Second)))):
-			}
-			p.runGNMIStream(ctx, t)
-		}()
+	// Spread the initial walk across a window so 1000+ targets don't burst the
+	// responder at once (thundering herd). FastIntervalMs is reused purely as the
+	// jitter window now that it no longer drives a poll ticker.
+	spread := time.Duration(p.snmpCfg.FastIntervalMs) * time.Millisecond
+	if spread <= 0 {
+		spread = 30 * time.Second
 	}
-
-	// Spread initial polls across the full FAST interval. With 1000+ targets,
-	// starting all at once produces a thundering herd.
-	jitter := time.Duration(rand.Int63n(int64(fastInterval)))
 	select {
 	case <-ctx.Done():
 		return
-	case <-time.After(jitter):
+	case <-time.After(time.Duration(rand.Int63n(int64(spread)))):
 	}
 
-	// First poll: FAST tier registers the device. Topology fires ~10s later
-	// so LLDP neighbor data appears soon after registration (was 150s avg jitter
-	// on the old SLOW tier — empty topology_links until cycle 2).
-	p.pollSNMP(ctx, t, snmp.TierFast)
+	rewalk := time.Duration(p.snmpCfg.RewalkIntervalMs) * time.Millisecond
+	if rewalk > 0 {
+		// Periodic full re-walk mode: walk now, then on the configured interval.
+		p.walkAll(ctx, t)
+		firstWalkDone()
+		ticker := time.NewTicker(rewalk)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				p.walkAll(ctx, t)
+			}
+		}
+	}
 
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-time.After(10*time.Second + time.Duration(rand.Int63n(int64(5*time.Second)))):
-			p.pollSNMP(ctx, t, snmp.TierTopology)
-		}
-	}()
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-time.After(time.Duration(rand.Int63n(int64(mediumInterval / 2)))):
-			p.pollSNMP(ctx, t, snmp.TierMedium)
-		}
-	}()
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-time.After(time.Duration(rand.Int63n(int64(slowInterval / 2)))):
-			p.pollSNMP(ctx, t, snmp.TierSlow)
-		}
-	}()
-
+	// One-shot mode (default): walk until the device answers once, then stop and
+	// let traps drive events. Retrying the initial walk means a device that was
+	// unreachable at startup still gets inventoried when it comes up — without any
+	// steady-state polling afterward.
+	retry := time.Duration(p.snmpCfg.WalkRetryIntervalMs) * time.Millisecond
+	if retry <= 0 {
+		retry = 30 * time.Second
+	}
+	walkedOnce := false
 	for {
+		ok := p.walkAll(ctx, t)
+		if !walkedOnce {
+			firstWalkDone() // signal discovery progress after the first attempt (success or not)
+			walkedOnce = true
+		}
+		if ok {
+			// One-shot done: release this device's SNMP session. Traps don't use
+			// it, and ~hundreds of idle UDP sockets lingering is what exhausts
+			// Windows socket buffers (WSAENOBUFS) — keeping only in-flight walks
+			// holding sockets avoids that. A re-walk (rewalk mode) keeps its
+			// session; this path is one-shot only.
+			p.closeConn(t)
+			// Debug, not Info: this fires once per device (hundreds of lines on a
+			// serial walk). Watch the single "topology links emitted from JSON" line
+			// for readiness instead.
+			p.log.Debug("initial SNMP walk complete — switching to trap-driven monitoring",
+				zap.String("target", t.SourceID()))
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-fastTicker.C:
-			p.pollSNMP(ctx, t, snmp.TierFast)
-		case <-mediumTicker.C:
-			// Always poll SNMP TierMedium regardless of gNMI capability.
-			// gNMI streams may not be available (e.g. simulator without gNMI
-			// servers), so SNMP is the reliable path. gNMI supplements when live.
-			p.pollSNMP(ctx, t, snmp.TierMedium)
-		case <-slowTicker.C:
-			// Always poll SNMP TierSlow regardless of gNMI capability.
-			// Skipping this caused interface counters, HR-MIB, UPS and sensor
-			// metrics to disappear for all gNMI-capable device types (router,
-			// switch, firewall, load_balancer) when using topology mode.
-			p.pollSNMP(ctx, t, snmp.TierSlow)
-		case <-topoTicker.C:
-			p.pollSNMP(ctx, t, snmp.TierTopology)
+		case <-time.After(retry):
 		}
 	}
+}
+
+// closeConn frees a one-shot target's SNMP session. In pooled (simulator) mode the
+// session is SHARED by every device on a shard endpoint, so it must stay open for
+// the run (closed only on shutdown via closeConns) and this is a no-op — closing it
+// per device would churn the 4 shard sockets back into the exhaustion this pooling
+// fixes. In non-pooled (real-device) mode the session belongs to one device, so its
+// socket is released here right after the one-shot walk.
+func (p *Poller) closeConn(t *target.Target) {
+	if p.pooled {
+		return
+	}
+	if v, ok := p.conns.LoadAndDelete(p.connKey(t)); ok {
+		for _, tc := range v.(*connPool).conns {
+			tc.mu.Lock()
+			if tc.cl != nil {
+				tc.cl.Close()
+				tc.cl = nil
+			}
+			tc.mu.Unlock()
+		}
+	}
+}
+
+// walkAll performs one full inventory walk of a target: FAST (system/liveness),
+// MEDIUM (interface state), SLOW (counters/HR/UPS/sensors) and TOPOLOGY (LLDP).
+// Returns true when the FAST liveness tier succeeded — i.e. the device answered
+// and was inventoried — so the caller can stop retrying.
+func (p *Poller) walkAll(ctx context.Context, t *target.Target) bool {
+	ok := p.pollSNMP(ctx, t, snmp.TierFast) // always — liveness + registration
+	if p.snmpCfg.WalkMedium {
+		p.pollSNMP(ctx, t, snmp.TierMedium)
+	}
+	// Topology before the slow counter walk: LLDP only needs the interface names
+	// gathered by MEDIUM, and getting topology_links populated early means
+	// link-down/up traps can correlate (and dedup) sooner.
+	if p.snmpCfg.WalkTopology {
+		p.pollSNMP(ctx, t, snmp.TierTopology)
+	}
+	if p.snmpCfg.WalkSlow {
+		p.pollSNMP(ctx, t, snmp.TierSlow)
+	}
+	// Environment sensors (temperature/humidity) — light, sensor/PDU-only tier for
+	// the heatmap. Independent of WalkSlow so we get temperature without the heavy
+	// counter/HR/UCD load. No-op for non-sensor device types (see Collect).
+	if p.snmpCfg.WalkSensors {
+		p.pollSNMP(ctx, t, snmp.TierEnvironment)
+	}
+	return ok
 }
 
 // AddTarget starts polling a target that arrived after Run started (e.g. via
@@ -238,7 +409,9 @@ func (p *Poller) AddTarget(t *target.Target) bool {
 	p.running[key] = cancel
 	p.health.totalAdd(1)
 	p.mu.Unlock()
-	go p.runTarget(tCtx, t)
+	// Runtime-added targets (rediscovery) don't gate gNMI startup — it's already
+	// running by then — so pass a no-op discovery signal.
+	go p.runTarget(tCtx, t, func() {})
 	p.log.Info("poller: target added at runtime",
 		zap.String("source_id", key),
 		zap.String("type", t.DeviceType),
@@ -246,110 +419,107 @@ func (p *Poller) AddTarget(t *target.Target) bool {
 	return true
 }
 
-// runGNMIStream maintains a persistent gNMI STREAM subscription with backoff
-// reconnect. One goroutine per gnmi-enabled target for the lifetime of the EDR.
-func (p *Poller) runGNMIStream(ctx context.Context, t *target.Target) {
-	backoff := 2 * time.Second
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		// Per-device datacenter/floor override: topology JSON may carry the
-		// device's own datacenter_id (e.g. "DC1"). Use it when present so
-		// multi-datacenter topology files are routed correctly in DCS.
-		dcID := p.identity.DatacenterID
-		if t.DatacenterID != "" {
-			dcID = t.DatacenterID
-		}
-		floorID := p.identity.FloorID
-		if t.FloorID != "" {
-			floorID = t.FloorID
-		}
-		sub := gnmi.NewSubscriber(
-			t, p.gnmiCfg,
-			p.identity.OrgID, dcID,
-			floorID, p.identity.NetworkID,
-			p.identity.GroupID, p.identity.ReaderID,
-			p.signer, p.log,
-		)
-		p.log.Debug("gnmi stream connecting", zap.String("target", t.SourceID()), zap.String("ip", t.GNMIIP))
-		err := sub.RunStream(ctx, p.out)
-		if ctx.Err() != nil {
-			return
-		}
-		if err != nil {
-			p.log.Warn("gnmi stream error — reconnecting",
-				zap.String("target", t.SourceID()),
-				zap.Duration("retry_in", backoff),
-				zap.Error(err))
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		if backoff < 60*time.Second {
-			backoff *= 2
-		}
-	}
-}
-
-// targetConn holds one reusable SNMP session per target. mu serializes a
-// target's concurrent tier polls over the shared session (gosnmp is not safe
-// for concurrent use on one connection).
+// targetConn holds one reusable SNMP session for a responder endpoint. mu
+// serializes all polls over the shared session (gosnmp is not safe for concurrent
+// use on one connection). In pooled mode many devices share one targetConn, so mu
+// also serializes those devices onto the single shard socket — which matches the
+// single-process snmpsim responder's serial capacity.
 type targetConn struct {
 	mu sync.Mutex
 	cl *snmp.Client // nil until first connect / after an error reset
 }
 
-// getConn returns the reusable connection holder for a target, creating it on
-// first use. The holder persists for the life of the poller so the underlying
-// UDP socket is reused across polls instead of churned each cycle.
-func (p *Poller) getConn(t *target.Target) *targetConn {
-	key := t.SourceID()
-	if v, ok := p.conns.Load(key); ok {
-		return v.(*targetConn)
+// connKey identifies the pooled SNMP session: the responder socket the target
+// dials (IP + shard port). In simulator mode every device shares one of a few
+// loopback shard endpoints, so this collapses hundreds of per-device sockets to a
+// handful. With real devices each IP is distinct, giving one session per device.
+func (p *Poller) connKey(t *target.Target) string {
+	return fmt.Sprintf("%s:%d", t.IP, snmp.ShardPort(t.Community, p.snmpCfg.Shards, p.snmpCfg.ShardBasePort))
+}
+
+// connPool holds poolSize reusable sessions for one responder endpoint. Devices
+// are spread across the sessions by community hash so different devices walk
+// concurrently (each session is serialized by its own mu), while a given device
+// always lands on the same session.
+type connPool struct {
+	conns []*targetConn
+}
+
+func newConnPool(n int) *connPool {
+	if n < 1 {
+		n = 1
 	}
-	actual, _ := p.conns.LoadOrStore(key, &targetConn{})
-	return actual.(*targetConn)
+	cp := &connPool{conns: make([]*targetConn, n)}
+	for i := range cp.conns {
+		cp.conns[i] = &targetConn{}
+	}
+	return cp
+}
+
+func (cp *connPool) pick(community string) *targetConn {
+	if len(cp.conns) == 1 {
+		return cp.conns[0]
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(community))
+	return cp.conns[h.Sum32()%uint32(len(cp.conns))]
+}
+
+// getConn returns one of the reusable sessions for a target's responder endpoint,
+// creating the pool on first use. Sessions persist for the life of the poller so
+// the underlying UDP sockets are reused instead of churned each cycle.
+func (p *Poller) getConn(t *target.Target) *targetConn {
+	key := p.connKey(t)
+	v, ok := p.conns.Load(key)
+	if !ok {
+		v, _ = p.conns.LoadOrStore(key, newConnPool(p.poolSize))
+	}
+	return v.(*connPool).pick(t.Community)
 }
 
 // closeConns closes every reused SNMP session. Called on shutdown so sockets
 // are released cleanly.
 func (p *Poller) closeConns() {
 	p.conns.Range(func(_, v any) bool {
-		tc := v.(*targetConn)
-		tc.mu.Lock()
-		if tc.cl != nil {
-			tc.cl.Close()
-			tc.cl = nil
+		for _, tc := range v.(*connPool).conns {
+			tc.mu.Lock()
+			if tc.cl != nil {
+				tc.cl.Close()
+				tc.cl = nil
+			}
+			tc.mu.Unlock()
 		}
-		tc.mu.Unlock()
 		return true
 	})
 }
 
 // pollSNMP acquires the global rate limit and concurrency semaphore, runs one
 // tiered collection, and updates the per-target circuit breaker.
-func (p *Poller) pollSNMP(ctx context.Context, t *target.Target, tier snmp.Tier) {
-	if p.health.paused() {
-		p.log.Debug("snmp poll skipped — global pause (breaker ratio over threshold)",
+// pollSNMP runs one tiered collection and returns true only when the collection
+// succeeded and its packets were emitted. The boolean lets walkAll know whether
+// the FAST liveness tier answered so the one-shot walker can stop retrying.
+func (p *Poller) pollSNMP(ctx context.Context, t *target.Target, tier snmp.Tier) bool {
+	// Global pause applies to heavy walks only. The FAST heartbeat must keep
+	// flowing during a site-wide pause, otherwise the very mechanism meant to
+	// protect a wedged responder blanks every device "offline" on the UI.
+	if tier != snmp.TierFast && p.health.paused() {
+		p.log.Debug("snmp poll skipped — global pause (heavy-breaker ratio over threshold)",
 			zap.String("target", t.SourceID()),
 			zap.Int("tier", int(tier)))
-		return
+		return false
 	}
 
-	br := p.getBreaker(t)
+	br := p.getBreaker(t, tier)
 	if br.tripped() {
 		p.log.Debug("snmp poll skipped — circuit open",
 			zap.String("target", t.SourceID()),
 			zap.Int("tier", int(tier)))
-		return
+		return false
 	}
 
 	if p.limiter != nil {
 		if !p.limiter.wait(ctx) {
-			return
+			return false
 		}
 	}
 
@@ -362,28 +532,66 @@ func (p *Poller) pollSNMP(ctx context.Context, t *target.Target, tier snmp.Tier)
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
-	select {
-	case p.snmpSem <- struct{}{}:
-	case <-ctx.Done():
-		return
+	// Heavy tiers (Medium/Slow/Topology) first take heavySem, which is sized one
+	// below the global socket cap. This guarantees the cheap FAST liveness Get
+	// always has at least one free socket slot and can't be starved behind a burst
+	// of expensive BulkWalks (which would let last_seen_at go stale and flip a
+	// reachable device "offline").
+	if tier != snmp.TierFast {
+		select {
+		case p.heavySem <- struct{}{}:
+		case <-ctx.Done():
+			return false
+		}
+		defer func() { <-p.heavySem }()
 	}
-	defer func() { <-p.snmpSem }()
+
+	// Global socket cap: EVERY tier must hold a socketSem token before opening
+	// (snmp.NewClient) or using a UDP socket. This single gate bounds the TOTAL
+	// number of concurrent SNMP sockets — the fix for Windows WSAENOBUFS socket
+	// exhaustion. Held for the whole poll (through Collect) so concurrent UDP
+	// operations are bounded too, then released on return.
+	releaseSocket, ok := snmp.AcquireSocket(ctx)
+	if !ok {
+		return false
+	}
+	defer releaseSocket()
 
 	if tc.cl == nil {
 		cl, err := snmp.NewClient(t, p.snmpCfg)
 		if err != nil {
-			br.recordFailure()
-			p.log.Warn("snmp connect failed",
-				zap.String("target", t.IP),
-				zap.Error(err))
-			return
+			p.metrics.fails[int(tier)].Add(1)
+			if br.recordFailure() {
+				p.metrics.breakerOpens.Add(1)
+			}
+			if ok, suppressed := p.throttle.allow("connect|" + t.SourceID()); ok {
+				p.log.Warn("snmp connect failed",
+					zap.String("target", t.IP),
+					zap.Int("suppressed_since_last", suppressed),
+					zap.Error(err))
+			}
+			return false
 		}
 		tc.cl = cl
 	}
 	cl := tc.cl
+	// Pooled session is shared across devices on this shard endpoint; set THIS
+	// device's community (= its mgmt IP, the snmpsim routing key) before polling.
+	// Safe under tc.mu, which serializes every device on the shared socket.
+	cl.SetCommunity(t.Community)
 
-	// Close the socket on ctx cancel so an in-flight BulkWalk returns instantly.
-	stop := context.AfterFunc(ctx, func() { cl.Close() })
+	// Bound the whole poll. Without this, a wedged responder that stops answering
+	// mid-BulkWalk holds this target's mutex AND a concurrency-semaphore slot
+	// indefinitely, starving every other target ("goroutines stuck N minutes").
+	// A per-poll deadline (also tripped by parent-ctx cancel) closes the socket so
+	// the BulkWalk returns promptly and the locks release.
+	pollTimeout := time.Duration(p.snmpCfg.Timeout) * time.Millisecond * 3
+	if pollTimeout < 15*time.Second {
+		pollTimeout = 15 * time.Second
+	}
+	pollCtx, cancelPoll := context.WithTimeout(ctx, pollTimeout)
+	defer cancelPoll()
+	stop := context.AfterFunc(pollCtx, func() { cl.Close() })
 	defer stop()
 
 	// Per-device datacenter/floor override (same logic as runGNMIStream).
@@ -401,20 +609,60 @@ func (p *Poller) pollSNMP(ctx context.Context, t *target.Target, tier snmp.Tier)
 		snmpFloorID, p.identity.NetworkID,
 		p.identity.GroupID, p.identity.ReaderID,
 		p.signer,
+		p.snmpCfg.MgmtPort, p.snmpCfg.Timeout,
 	)
 	pkts, err := collector.Collect(tier)
+	ti := int(tier)
 	if err != nil {
-		br.recordFailure()
-		// Session may be broken (timeout, or socket closed by the cancel hook
-		// above) — drop it so the next poll reconnects with a fresh socket.
-		cl.Close()
-		tc.cl = nil
-		p.log.Warn("snmp collect failed",
+		isTimeout := strings.Contains(strings.ToLower(err.Error()), "timeout")
+		if isTimeout {
+			p.metrics.timeouts[ti].Add(1)
+		} else {
+			p.metrics.fails[ti].Add(1)
+		}
+		// Socket lifecycle: KEEP the session only on a plain SNMP *timeout* — the
+		// responder was just slow, the UDP socket is still valid, and reusing it
+		// avoids the per-poll open/close churn that exhausted Windows socket
+		// buffers (WSAENOBUFS). For ANY other error the session is dead — a closed
+		// socket ("use of closed network connection", e.g. after the responder
+		// restarted or the per-poll deadline fired), or shutdown — so drop it and
+		// reconnect next poll. Reusing a dead socket made every subsequent poll
+		// fail forever; that's the bug this guards against.
+		if pollCtx.Err() != nil || !isTimeout {
+			cl.Close()
+			tc.cl = nil
+		}
+
+		// Transient-vs-real (simulator-only, gated by mgmt_port>0): a FAST timeout
+		// may just mean the shared snmpsim responder on 161 is overloaded, not that
+		// the device is down. The simulator's SET management agent runs on its own
+		// socket (mgmt_port, default 1161) and stays responsive when 161 is wedged.
+		// If it answers, the device is alive — DON'T count this miss toward the
+		// liveness breaker, so the heartbeat keeps probing and recovers the instant
+		// 161 frees up (no 30s breaker blackout, no false offline).
+		if tier == snmp.TierFast && isTimeout && p.snmpCfg.MgmtPort > 0 &&
+			snmp.ProbeMgmt(t.IP, uint16(p.snmpCfg.MgmtPort), t.Community, p.snmpCfg.Timeout) {
+			p.metrics.mgmtConfirmed.Add(1)
+			p.log.Debug("snmp fast timeout but mgmt agent alive — transient overload, not counting against liveness",
+				zap.String("target", t.IP),
+				zap.Int("mgmt_port", p.snmpCfg.MgmtPort))
+			return false
+		}
+
+		if br.recordFailure() {
+			p.metrics.breakerOpens.Add(1)
+		}
+		// Per-poll failures are expected/transient (slow or dead responder) and the
+		// circuit breaker + health monitor already report sustained failure at a
+		// higher level. Log each one at Debug so a flapping responder doesn't flood
+		// the console — switch log.level to debug if you need per-poll detail.
+		p.log.Debug("snmp collect failed",
 			zap.String("target", t.IP),
-			zap.Int("tier", int(tier)),
+			zap.Int("tier", ti),
 			zap.Error(err))
-		return
+		return false
 	}
+	p.metrics.ok[ti].Add(1)
 	br.recordSuccess()
 	p.log.Debug("snmp collected",
 		zap.String("target", t.IP),
@@ -424,9 +672,10 @@ func (p *Poller) pollSNMP(ctx context.Context, t *target.Target, tier snmp.Tier)
 		select {
 		case p.out <- pkt:
 		case <-ctx.Done():
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // ─── health monitor ──────────────────────────────────────────────────────────
@@ -525,11 +774,17 @@ func (b *circuitBreaker) tripped() bool {
 	return false
 }
 
-func (b *circuitBreaker) recordFailure() {
+// recordFailure increments the consecutive-failure counter and opens the breaker
+// once the threshold is reached. Returns true only on the transition from closed
+// to open (so the caller can count distinct open events for metrics).
+func (b *circuitBreaker) recordFailure() bool {
 	n := b.fails.Add(1)
 	if int(n) >= b.threshold {
+		wasOpen := b.openUntil.Load() != 0
 		b.openUntil.Store(time.Now().Add(b.cooldown).UnixNano())
+		return !wasOpen
 	}
+	return false
 }
 
 func (b *circuitBreaker) recordSuccess() {
@@ -537,21 +792,30 @@ func (b *circuitBreaker) recordSuccess() {
 	b.openUntil.Store(0)
 }
 
-func (p *Poller) getBreaker(t *target.Target) *circuitBreaker {
+// getBreaker returns the per-target circuit breaker for the tier's class. FAST
+// uses the tolerant liveBreakers map (fast_breaker_threshold); every heavy tier
+// shares the heavyBreakers map (breaker_threshold). Splitting them keeps a
+// flapping heavy walk from ever silencing the liveness heartbeat.
+func (p *Poller) getBreaker(t *target.Target, tier snmp.Tier) *circuitBreaker {
 	key := t.SourceID() + "|" + t.IP
-	if v, ok := p.breakers.Load(key); ok {
+	m := &p.heavyBreakers
+	threshold := p.snmpCfg.BreakerThreshold
+	if tier == snmp.TierFast {
+		m = &p.liveBreakers
+		threshold = p.snmpCfg.FastBreakerThreshold
+	}
+	if v, ok := m.Load(key); ok {
 		return v.(*circuitBreaker)
 	}
 	cooldown := time.Duration(p.snmpCfg.BreakerCooldownMs) * time.Millisecond
 	if cooldown <= 0 {
 		cooldown = 30 * time.Second
 	}
-	threshold := p.snmpCfg.BreakerThreshold
 	if threshold <= 0 {
 		threshold = 3
 	}
 	br := &circuitBreaker{threshold: threshold, cooldown: cooldown}
-	actual, _ := p.breakers.LoadOrStore(key, br)
+	actual, _ := m.LoadOrStore(key, br)
 	return actual.(*circuitBreaker)
 }
 
@@ -590,4 +854,122 @@ func (r *rateLimiter) wait(ctx context.Context) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// ─── poll metrics ──────────────────────────────────────────────────────────────
+
+// pollMetrics holds lifetime counters per tier (index = snmp.Tier) plus a couple
+// of global ones. Read/written with atomics so the metrics goroutine can sample
+// them without locking the poll path. Cumulative, not windowed — the periodic
+// summary reports running totals so a climbing timeout count signals instability.
+type pollMetrics struct {
+	ok       [snmp.NumTiers]atomic.Int64 // successful collects
+	timeouts [snmp.NumTiers]atomic.Int64 // SNMP timeouts (the simulator-overload signal)
+	fails    [snmp.NumTiers]atomic.Int64 // non-timeout failures (connect, closed socket, …)
+
+	breakerOpens  atomic.Int64 // distinct breaker open events (live + heavy)
+	mgmtConfirmed atomic.Int64 // FAST timeouts proven transient via the mgmt agent
+}
+
+// metricsLoop logs a one-line poll/timeout summary every MetricsLogIntervalMs so
+// simulator instability is visible without a metrics endpoint. Disabled when the
+// interval is 0.
+func (p *Poller) metricsLoop(ctx context.Context) {
+	iv := time.Duration(p.snmpCfg.MetricsLogIntervalMs) * time.Millisecond
+	if iv <= 0 {
+		return
+	}
+	ticker := time.NewTicker(iv)
+	defer ticker.Stop()
+	tierName := [snmp.NumTiers]string{"fast", "medium", "slow", "topology", "environment"}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		var okT, toT, failT int64
+		fields := make([]zap.Field, 0, snmp.NumTiers+5)
+		for i := 0; i < snmp.NumTiers; i++ {
+			ok := p.metrics.ok[i].Load()
+			to := p.metrics.timeouts[i].Load()
+			fa := p.metrics.fails[i].Load()
+			okT += ok
+			toT += to
+			failT += fa
+			fields = append(fields, zap.String(tierName[i],
+				fmt.Sprintf("ok=%d timeout=%d fail=%d", ok, to, fa)))
+		}
+		liveOpen, heavyOpen := 0, 0
+		p.liveBreakers.Range(func(_, v any) bool {
+			if v.(*circuitBreaker).tripped() {
+				liveOpen++
+			}
+			return true
+		})
+		p.heavyBreakers.Range(func(_, v any) bool {
+			if v.(*circuitBreaker).tripped() {
+				heavyOpen++
+			}
+			return true
+		})
+		var timeoutRate float64
+		if total := okT + toT + failT; total > 0 {
+			timeoutRate = float64(toT) / float64(total)
+		}
+		fields = append(fields,
+			zap.Float64("timeout_rate", timeoutRate),
+			zap.Int("live_breakers_open", liveOpen),
+			zap.Int("heavy_breakers_open", heavyOpen),
+			zap.Int64("breaker_opens_total", p.metrics.breakerOpens.Load()),
+			zap.Int64("mgmt_confirmed_alive", p.metrics.mgmtConfirmed.Load()),
+		)
+		p.log.Info("snmp poll metrics", fields...)
+	}
+}
+
+// ─── log throttle ──────────────────────────────────────────────────────────────
+
+// logThrottle rate-limits repeated log lines keyed by an arbitrary string (here:
+// "connect|<target>" / "gnmi|<target>"). A bursty/flapping responder otherwise
+// floods the console with one identical Warn per failure across thousands of
+// targets. window<=0 disables throttling (every call is allowed — old behavior).
+type logThrottle struct {
+	window time.Duration
+	mu     sync.Mutex
+	m      map[string]*throttleEntry
+}
+
+type throttleEntry struct {
+	last       time.Time
+	suppressed int
+}
+
+func newLogThrottle(window time.Duration) *logThrottle {
+	return &logThrottle{window: window, m: make(map[string]*throttleEntry)}
+}
+
+// allow reports whether a log line for key may be emitted now, and how many were
+// suppressed for that key since the last emit (always 0 when throttling is off or
+// on the first sighting).
+func (lt *logThrottle) allow(key string) (bool, int) {
+	if lt == nil || lt.window <= 0 {
+		return true, 0
+	}
+	now := time.Now()
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	e := lt.m[key]
+	if e == nil {
+		lt.m[key] = &throttleEntry{last: now}
+		return true, 0
+	}
+	if now.Sub(e.last) >= lt.window {
+		n := e.suppressed
+		e.last = now
+		e.suppressed = 0
+		return true, n
+	}
+	e.suppressed++
+	return false, 0
 }

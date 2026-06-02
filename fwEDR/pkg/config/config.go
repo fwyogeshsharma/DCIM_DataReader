@@ -54,9 +54,10 @@ type DiscoveryConfig struct {
 	Subnets          []string `yaml:"subnets"`            // CIDR ranges to sweep
 	SNMPAgent        string   `yaml:"snmp_agent"`         // SNMP socket target; "127.0.0.1" for simulator, "" = probe device IP directly
 	SeedIP           string   `yaml:"seed_ip"`            // first known device IP; used as readiness probe before sweep (community = seed_ip)
-	IntervalHours    int      `yaml:"interval_hours"`     // background rediscovery interval (hours)
+	IntervalHours    int      `yaml:"interval_hours"`     // background rediscovery interval (hours). 0 = disabled (manual --rediscover only)
 	TargetCacheHours int      `yaml:"target_cache_hours"` // skip sweep on startup if targets.json is younger than this (default 24)
 	EnrichmentPaceMs int      `yaml:"enrichment_pace_ms"` // delay between per-target ipAdEntAddr walks during background enrichment (default 200)
+	Enrich           bool     `yaml:"enrich"`             // run the post-walk ipAdEntAddr enrichment pass (interface IPs + OOB/loopback). default true; set false to stay idle/trap-driven after the one-shot walk
 }
 
 // SNMPConfig holds global SNMP defaults; per-target config can override.
@@ -82,10 +83,73 @@ type SNMPConfig struct {
 	TrapAddr           string `yaml:"trap_addr"`
 	Timeout            int    `yaml:"timeout_ms"`
 	Retries            int    `yaml:"retries"`
-	MaxConcurrent      int    `yaml:"max_concurrent"`
-	RateLimitPerSec    int    `yaml:"rate_limit_per_sec"`
-	BreakerThreshold   int    `yaml:"breaker_threshold"`
-	BreakerCooldownMs  int    `yaml:"breaker_cooldown_ms"`
+	// MaxConcurrent is the GLOBAL cap on concurrent SNMP UDP sockets across ALL
+	// tiers (fast + heavy combined) — not per-tier. The poller enforces it with a
+	// single global semaphore every tier must acquire before opening a socket, so
+	// the total number of in-flight UDP sockets never exceeds this. In simulator
+	// sharding mode the effective cap is further clamped to shards*2 (load is
+	// spread over only `shards` responders). Keep this modest on Windows: too many
+	// simultaneous UDP binds trigger WSAENOBUFS ("lacked sufficient buffer space").
+	MaxConcurrent     int `yaml:"max_concurrent"`
+	RateLimitPerSec   int `yaml:"rate_limit_per_sec"`
+	BreakerThreshold  int `yaml:"breaker_threshold"` // consecutive failures to open the HEAVY-walk breaker (Medium/Slow/Topology). default 3
+	BreakerCooldownMs int `yaml:"breaker_cooldown_ms"`
+
+	// FastBreakerThreshold is the separate, more tolerant threshold for the FAST
+	// liveness breaker. The cheap 1-Get heartbeat must NOT share the heavy-walk
+	// breaker: under a slow/overloaded SNMP responder the heavy BulkWalks time out
+	// first and, on a shared breaker, would open it and silence the heartbeat —
+	// flipping a perfectly reachable device "offline" downstream. Splitting the
+	// breakers + requiring more consecutive FAST misses absorbs transient blips.
+	// default 5.
+	FastBreakerThreshold int `yaml:"fast_breaker_threshold"`
+
+	// MgmtPort, when > 0, enables a SIMULATOR-ONLY confirmation probe: on a FAST
+	// timeout EDR does one cheap sysName Get against ip:MgmtPort (the simulator's
+	// SNMP SET management agent, default 1161). That agent runs on its own socket,
+	// independent of the shared snmpsim responder on 161, so it stays responsive
+	// even when 161 is wedged. If it answers, the device is alive and 161 is merely
+	// overloaded → EDR treats the miss as transient and does NOT count it toward the
+	// liveness breaker. 0 = off (production: real devices have no such agent).
+	MgmtPort int `yaml:"mgmt_port"`
+
+	// MetricsLogIntervalMs controls how often the poller emits a one-line summary
+	// of poll/timeout counters (per tier) so simulator instability is visible
+	// without a metrics server. default 60000. 0 disables.
+	MetricsLogIntervalMs int `yaml:"metrics_log_interval_ms"`
+
+	// LogThrottleMs is the minimum interval between repeated connect-failure /
+	// gNMI-reconnect warnings PER target. Bursty responders otherwise flood the
+	// console; throttled lines carry a suppressed-since-last count. default 30000.
+	// 0 disables throttling (log every occurrence — old behavior).
+	LogThrottleMs int `yaml:"log_throttle_ms"`
+
+	// Event-driven monitoring model. By default EDR no longer polls continuously:
+	// it does ONE full SNMP walk per device (all tiers — system, interfaces,
+	// counters, LLDP topology) to build inventory, then stops and relies on SNMP
+	// traps for state/topology change events. This removes the steady-state poll
+	// load that destabilized the simulator.
+	//
+	//   RewalkIntervalMs  > 0 → repeat the full walk on this interval (lightweight
+	//                           periodic inventory/topology refresh; also re-reads
+	//                           sysName so renames reflect). 0 = pure one-shot
+	//                           (default) — walk once, then traps only.
+	//   WalkRetryIntervalMs    retry cadence for the INITIAL walk while a device is
+	//                           unreachable, so a device that was down at startup
+	//                           still gets inventoried once it answers. Retries stop
+	//                           after the first successful walk. default 30000.
+	RewalkIntervalMs    int `yaml:"rewalk_interval_ms"`
+	WalkRetryIntervalMs int `yaml:"walk_retry_interval_ms"`
+
+	// Per-tier toggles for the inventory walk. FAST (system/liveness) always runs.
+	// Set walk_slow:false to skip the heavy counter/HR/UPS/sensor walks — the
+	// biggest SNMP load and not needed for device inventory or link topology.
+	// Defaults: all true (full walk). Combined with max_concurrent:1 this keeps
+	// the single-threaded simulator from being hit by parallel requests.
+	WalkMedium   bool `yaml:"walk_medium"`   // interface admin/oper/speed (also creates the interfaces table). default true
+	WalkSlow     bool `yaml:"walk_slow"`     // counters, server HR/UCD, UPS, sensors. default true
+	WalkTopology bool `yaml:"walk_topology"` // LLDP neighbor discovery → topology_links. default true
+	WalkSensors  bool `yaml:"walk_sensors"`  // environment sensors ONLY (temperature/humidity from sensor+PDU devices) WITHOUT the heavy counter walk. default false — opt-in for the heatmap
 
 	// Sharding: spread devices across N snmpsim responder processes to avoid the
 	// single-process wedge and raise throughput. Shard 0 stays on port 161 (so
@@ -120,12 +184,29 @@ type SNMPV3 struct {
 
 // GNMIConfig holds gNMI subscriber settings.
 type GNMIConfig struct {
-	Enabled      bool      `yaml:"enabled"` // default true; set false when no gNMI servers exist (e.g. SNMP-only simulator)
-	Port         int       `yaml:"port"`    // default 9339
+	Enabled bool `yaml:"enabled"` // default true; set false when no gNMI servers exist (e.g. SNMP-only simulator)
+	Port    int  `yaml:"port"`    // default 9339
+
+	// ProxyAddr is the single aggregating gNMI proxy endpoint (host:port). One
+	// subscription with an empty prefix.target streams telemetry for ALL devices
+	// — the collector holds ONE connection to the proxy, not one per device. This
+	// is the preferred path. Empty disables the proxy and uses direct mode only.
+	ProxyAddr string `yaml:"proxy_addr"` // e.g. "127.0.0.1:50051"
+
+	// FallbackPort is the per-device direct gNMI port used ONLY when the proxy is
+	// unavailable. The collector opens direct connections to each device on this
+	// port as a temporary measure and automatically tears them down and returns to
+	// the single proxy subscription once the proxy recovers. default 57400.
+	FallbackPort int `yaml:"fallback_port"`
+
+	// ProxyProbeIntervalMs is how often to re-check proxy availability while in
+	// direct-fallback mode, so recovery is detected and the proxy resumed. default 5000.
+	ProxyProbeIntervalMs int `yaml:"proxy_probe_interval_ms"`
+
 	TLS          TLSConfig `yaml:"tls"`
 	Username     string    `yaml:"username"`
 	Password     string    `yaml:"password"`
-	PollInterval int       `yaml:"poll_interval_ms"` // default 30000
+	PollInterval int       `yaml:"poll_interval_ms"` // default 30000; gNMI SAMPLE interval
 }
 
 // TargetConfig describes one device to poll. IP roles follow DCIM conventions —
@@ -187,13 +268,22 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	cfg.SNMP.MaxConcurrent = 5
 	cfg.SNMP.RateLimitPerSec = 50
 	cfg.SNMP.BreakerThreshold = 3
+	cfg.SNMP.FastBreakerThreshold = 5
 	cfg.SNMP.BreakerCooldownMs = 30000
+	cfg.SNMP.MetricsLogIntervalMs = 60000
+	cfg.SNMP.LogThrottleMs = 30000
 	cfg.Publisher.BatchSize = 256
 	cfg.Publisher.FlushIntervalMs = 200
 	cfg.Publisher.MaxInFlight = 2
+	cfg.Discovery.Enrich = true // default on; YAML "enrich: false" overrides
+	cfg.SNMP.WalkMedium = true  // default on; full walk unless YAML overrides
+	cfg.SNMP.WalkSlow = true
+	cfg.SNMP.WalkTopology = true
 	cfg.GNMI.Enabled = true // default on; YAML "enabled: false" overrides
 	cfg.GNMI.Port = 9339
 	cfg.GNMI.PollInterval = 30000
+	cfg.GNMI.FallbackPort = 57400
+	cfg.GNMI.ProxyProbeIntervalMs = 5000
 	if err := loadYAML(path, cfg); err != nil {
 		return nil, err
 	}
@@ -219,6 +309,12 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	if cfg.SNMP.BreakerThreshold <= 0 {
 		cfg.SNMP.BreakerThreshold = 3
 	}
+	if cfg.SNMP.FastBreakerThreshold <= 0 {
+		cfg.SNMP.FastBreakerThreshold = 5
+	}
+	if cfg.SNMP.WalkRetryIntervalMs <= 0 {
+		cfg.SNMP.WalkRetryIntervalMs = 30000
+	}
 	if cfg.SNMP.BreakerCooldownMs <= 0 {
 		cfg.SNMP.BreakerCooldownMs = 30000
 	}
@@ -233,6 +329,15 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	}
 	if cfg.Publisher.MaxInFlight <= 0 {
 		cfg.Publisher.MaxInFlight = 2
+	}
+	if cfg.GNMI.FallbackPort <= 0 {
+		cfg.GNMI.FallbackPort = 57400
+	}
+	if cfg.GNMI.ProxyProbeIntervalMs <= 0 {
+		cfg.GNMI.ProxyProbeIntervalMs = 5000
+	}
+	if cfg.GNMI.PollInterval <= 0 {
+		cfg.GNMI.PollInterval = 30000
 	}
 	return cfg, nil
 }

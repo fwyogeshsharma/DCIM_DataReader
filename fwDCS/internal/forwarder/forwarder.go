@@ -78,6 +78,9 @@ type aggDevice struct {
 	RackNum        *int           `json:"rack_num,omitempty"`
 	RackUnit       *int           `json:"rack_unit,omitempty"`
 	PowerDrawW     *int           `json:"power_draw_w,omitempty"`
+	DeviceRole     string         `json:"device_role,omitempty"`
+	RoleConfidence *float64       `json:"role_confidence,omitempty"`
+	RoleSource     string         `json:"role_source,omitempty"`
 	Interfaces     []aggInterface `json:"interfaces,omitempty"`
 	Metrics        []aggMetric    `json:"metrics,omitempty"`
 }
@@ -140,15 +143,20 @@ type aggTopoLink struct {
 
 type aggEvent struct {
 	ID             string          `json:"id"`
-	DeviceID       string          `json:"device_id,omitempty"`
-	Hostname       string          `json:"hostname"`
+	DeviceID       string          `json:"device_id,omitempty"` // source device
+	Hostname       string          `json:"hostname"`            // source hostname
 	Kind           string          `json:"kind"`
 	EventName      string          `json:"event_name"`
 	Severity       string          `json:"severity"`
 	TrapOID        string          `json:"trap_oid,omitempty"`
 	SourceIP       string          `json:"source_ip,omitempty"`
 	CollectorAgent string          `json:"collector_agent,omitempty"`
-	TS             string          `json:"ts"` // RFC3339
+	SrcPortName    string          `json:"src_port_name,omitempty"` // link events: sender port
+	DstDeviceID    string          `json:"dst_device_id,omitempty"` // link events: peer device
+	DstHostname    string          `json:"dst_hostname,omitempty"`  // link events: peer hostname
+	DstPortName    string          `json:"dst_port_name,omitempty"` // link events: peer port
+	LinkID         string          `json:"link_id,omitempty"`       // link events: topology_links id
+	TS             string          `json:"ts"`                      // RFC3339
 	Payload        json.RawMessage `json:"payload,omitempty"`
 }
 
@@ -373,8 +381,15 @@ func (f *Forwarder) push(ctx context.Context) error {
 
 	// ── 6. POST each scope in parallel. Scopes are disjoint (different
 	// datacenter/floor → different devices), so concurrent ingests don't conflict.
-	// If ANY scope fails we return an error and advance no cursors, so the next
-	// tick retries the whole batch — upserts are idempotent. ──────────────────
+	// Each scope payload is split into size-bounded chunks (chunkPayload) so no
+	// single POST body exceeds the Aggregator's request-size limit (the cause of
+	// the repeated HTTP 413 stall: a 4xx is non-retryable, so cursors never
+	// advanced and every tick re-sent the same oversized batch). Chunks within a
+	// scope are POSTed SEQUENTIALLY — all device chunks first, then the trailing
+	// topology+events chunk — so link endpoints are already committed and the
+	// Aggregator resolves them via its hostname DB lookup. If ANY chunk fails we
+	// record the error and advance no cursors, so the next tick retries the whole
+	// batch — upserts are idempotent. ─────────────────────────────────────────
 	var (
 		mu       sync.Mutex
 		firstErr error
@@ -384,22 +399,29 @@ func (f *Forwarder) push(ctx context.Context) error {
 		wg       sync.WaitGroup
 	)
 	for _, payload := range payloads {
-		payload := payload
+		chunks := f.chunkPayload(payload)
+		if len(chunks) == 0 {
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resp, err := f.postWithRetry(ctx, payload)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
+			for _, chunk := range chunks {
+				resp, err := f.postWithRetry(ctx, chunk)
+				if err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					return // stop this scope; cursors won't advance, batch retries next tick
 				}
-				return
+				mu.Lock()
+				totDev += resp.Ingested.Devices
+				totTopo += resp.Ingested.TopologyLinks
+				totEv += resp.Ingested.Events
+				mu.Unlock()
 			}
-			totDev += resp.Ingested.Devices
-			totTopo += resp.Ingested.TopologyLinks
-			totEv += resp.Ingested.Events
 		}()
 	}
 	wg.Wait()
@@ -504,6 +526,9 @@ func (f *Forwarder) buildPayloads(
 			RackNum:        d.RackNum,
 			RackUnit:       d.RackUnit,
 			PowerDrawW:     d.PowerDrawW,
+			DeviceRole:     d.DeviceRole,
+			RoleConfidence: d.RoleConfidence,
+			RoleSource:     d.RoleSource,
 			Interfaces:     make([]aggInterface, 0),
 			Metrics:        make([]aggMetric, 0),
 		}
@@ -612,6 +637,11 @@ func (f *Forwarder) buildPayloads(
 			TrapOID:        ev.TrapOID,
 			SourceIP:       ev.SourceIP,
 			CollectorAgent: ev.CollectorAgent,
+			SrcPortName:    ev.SrcPortName,
+			DstDeviceID:    ev.DstDeviceID,
+			DstHostname:    ev.DstHostname,
+			DstPortName:    ev.DstPortName,
+			LinkID:         ev.LinkID,
 			TS:             ev.TS.UTC().Format(time.RFC3339),
 		}
 		if ev.Payload != "" && ev.Payload != "{}" {
@@ -626,6 +656,112 @@ func (f *Forwarder) buildPayloads(
 		out = append(out, p)
 	}
 	return out
+}
+
+// maxPostBytes bounds each POST body by MEASURED serialized JSON size. Set well
+// under 1MB because the Aggregator sits behind a proxy/ingress whose body limit
+// (~1MB) is far below express's 10MB — count-based bounds (N devices) can't
+// guarantee byte size, so a 50-device chunk still tripped HTTP 413. 512KB clears
+// a 1MB proxy with wide margin and is still a large batch.
+const maxPostBytes = 512 * 1024
+
+// chunkPayload splits one scope payload into byte-bounded sub-payloads, each
+// carrying the same scope identifiers. Devices (with their nested interfaces,
+// addresses, and metrics) are packed by MEASURED serialized size until adding
+// the next device would exceed maxPostBytes — but a single device always fits in
+// one chunk even if it alone exceeds the budget (a device can't be split; it
+// ships alone and is logged). Topology links and events ride in trailing
+// chunk(s) emitted AFTER all device chunks, so by the time the Aggregator
+// ingests links every endpoint device is already committed and resolvable by
+// hostname; events fall back to their forwarded device_id.
+func (f *Forwarder) chunkPayload(p *aggPayload) []*aggPayload {
+	base := func() *aggPayload {
+		return &aggPayload{
+			OrgID:         p.OrgID,
+			DatacenterID:  p.DatacenterID,
+			FloorID:       p.FloorID,
+			NetworkID:     p.NetworkID,
+			GroupID:       p.GroupID,
+			Devices:       make([]aggDevice, 0),
+			TopologyLinks: make([]aggTopoLink, 0),
+			Events:        make([]aggEvent, 0),
+		}
+	}
+	// Fixed envelope overhead (scope ids + empty arrays). Approximate; the 512KB
+	// budget already leaves ample headroom for it.
+	const envelope = 512
+
+	var chunks []*aggPayload
+	cur := base()
+	curBytes := envelope
+	for _, d := range p.Devices {
+		db := jsonLen(d)
+		if len(cur.Devices) > 0 && curBytes+db > maxPostBytes {
+			chunks = append(chunks, cur)
+			cur = base()
+			curBytes = envelope
+		}
+		if db > maxPostBytes {
+			f.log.Warn("forwarder: single device exceeds POST byte budget — sending alone, may 413",
+				zap.String("hostname", d.Hostname),
+				zap.Int("bytes", db),
+				zap.Int("budget", maxPostBytes))
+		}
+		cur.Devices = append(cur.Devices, d)
+		curBytes += db
+	}
+	if len(cur.Devices) > 0 {
+		chunks = append(chunks, cur)
+	}
+
+	// Trailing topology + events, split into byte-bounded chunks of their own and
+	// sent last so link endpoints are already committed.
+	for _, tl := range p.TopologyLinks {
+		if len(chunks) == 0 || lastTailFull(chunks, jsonLen(tl), true) {
+			chunks = append(chunks, base())
+		}
+		c := chunks[len(chunks)-1]
+		c.TopologyLinks = append(c.TopologyLinks, tl)
+	}
+	for _, ev := range p.Events {
+		if len(chunks) == 0 || lastTailFull(chunks, jsonLen(ev), false) {
+			chunks = append(chunks, base())
+		}
+		c := chunks[len(chunks)-1]
+		c.Events = append(c.Events, ev)
+	}
+
+	return chunks
+}
+
+// jsonLen returns the serialized byte length of v (0 on marshal error, which
+// then just packs conservatively).
+func jsonLen(v any) int {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return len(b)
+}
+
+// lastTailFull reports whether the trailing chunk can't take addBytes more of a
+// topology link (isLink) or event without exceeding the byte budget, OR isn't a
+// pure tail chunk (still holds devices — links/events must not piggyback on a
+// device chunk, which is POSTed before endpoints commit).
+func lastTailFull(chunks []*aggPayload, addBytes int, isLink bool) bool {
+	c := chunks[len(chunks)-1]
+	if len(c.Devices) > 0 {
+		return true // last chunk is a device chunk — force a fresh tail chunk
+	}
+	cur := 512 // envelope
+	for _, l := range c.TopologyLinks {
+		cur += jsonLen(l)
+	}
+	for _, e := range c.Events {
+		cur += jsonLen(e)
+	}
+	hasContent := len(c.TopologyLinks) > 0 || len(c.Events) > 0
+	return hasContent && cur+addBytes > maxPostBytes
 }
 
 // postWithRetry POSTs the payload to the Aggregator endpoint. Retries on

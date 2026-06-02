@@ -264,7 +264,22 @@ func (s *Sweeper) EnrichTarget(t *target.Target) []InterfaceAddress {
 	if s.snmpAgent != "" {
 		socketTarget = s.snmpAgent
 	}
-	addrPdus, err := s.snmpWalk(socketTarget, t.Community, oidIpAdEntAddr)
+	var (
+		addrPdus []gosnmp.SnmpPDU
+		err      error
+	)
+	for attempt := 1; attempt <= 3; attempt++ {
+		addrPdus, err = s.snmpWalk(socketTarget, t.Community, oidIpAdEntAddr)
+		if err == nil {
+			break
+		}
+		s.log.Warn("interface address enrichment walk failed",
+			zap.String("target", t.SourceID()),
+			zap.String("community", t.Community),
+			zap.Int("attempt", attempt),
+			zap.Error(err))
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
 	if err != nil {
 		return nil
 	}
@@ -281,7 +296,19 @@ func (s *Sweeper) EnrichTarget(t *target.Target) []InterfaceAddress {
 
 	// Walk ipAdEntIfIndex to map each IP → ifIndex. The IP appears as the OID
 	// suffix; the PDU value is the ifIndex.
-	idxPdus, _ := s.snmpWalk(socketTarget, t.Community, oidIpAdEntIfIndex)
+	var idxPdus []gosnmp.SnmpPDU
+	for attempt := 1; attempt <= 3; attempt++ {
+		idxPdus, err = s.snmpWalk(socketTarget, t.Community, oidIpAdEntIfIndex)
+		if err == nil {
+			break
+		}
+		s.log.Warn("interface index enrichment walk failed",
+			zap.String("target", t.SourceID()),
+			zap.String("community", t.Community),
+			zap.Int("attempt", attempt),
+			zap.Error(err))
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
 	ipToIdx := make(map[string]int, len(idxPdus))
 	idxPrefix := oidIpAdEntIfIndex + "."
 	for _, p := range idxPdus {
@@ -320,8 +347,15 @@ func (s *Sweeper) EnrichTarget(t *target.Target) []InterfaceAddress {
 
 	out := make([]InterfaceAddress, 0, len(addresses))
 	for _, ip := range addresses {
+		idx := ipToIdx[ip]
+		if idx <= 0 {
+			s.log.Debug("interface address skipped without ifIndex",
+				zap.String("target", t.SourceID()),
+				zap.String("address", ip))
+			continue
+		}
 		out = append(out, InterfaceAddress{
-			IfIndex: ipToIdx[ip],
+			IfIndex: idx,
 			Address: ip,
 			Family:  "ipv4",
 		})
@@ -330,13 +364,24 @@ func (s *Sweeper) EnrichTarget(t *target.Target) []InterfaceAddress {
 }
 
 func (s *Sweeper) snmpWalk(socketTarget, community, oid string) ([]gosnmp.SnmpPDU, error) {
+	timeout := time.Duration(s.snmp.Timeout) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout*4)
+	defer cancel()
+	release, ok := snmp.AcquireSocket(ctx)
+	if !ok {
+		return nil, ctx.Err()
+	}
+	defer release()
 	g := &gosnmp.GoSNMP{
 		Target:    socketTarget,
 		Port:      snmp.ShardPort(community, s.snmp.Shards, s.snmp.ShardBasePort),
 		Transport: "udp",
 		Community: community,
 		Version:   gosnmp.Version2c,
-		Timeout:   time.Duration(s.snmp.Timeout) * time.Millisecond,
+		Timeout:   timeout,
 		Retries:   0,
 		MaxOids:   gosnmp.MaxOids,
 	}
@@ -348,13 +393,25 @@ func (s *Sweeper) snmpWalk(socketTarget, community, oid string) ([]gosnmp.SnmpPD
 }
 
 func (s *Sweeper) snmpGet(socketTarget, community string) (hostname, descr string, ok bool) {
+	timeout := time.Duration(s.snmp.Timeout) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout*2)
+	defer cancel()
+	release, acquired := snmp.AcquireSocket(ctx)
+	if !acquired {
+		s.log.Debug("snmp get skipped waiting for socket slot", zap.String("target", socketTarget), zap.String("community", community), zap.Error(ctx.Err()))
+		return "", "", false
+	}
+	defer release()
 	g := &gosnmp.GoSNMP{
 		Target:    socketTarget,
 		Port:      snmp.ShardPort(community, s.snmp.Shards, s.snmp.ShardBasePort),
 		Transport: "udp",
 		Community: community,
 		Version:   gosnmp.Version2c,
-		Timeout:   time.Duration(s.snmp.Timeout) * time.Millisecond,
+		Timeout:   timeout,
 		// No retries during sweep: dead IPs vastly outnumber flaky-but-live
 		// IPs, so 0-retry shortens dead-IP cost from 6s to 2s. Devices that
 		// drop the first probe are picked up by the periodic rediscovery loop.

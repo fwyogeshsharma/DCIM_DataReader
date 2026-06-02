@@ -20,7 +20,7 @@ log:
   format: "json"
 
 aggregator:
-  enabled:     true
+  enabled:     false
   endpoint:    "https://fwdcim.faberwork.com/api/v1/ingest"
   ingest_key:  "74613fe24e4da087f46d584c6558870a3bed6b993a6416ced4df17f9a0f1e824"
   interval_ms: 5000
@@ -33,5 +33,12 @@ aggregator:
 # root: hostname OR any IP of the tree root. Empty = auto-pick highest-degree
 # node per connected component. Works for any graph shape.
 topology:
-  root:                 "192.168.1.6"   # DC1-ER1 (seed/edge router); "" = auto
+  root:                 "192.168.0.7"   # DC1-ER1 (seed/edge router); "" = auto
   recompute_interval_ms: 30000
+  # Fabric-role classifier: infer device_role (core/spine/leaf/access/distribution)
+  # for switches after each hierarchy recompute, from hostname + model + LLDP
+  # neighbor profile. Stored in devices.device_role/role_confidence/role_source.
+  classify_roles:        true
+  # Optional: override classifier lookup tables/weights/thresholds without a
+  # rebuild. Empty = compiled-in defaults (tuned for the simulator naming).
+  # role_rules_path:     "C:\\Users\\Faber\\Desktop\\fwDCIM\\fwDCS\\role_rules.yaml"
