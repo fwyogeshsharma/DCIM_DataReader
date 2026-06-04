@@ -106,6 +106,13 @@ const (
 	// and emitted as environment.temperature_c (tags CHASSIS / CPU).
 	OIDEntPhySensorValue = "1.3.6.1.2.1.99.1.1.1.4"
 
+	// Enterprise power-device scalar trees (simulator snmprec_generator). Each is a
+	// flat set of scalar columns base.N.0, read with one SNMP GET. EDR has no other
+	// source for these (PDUs/generators are SNMP-only — not gNMI-capable).
+	OIDPDUBase       = "1.3.6.1.4.1.99999.5" // _pdu_entries: load/volt/pf/current/power/energy/freq/temp/humidity
+	OIDGeneratorBase = "1.3.6.1.4.1.99999.7" // _generator_entries: fuel/runhours/status/load/kW/phase volts/freq/coolant/oil/battery
+	OIDUPSEntBase    = "1.3.6.1.4.1.99999.4" // UPS enterprise status: fan/charger/rectifier/phase/batteryEx
+
 	// IP-MIB — ipAddrTable
 	OIDIpAdEntAddr    = "1.3.6.1.2.1.4.20.1.1" // ipAdEntAddr: OID suffix is the IP address
 	OIDIpAdEntIfIndex = "1.3.6.1.2.1.4.20.1.2" // ipAdEntIfIndex: value is the ifIndex; suffix is the IP

@@ -134,8 +134,19 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 		// for devices that carry sensors. No interface counters / HR / UCD — so it
 		// adds minimal SNMP load. Errors are non-fatal (returns what it has).
 		switch c.target.DeviceType {
-		case "sensor", "pdu", "floor_pdu":
+		case "sensor":
 			if p, err := c.collectSensors(); err == nil {
+				pkts = append(pkts, p...)
+			}
+		case "pdu", "floor_pdu":
+			// Enterprise PDU scalars (load/voltage/current/power/energy/freq +
+			// temperature + humidity). The simulator serves these only on the
+			// 99999.5 tree — the vendor sensor walks return nothing for PDUs.
+			if p, err := c.collectPDU(); err == nil {
+				pkts = append(pkts, p...)
+			}
+		case "generator":
+			if p, err := c.collectGenerator(); err == nil {
 				pkts = append(pkts, p...)
 			}
 		case "server":
@@ -147,6 +158,9 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 			}
 		case "ups":
 			if p, err := c.collectUPSTemp(); err == nil {
+				pkts = append(pkts, p...)
+			}
+			if p, err := c.collectUPSEnterprise(); err == nil {
 				pkts = append(pkts, p...)
 			}
 		}
@@ -518,6 +532,120 @@ func (c *Collector) collectUPS() ([]*v1.TelemetryPacket, error) {
 			LastOIDComponent(p.Name), ToFloat64(p), c.hostMeta()))
 	}
 	return pkts, nil
+}
+
+// ─── enterprise power-device scalars (PDU / generator / UPS-enterprise) ──────
+
+// scalarMetric describes one enterprise scalar column (base.col.0): the metric
+// name to emit, an optional tag, and the divisor that undoes the simulator's
+// fixed-point ×N encoding (1 = no scaling).
+type scalarMetric struct {
+	col   string
+	name  string
+	tag   string
+	scale float64
+}
+
+// pduScalars maps the simulator's _pdu_entries (99999.5.N.0) to metrics. Temp
+// and humidity are folded into the shared environment.* names (tag PDU) so they
+// land on the heatmap alongside sensor/server/ups readings.
+var pduScalars = []scalarMetric{
+	{"1", "pdu.load_percent", "", 1},
+	{"2", "pdu.voltage_v", "", 1},
+	{"3", "pdu.power_factor", "", 100},
+	{"4", "pdu.phase_imbalance_percent", "", 1},
+	{"5", "pdu.outlet_status", "", 1},
+	{"6", "pdu.breaker_status", "", 1},
+	{"7", "pdu.outlet_failure", "", 1},
+	{"8", "pdu.smoke_detected", "", 1},
+	{"9", "pdu.current_a", "", 10},
+	{"10", "pdu.ground_fault", "", 1},
+	{"11", "pdu.real_power_w", "", 1},
+	{"12", "pdu.apparent_power_va", "", 1},
+	{"13", "pdu.energy_kwh", "", 10},
+	{"14", "pdu.frequency_hz", "", 10},
+	{"15", "environment.temperature_c", "PDU", 10},
+	{"16", "environment.humidity_percent", "", 10},
+	{"17", "pdu.outlet_power_w", "", 1},
+}
+
+// genScalars maps the simulator's _generator_entries (99999.7.N.0) to metrics.
+var genScalars = []scalarMetric{
+	{"1", "generator.fuel_percent", "", 1},
+	{"2", "generator.run_hours", "", 1},
+	{"3", "generator.status", "", 1},
+	{"4", "generator.load_percent", "", 1},
+	{"5", "generator.output_kw", "", 1},
+	{"6", "generator.output_voltage_v", "PhA", 10},
+	{"7", "generator.output_voltage_v", "PhB", 10},
+	{"8", "generator.output_voltage_v", "PhC", 10},
+	{"9", "generator.frequency_hz", "", 10},
+	{"10", "generator.coolant_status", "", 1},
+	{"11", "generator.oil_pressure_status", "", 1},
+	{"12", "generator.battery_status", "", 1},
+	{"13", "generator.start_attempts", "", 1},
+}
+
+// upsEntScalars maps the UPS enterprise status block (99999.4.N.0) to metrics.
+var upsEntScalars = []scalarMetric{
+	{"1", "environment.ups_fan_status", "", 1},
+	{"2", "environment.ups_charger_status", "", 1},
+	{"3", "environment.ups_rectifier_status", "", 1},
+	{"4", "environment.ups_phase_status", "", 1},
+	{"5", "environment.ups_battery_status_ex", "", 1},
+}
+
+func (c *Collector) collectPDU() ([]*v1.TelemetryPacket, error) {
+	return c.collectScalars(OIDPDUBase, pduScalars)
+}
+
+func (c *Collector) collectGenerator() ([]*v1.TelemetryPacket, error) {
+	return c.collectScalars(OIDGeneratorBase, genScalars)
+}
+
+func (c *Collector) collectUPSEnterprise() ([]*v1.TelemetryPacket, error) {
+	return c.collectScalars(OIDUPSEntBase, upsEntScalars)
+}
+
+// collectScalars reads a set of enterprise scalar OIDs (base.col.0) in a single
+// SNMP GET and emits one metric per readable varbind. Unanswered columns
+// (NoSuchInstance/Object) are skipped so a partial agent never fails the tier.
+func (c *Collector) collectScalars(base string, table []scalarMetric) ([]*v1.TelemetryPacket, error) {
+	oids := make([]string, len(table))
+	idx := make(map[string]scalarMetric, len(table))
+	for i, s := range table {
+		oids[i] = base + "." + s.col + ".0"
+		idx[s.col] = s
+	}
+	pkt, err := c.client.Get(oids)
+	if err != nil {
+		return nil, err
+	}
+	var pkts []*v1.TelemetryPacket
+	for _, p := range pkt.Variables {
+		switch p.Type {
+		case gosnmp.NoSuchObject, gosnmp.NoSuchInstance, gosnmp.EndOfMibView, gosnmp.Null:
+			continue
+		}
+		s, ok := idx[scalarCol(p.Name, base)]
+		if !ok {
+			continue
+		}
+		scale := s.scale
+		if scale == 0 {
+			scale = 1
+		}
+		pkts = append(pkts, c.newMetric(s.name, s.tag, ToFloat64(p)/scale, c.hostMeta()))
+	}
+	return pkts, nil
+}
+
+// scalarCol extracts the column number from an enterprise scalar OID, i.e. the
+// "N" in base.N.0 (e.g. "1.3.6.1.4.1.99999.5.15.0" with base 99999.5 → "15").
+func scalarCol(oidName, base string) string {
+	n := strings.TrimPrefix(oidName, ".")
+	n = strings.TrimPrefix(n, strings.TrimPrefix(base, ".")+".")
+	return strings.TrimSuffix(n, ".0")
 }
 
 // collectUPSTemp reads upsBatteryTemperature (whole °C). Emitted as

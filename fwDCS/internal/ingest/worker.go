@@ -101,21 +101,26 @@ func (p *Pipeline) QueueDepth() uint32 { return p.queueDepth.Load() }
 
 func (p *Pipeline) workerLoop(ctx context.Context, id int) {
 	rows := make([]store.MetricRow, 0, p.cfg.BufferRows)
+	energyRows := make([]store.EnergyRow, 0, p.cfg.BufferRows)
 	flushInterval := time.Duration(p.cfg.FlushIntervalMs) * time.Millisecond
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
 
 	flush := func() {
-		if len(rows) == 0 {
-			return
+		if len(rows) > 0 {
+			if err := p.db.WriteMetricsBatch(context.Background(), rows); err != nil {
+				p.log.Warn("metrics batch insert failed",
+					zap.Int("worker", id), zap.Int("rows", len(rows)), zap.Error(err))
+			}
+			rows = rows[:0]
 		}
-		if err := p.db.WriteMetricsBatch(context.Background(), rows); err != nil {
-			p.log.Warn("metrics batch insert failed",
-				zap.Int("worker", id),
-				zap.Int("rows", len(rows)),
-				zap.Error(err))
+		if len(energyRows) > 0 {
+			if err := p.db.WriteEnergyBatch(context.Background(), energyRows); err != nil {
+				p.log.Warn("energy batch insert failed",
+					zap.Int("worker", id), zap.Int("rows", len(energyRows)), zap.Error(err))
+			}
+			energyRows = energyRows[:0]
 		}
-		rows = rows[:0]
 	}
 
 	for {
@@ -126,6 +131,16 @@ func (p *Pipeline) workerLoop(ctx context.Context, id int) {
 		case batch := <-p.ch:
 			p.queueDepth.Add(^uint32(0)) // -1
 			for _, pkt := range batch {
+				// BACnet energy telemetry routes to its own hypertable.
+				if pkt.Kind == "energy" {
+					if er, ok := p.processEnergy(ctx, pkt); ok {
+						energyRows = append(energyRows, er)
+						if len(energyRows) >= p.cfg.BufferRows {
+							flush()
+						}
+					}
+					continue
+				}
 				row, ok := p.process(ctx, pkt)
 				if !ok {
 					continue
@@ -139,6 +154,54 @@ func (p *Pipeline) workerLoop(ctx context.Context, id int) {
 			flush()
 		}
 	}
+}
+
+// processEnergy turns a Kind=="energy" packet into an EnergyRow. circuit/phase
+// are derived from the packet tag (CktNN → circuit, PhA/PhB/PhC → phase).
+func (p *Pipeline) processEnergy(ctx context.Context, pkt *v1.TelemetryPacket) (store.EnergyRow, bool) {
+	if pkt.Id == "" || pkt.SourceId == "" || pkt.Name == "" {
+		return store.EnergyRow{}, false
+	}
+	Normalize(pkt)
+	deviceID := p.lookupOrRegister(ctx, pkt)
+	if deviceID == "" {
+		return store.EnergyRow{}, false
+	}
+
+	var circuit, phase string
+	switch {
+	case strings.HasPrefix(pkt.Tag, "Ckt"):
+		circuit = pkt.Tag
+	case pkt.Tag == "PhA" || pkt.Tag == "PhB" || pkt.Tag == "PhC":
+		phase = pkt.Tag
+	}
+
+	agent := pkt.Meta["collector_agent"]
+	if agent == "" {
+		agent = "EDR"
+	}
+	proto := pkt.Meta["collector_protocol"]
+	if proto == "" {
+		proto = "BACNET"
+	}
+	attrs := store.MapWithout(pkt.Meta,
+		"hostname", "device_type", "vendor",
+		"mgmt_ip", "prod_ip", "loopback_ip", "oob_ip",
+		"collector_agent", "collector_protocol",
+		"snmp_enabled", "gnmi_enabled")
+
+	return store.EnergyRow{
+		DeviceID:          deviceID,
+		TS:                time.Unix(0, pkt.TimestampNs).UTC(),
+		MetricName:        pkt.Name,
+		Tag:               pkt.Tag,
+		Circuit:           circuit,
+		Phase:             phase,
+		Value:             pkt.Value,
+		Attributes:        store.AttributesJSON(attrs),
+		CollectorAgent:    agent,
+		CollectorProtocol: proto,
+	}, true
 }
 
 // process handles one packet. Returns (row, true) if the packet became a

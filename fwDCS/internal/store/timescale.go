@@ -494,6 +494,95 @@ func (db *DB) WriteMetricsBatch(ctx context.Context, rows []MetricRow) error {
 	return nil
 }
 
+// ─── energy metrics ───────────────────────────────────────────────────────────
+
+// EnergyRow is one BACnet/IP energy reading destined for the energy_metrics
+// hypertable. circuit/phase are first-class columns derived from the packet tag.
+type EnergyRow struct {
+	DeviceID          string
+	TS                time.Time
+	MetricName        string // e.g. energy.active_power_kw
+	Tag               string // raw secondary key (CktNN / PhA / H3)
+	Circuit           string // CktNN for per-circuit rows; "" for panel
+	Phase             string // PhA/PhB/PhC for phase rows; "" otherwise
+	Value             float64
+	Attributes        string // pre-encoded JSONB
+	CollectorAgent    string
+	CollectorProtocol string
+}
+
+// WriteEnergyBatch inserts energy rows via a COPY through a staging table, then
+// upserts into the energy_metrics hypertable. Mirrors WriteMetricsBatch.
+func (db *DB) WriteEnergyBatch(ctx context.Context, rows []EnergyRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	conn, err := db.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("energy batch: acquire: %w", err)
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("energy batch: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	_, err = tx.Exec(ctx, `
+		CREATE TEMP TABLE _energy_stage (
+			device_id          UUID,
+			ts                 TIMESTAMPTZ,
+			metric_name        TEXT,
+			tag                TEXT,
+			circuit            TEXT,
+			phase              TEXT,
+			value              DOUBLE PRECISION,
+			attributes         JSONB,
+			collector_agent    TEXT,
+			collector_protocol TEXT
+		) ON COMMIT DROP`)
+	if err != nil {
+		return fmt.Errorf("energy batch: stage create: %w", err)
+	}
+
+	src := pgx.CopyFromSlice(len(rows), func(i int) ([]any, error) {
+		r := rows[i]
+		attrs := r.Attributes
+		if attrs == "" {
+			attrs = "{}"
+		}
+		agent := r.CollectorAgent
+		if agent == "" {
+			agent = "EDR"
+		}
+		proto := r.CollectorProtocol
+		if proto == "" {
+			proto = "BACNET"
+		}
+		return []any{r.DeviceID, r.TS, r.MetricName, r.Tag, r.Circuit, r.Phase, r.Value, attrs, agent, proto}, nil
+	})
+	if _, err := tx.CopyFrom(ctx,
+		pgx.Identifier{"_energy_stage"},
+		[]string{"device_id", "ts", "metric_name", "tag", "circuit", "phase", "value", "attributes", "collector_agent", "collector_protocol"},
+		src); err != nil {
+		return fmt.Errorf("energy batch: copy: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO energy_metrics (device_id, ts, metric_name, tag, circuit, phase, value, attributes, collector_agent, collector_protocol)
+		SELECT device_id, ts, metric_name, tag, circuit, phase, value, attributes, collector_agent, collector_protocol
+		FROM _energy_stage
+		ON CONFLICT (device_id, metric_name, tag, ts) DO NOTHING`); err != nil {
+		return fmt.Errorf("energy batch: upsert: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("energy batch: commit: %w", err)
+	}
+	return nil
+}
+
 // ─── events ──────────────────────────────────────────────────────────────────
 
 // WriteEvent inserts a trap or alarm event. sourceHostname is stored in the

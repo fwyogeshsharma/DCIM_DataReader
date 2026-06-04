@@ -13,6 +13,7 @@ type Capability uint8
 const (
 	CapSNMP Capability = 1 << iota
 	CapGNMI
+	CapBACnet
 )
 
 // Target is a resolved device ready for polling.
@@ -89,6 +90,9 @@ func FromConfig(tc config.TargetConfig, global config.SNMPConfig) *Target {
 	caps := CapSNMP
 	if tc.GNMIEnabled {
 		caps |= CapGNMI
+	}
+	if tc.BACnetEnabled {
+		caps |= CapBACnet
 	}
 	return &Target{
 		IP:             tc.IP,

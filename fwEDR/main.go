@@ -15,6 +15,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/faberwork/fwedr/internal/bacnet"
 	"github.com/faberwork/fwedr/internal/discovery"
 	"github.com/faberwork/fwedr/internal/poller"
 	"github.com/faberwork/fwedr/internal/publisher"
@@ -342,6 +343,17 @@ func run(cfgPath string, forceRediscover bool) error {
 		p.Run(ctx)
 		close(pollerDone)
 	}()
+
+	// BACnet/IP manager — polls Verdigris EV2 energy monitors
+	// (device_type=energy_monitor). Independent of the SNMP one-shot walk: its
+	// own periodic ReadPropertyMultiple loop (+ optional COV push). No-op when
+	// disabled or when no energy_monitor devices are present.
+	if cfg.BACnet.Enabled {
+		bm := bacnet.NewManager(targets, cfg.BACnet, cfg.Identity, signer, log)
+		if bm.Count() > 0 {
+			go bm.Run(ctx, pktCh)
+		}
+	}
 
 	// Background rediscovery loop — picks up devices that were not yet up
 	// when EDR started, and new devices that appear between full sweep cycles.

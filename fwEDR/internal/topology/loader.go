@@ -156,6 +156,11 @@ func LoadTargets(path string) ([]config.TargetConfig, error) {
 			tc.GNMIEnabled = true
 			tc.GNMIIP = mgmtIP // connect to per-device gNMI server on mgmt IP
 		}
+		// energy_monitor = Verdigris EV2 BACnet/IP power meter. Polled by the
+		// BACnet manager at MgmtIP:47808 (EV2 is mgmt-only — no SNMP power data).
+		if d.DeviceType == "energy_monitor" {
+			tc.BACnetEnabled = true
+		}
 		out = append(out, tc)
 	}
 	return out, nil

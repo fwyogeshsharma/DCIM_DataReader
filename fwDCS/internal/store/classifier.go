@@ -175,6 +175,8 @@ func typeToRole(dt string) (role string, isFabricSwitch bool) {
 		return "floor_pdu", false
 	case "sensor":
 		return "sensor", false
+	case "energy_monitor":
+		return "energy_monitor", false
 	default:
 		return "unclassified", false
 	}

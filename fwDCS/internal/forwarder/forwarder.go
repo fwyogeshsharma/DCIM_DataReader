@@ -49,40 +49,41 @@ type aggPayload struct {
 }
 
 type aggDevice struct {
-	ID             string         `json:"id"`
-	Hostname       string         `json:"hostname"`
-	DeviceType     string         `json:"device_type"`
-	Vendor         string         `json:"vendor,omitempty"`
-	ModelName      string         `json:"model_name,omitempty"`
-	OSName         string         `json:"os_name,omitempty"`
-	OSVersion      string         `json:"os_version,omitempty"`
-	SysOID         string         `json:"sys_oid,omitempty"`
-	SysDescription string         `json:"sys_description,omitempty"`
-	SysLocation    string         `json:"sys_location,omitempty"`
-	MgmtIP         string         `json:"mgmt_ip,omitempty"`
-	ProdIP         string         `json:"prod_ip,omitempty"`
-	LoopbackIP     string         `json:"loopback_ip,omitempty"`
-	OOBIP          string         `json:"oob_ip,omitempty"`
-	SNMPEnabled    bool           `json:"snmp_enabled"`
-	GNMIEnabled    bool           `json:"gnmi_enabled"`
-	SNMPPort       int            `json:"snmp_port,omitempty"`
-	SNMPVersion    int            `json:"snmp_version,omitempty"`
-	GNMIPort       int            `json:"gnmi_port,omitempty"`
-	CollectorAgent string         `json:"collector_agent,omitempty"`
-	IsReachable    bool           `json:"is_reachable"`
-	Country        string         `json:"country,omitempty"`
-	DatacenterCity string         `json:"datacenter_city,omitempty"`
-	Datacenter     string         `json:"datacenter,omitempty"`
-	Room           string         `json:"room,omitempty"`
-	RackRow        *int           `json:"rack_row,omitempty"`
-	RackNum        *int           `json:"rack_num,omitempty"`
-	RackUnit       *int           `json:"rack_unit,omitempty"`
-	PowerDrawW     *int           `json:"power_draw_w,omitempty"`
-	DeviceRole     string         `json:"device_role,omitempty"`
-	RoleConfidence *float64       `json:"role_confidence,omitempty"`
-	RoleSource     string         `json:"role_source,omitempty"`
-	Interfaces     []aggInterface `json:"interfaces,omitempty"`
-	Metrics        []aggMetric    `json:"metrics,omitempty"`
+	ID             string            `json:"id"`
+	Hostname       string            `json:"hostname"`
+	DeviceType     string            `json:"device_type"`
+	Vendor         string            `json:"vendor,omitempty"`
+	ModelName      string            `json:"model_name,omitempty"`
+	OSName         string            `json:"os_name,omitempty"`
+	OSVersion      string            `json:"os_version,omitempty"`
+	SysOID         string            `json:"sys_oid,omitempty"`
+	SysDescription string            `json:"sys_description,omitempty"`
+	SysLocation    string            `json:"sys_location,omitempty"`
+	MgmtIP         string            `json:"mgmt_ip,omitempty"`
+	ProdIP         string            `json:"prod_ip,omitempty"`
+	LoopbackIP     string            `json:"loopback_ip,omitempty"`
+	OOBIP          string            `json:"oob_ip,omitempty"`
+	SNMPEnabled    bool              `json:"snmp_enabled"`
+	GNMIEnabled    bool              `json:"gnmi_enabled"`
+	SNMPPort       int               `json:"snmp_port,omitempty"`
+	SNMPVersion    int               `json:"snmp_version,omitempty"`
+	GNMIPort       int               `json:"gnmi_port,omitempty"`
+	CollectorAgent string            `json:"collector_agent,omitempty"`
+	IsReachable    bool              `json:"is_reachable"`
+	Country        string            `json:"country,omitempty"`
+	DatacenterCity string            `json:"datacenter_city,omitempty"`
+	Datacenter     string            `json:"datacenter,omitempty"`
+	Room           string            `json:"room,omitempty"`
+	RackRow        *int              `json:"rack_row,omitempty"`
+	RackNum        *int              `json:"rack_num,omitempty"`
+	RackUnit       *int              `json:"rack_unit,omitempty"`
+	PowerDrawW     *int              `json:"power_draw_w,omitempty"`
+	DeviceRole     string            `json:"device_role,omitempty"`
+	RoleConfidence *float64          `json:"role_confidence,omitempty"`
+	RoleSource     string            `json:"role_source,omitempty"`
+	Interfaces     []aggInterface    `json:"interfaces,omitempty"`
+	Metrics        []aggMetric       `json:"metrics,omitempty"`
+	EnergyMetrics  []aggEnergyMetric `json:"energy_metrics,omitempty"`
 }
 
 type aggInterface struct {
@@ -120,6 +121,19 @@ type aggMetric struct {
 	CollectorAgent    string          `json:"collector_agent,omitempty"`
 	CollectorProtocol string          `json:"collector_protocol,omitempty"`
 	InterfaceName     string          `json:"interface_name,omitempty"`
+	TS                string          `json:"ts,omitempty"` // RFC3339
+}
+
+type aggEnergyMetric struct {
+	DeviceID          string          `json:"device_id"`
+	MetricName        string          `json:"metric_name"`
+	Value             float64         `json:"value"`
+	Tag               string          `json:"tag,omitempty"`
+	Circuit           string          `json:"circuit,omitempty"`
+	Phase             string          `json:"phase,omitempty"`
+	Attributes        json.RawMessage `json:"attributes,omitempty"`
+	CollectorAgent    string          `json:"collector_agent,omitempty"`
+	CollectorProtocol string          `json:"collector_protocol,omitempty"`
 	TS                string          `json:"ts,omitempty"` // RFC3339
 }
 
@@ -239,6 +253,7 @@ func (f *Forwarder) push(ctx context.Context) error {
 	// ── 1. Load cursors ──────────────────────────────────────────────────────
 	devCursor, _ := f.db.GetForwarderCursor(ctx, "devices")
 	metricsCursor, _ := f.db.GetForwarderCursor(ctx, "metrics")
+	energyCursor, _ := f.db.GetForwarderCursor(ctx, "energy")
 	topoCursor, _ := f.db.GetForwarderCursor(ctx, "topology")
 	eventsCursor, _ := f.db.GetForwarderCursor(ctx, "events")
 
@@ -255,6 +270,13 @@ func (f *Forwarder) push(ctx context.Context) error {
 		metricsCursor, metricLimit)
 	if err != nil {
 		return fmt.Errorf("metrics query: %w", err)
+	}
+
+	recentEnergy, err := f.db.EnergySince(ctx,
+		f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID,
+		energyCursor, metricLimit)
+	if err != nil {
+		return fmt.Errorf("energy query: %w", err)
 	}
 
 	topoLinks, err := f.db.TopologyLinksSince(ctx,
@@ -276,18 +298,30 @@ func (f *Forwarder) push(ctx context.Context) error {
 	for _, m := range recentMetrics {
 		metricsByDevice[m.DeviceID] = append(metricsByDevice[m.DeviceID], m)
 	}
+	energyByDevice := make(map[string][]store.FwdEnergy, len(recentEnergy))
+	for _, e := range recentEnergy {
+		energyByDevice[e.DeviceID] = append(energyByDevice[e.DeviceID], e)
+	}
 
-	// Devices that only appear in the metrics delta (device row not updated)
-	// need to be fetched separately so we can include them in the payload.
+	// Devices that only appear in the metrics/energy delta (device row not
+	// updated) need to be fetched separately so we can include them in the payload.
 	changedIDs := make(map[string]bool, len(changedDevices))
 	for _, d := range changedDevices {
 		changedIDs[d.ID] = true
 	}
+	extraSeen := make(map[string]bool)
 	var extraIDs []string
-	for devID := range metricsByDevice {
-		if !changedIDs[devID] {
+	addExtra := func(devID string) {
+		if !changedIDs[devID] && !extraSeen[devID] {
+			extraSeen[devID] = true
 			extraIDs = append(extraIDs, devID)
 		}
+	}
+	for devID := range metricsByDevice {
+		addExtra(devID)
+	}
+	for devID := range energyByDevice {
+		addExtra(devID)
 	}
 	extraDevices, err := f.db.DevicesByIDs(ctx, extraIDs)
 	if err != nil {
@@ -373,7 +407,7 @@ func (f *Forwarder) push(ctx context.Context) error {
 	// and emit one payload per group.
 	payloads := f.buildPayloads(
 		allDevices, ifacesByDevice, addrsByIface,
-		metricsByDevice, topoLinks, events,
+		metricsByDevice, energyByDevice, topoLinks, events,
 	)
 	if len(payloads) == 0 {
 		return nil
@@ -442,6 +476,9 @@ func (f *Forwarder) push(ctx context.Context) error {
 	if len(recentMetrics) > 0 {
 		_ = f.db.SetForwarderCursor(ctx, "metrics", recentMetrics[len(recentMetrics)-1].TS)
 	}
+	if len(recentEnergy) > 0 {
+		_ = f.db.SetForwarderCursor(ctx, "energy", recentEnergy[len(recentEnergy)-1].TS)
+	}
 	if len(topoLinks) > 0 {
 		_ = f.db.SetForwarderCursor(ctx, "topology", topoLinks[len(topoLinks)-1].UpdatedAt)
 	}
@@ -492,6 +529,7 @@ func (f *Forwarder) buildPayloads(
 	ifacesByDevice map[string][]store.FwdInterface,
 	addrsByIface map[string][]store.FwdAddress,
 	metricsByDevice map[string][]store.FwdMetric,
+	energyByDevice map[string][]store.FwdEnergy,
 	topoLinks []store.FwdTopologyLink,
 	events []store.FwdEvent,
 ) []*aggPayload {
@@ -559,6 +597,7 @@ func (f *Forwarder) buildPayloads(
 			RoleSource:     d.RoleSource,
 			Interfaces:     make([]aggInterface, 0),
 			Metrics:        make([]aggMetric, 0),
+			EnergyMetrics:  make([]aggEnergyMetric, 0),
 		}
 		for _, iface := range ifacesByDevice[d.ID] {
 			ai := aggInterface{
@@ -604,6 +643,23 @@ func (f *Forwarder) buildPayloads(
 				am.Attributes = json.RawMessage(m.Attributes)
 			}
 			ad.Metrics = append(ad.Metrics, am)
+		}
+		for _, e := range energyByDevice[d.ID] {
+			ae := aggEnergyMetric{
+				DeviceID:          e.DeviceID,
+				MetricName:        e.MetricName,
+				Value:             e.Value,
+				Tag:               e.Tag,
+				Circuit:           e.Circuit,
+				Phase:             e.Phase,
+				CollectorAgent:    e.CollectorAgent,
+				CollectorProtocol: e.CollectorProtocol,
+				TS:                e.TS.UTC().Format(time.RFC3339),
+			}
+			if e.Attributes != "" && e.Attributes != "{}" {
+				ae.Attributes = json.RawMessage(e.Attributes)
+			}
+			ad.EnergyMetrics = append(ad.EnergyMetrics, ae)
 		}
 		g := getGroup(f.dcOrDefault(d.DatacenterID), f.floorOrDefault(d.FloorID))
 		g.Devices = append(g.Devices, ad)

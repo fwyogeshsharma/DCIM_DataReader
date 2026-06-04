@@ -376,6 +376,55 @@ func (db *DB) MetricsSince(ctx context.Context,
 	return out, rows.Err()
 }
 
+// FwdEnergy is one BACnet energy reading forwarded to the Aggregator. circuit/
+// phase are first-class so the Aggregator stores them in its own columns.
+type FwdEnergy struct {
+	DeviceID          string
+	MetricName        string
+	Value             float64
+	Tag               string
+	Circuit           string
+	Phase             string
+	Attributes        string // raw JSONB text ('{}' when none)
+	CollectorAgent    string
+	CollectorProtocol string
+	TS                time.Time
+}
+
+// EnergySince returns energy_metrics rows with ts > since for the tenant.
+func (db *DB) EnergySince(ctx context.Context,
+	orgID, netID, grpID string,
+	since time.Time, limit int) ([]FwdEnergy, error) {
+
+	rows, err := db.pool.Query(ctx, `
+		SELECT e.device_id, e.metric_name, e.value, e.tag, e.circuit, e.phase,
+		       COALESCE(e.attributes::text, '{}'),
+		       e.collector_agent, e.collector_protocol, e.ts
+		FROM energy_metrics e
+		JOIN devices d ON d.id = e.device_id
+		WHERE d.org_id=$1 AND d.network_id=$2 AND d.group_id=$3
+		  AND e.ts > $4
+		ORDER BY e.ts ASC
+		LIMIT $5`,
+		orgID, netID, grpID, since, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FwdEnergy
+	for rows.Next() {
+		var e FwdEnergy
+		if err := rows.Scan(&e.DeviceID, &e.MetricName, &e.Value, &e.Tag,
+			&e.Circuit, &e.Phase, &e.Attributes,
+			&e.CollectorAgent, &e.CollectorProtocol, &e.TS); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // ─── Topology query ───────────────────────────────────────────────────────────
 
 // TopologyLinksSince returns topology edges with updated_at > since, joining

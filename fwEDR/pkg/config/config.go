@@ -18,6 +18,7 @@ type EDRConfig struct {
 	TopologyFile string          `yaml:"topology_file"` // path to simulator topology JSON
 	SNMP         SNMPConfig      `yaml:"snmp"`
 	GNMI         GNMIConfig      `yaml:"gnmi"`
+	BACnet       BACnetConfig    `yaml:"bacnet"`
 	Targets      []TargetConfig  `yaml:"targets"`
 	Log          LogConfig       `yaml:"log"`
 }
@@ -209,22 +210,41 @@ type GNMIConfig struct {
 	PollInterval int       `yaml:"poll_interval_ms"` // default 30000; gNMI SAMPLE interval
 }
 
+// BACnetConfig holds the BACnet/IP collector settings. EDR polls Verdigris EV2
+// energy monitors (device_type=energy_monitor) via BACnet/IP — ReadPropertyMultiple
+// on a periodic cadence, plus optional SubscribeCOV push notifications.
+type BACnetConfig struct {
+	Enabled        bool `yaml:"enabled"`          // default true; set false to skip BACnet entirely
+	Port           int  `yaml:"port"`             // device UDP port (default 47808)
+	PollIntervalMs int  `yaml:"poll_interval_ms"` // ReadPropertyMultiple cadence (default 30000)
+	TimeoutMs      int  `yaml:"timeout_ms"`       // per-request response timeout (default 2000)
+	Retries        int  `yaml:"retries"`          // per-request retries (default 1)
+	ReadCircuits   bool `yaml:"read_circuits"`    // also read per-circuit objects (default true)
+	ObjectsPerRead int  `yaml:"objects_per_read"` // objects per ReadPropertyMultiple to fit the APDU (default 12)
+	UseCOV         bool `yaml:"use_cov"`          // also SubscribeCOV for push notifications (default true)
+	COVLifetimeSec int  `yaml:"cov_lifetime_sec"` // COV subscription lifetime; renewed before expiry (default 300)
+}
+
 // TargetConfig describes one device to poll. IP roles follow DCIM conventions —
 // see internal/target/target.go for full semantics.
 type TargetConfig struct {
-	IP          string            `yaml:"ip"`          // SNMP socket target (loopback in sim mode, real device IP in prod)
-	MgmtIP      string            `yaml:"mgmt_ip"`     // operator-facing mgmt IP (192.168.x in sim); defaults to IP if empty
-	ProdIP      string            `yaml:"prod_ip"`     // production / data-plane IP (10.x in sim); shown on dashboards
-	LoopbackIP  string            `yaml:"loopback_ip"` // router/switch loopback
-	OOBIP       string            `yaml:"oob_ip"`      // out-of-band mgmt IP
-	GNMIIP      string            `yaml:"gnmi_ip"`     // gNMI connection IP; defaults to mgmt IP if empty
-	Hostname    string            `yaml:"hostname"`
-	DeviceType  string            `yaml:"device_type"`  // router|switch|server|firewall|load_balancer|ups|pdu|floor_pdu|sensor
-	SNMPVersion int               `yaml:"snmp_version"` // 2|3; 0 = use global default
-	Community   string            `yaml:"community"`    // override global community
-	GNMIEnabled bool              `yaml:"gnmi"`         // whether to also subscribe via gNMI
-	Vendor      string            `yaml:"vendor"`       // cisco|juniper|arista|apc|raritan|vertiv|eaton|generic
-	Labels      map[string]string `yaml:"labels"`       // arbitrary key=value passed into attributes
+	IP          string `yaml:"ip"`          // SNMP socket target (loopback in sim mode, real device IP in prod)
+	MgmtIP      string `yaml:"mgmt_ip"`     // operator-facing mgmt IP (192.168.x in sim); defaults to IP if empty
+	ProdIP      string `yaml:"prod_ip"`     // production / data-plane IP (10.x in sim); shown on dashboards
+	LoopbackIP  string `yaml:"loopback_ip"` // router/switch loopback
+	OOBIP       string `yaml:"oob_ip"`      // out-of-band mgmt IP
+	GNMIIP      string `yaml:"gnmi_ip"`     // gNMI connection IP; defaults to mgmt IP if empty
+	Hostname    string `yaml:"hostname"`
+	DeviceType  string `yaml:"device_type"`  // router|switch|server|firewall|load_balancer|ups|pdu|floor_pdu|sensor
+	SNMPVersion int    `yaml:"snmp_version"` // 2|3; 0 = use global default
+	Community   string `yaml:"community"`    // override global community
+	GNMIEnabled bool   `yaml:"gnmi"`         // whether to also subscribe via gNMI
+	// BACnetEnabled marks a device as a BACnet/IP target (Verdigris EV2 energy
+	// monitors). Set automatically for device_type=energy_monitor by the topology
+	// loader. The BACnet manager polls these at MgmtIP:bacnet.port.
+	BACnetEnabled bool              `yaml:"bacnet"`
+	Vendor        string            `yaml:"vendor"` // cisco|juniper|arista|apc|raritan|vertiv|eaton|generic
+	Labels        map[string]string `yaml:"labels"` // arbitrary key=value passed into attributes
 
 	// Per-device routing key overrides. When non-empty these override the
 	// global identity.datacenter_id / identity.floor_id for this device's
@@ -279,6 +299,15 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	cfg.SNMP.WalkMedium = true  // default on; full walk unless YAML overrides
 	cfg.SNMP.WalkSlow = true
 	cfg.SNMP.WalkTopology = true
+	cfg.BACnet.Enabled = true // default on; YAML "enabled: false" overrides
+	cfg.BACnet.Port = 47808
+	cfg.BACnet.PollIntervalMs = 30000
+	cfg.BACnet.TimeoutMs = 2000
+	cfg.BACnet.Retries = 1
+	cfg.BACnet.ReadCircuits = true
+	cfg.BACnet.ObjectsPerRead = 12
+	cfg.BACnet.UseCOV = true
+	cfg.BACnet.COVLifetimeSec = 300
 	cfg.GNMI.Enabled = true // default on; YAML "enabled: false" overrides
 	cfg.GNMI.Port = 9339
 	cfg.GNMI.PollInterval = 30000
@@ -338,6 +367,21 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	}
 	if cfg.GNMI.PollInterval <= 0 {
 		cfg.GNMI.PollInterval = 30000
+	}
+	if cfg.BACnet.Port <= 0 {
+		cfg.BACnet.Port = 47808
+	}
+	if cfg.BACnet.PollIntervalMs <= 0 {
+		cfg.BACnet.PollIntervalMs = 30000
+	}
+	if cfg.BACnet.TimeoutMs <= 0 {
+		cfg.BACnet.TimeoutMs = 2000
+	}
+	if cfg.BACnet.ObjectsPerRead <= 0 {
+		cfg.BACnet.ObjectsPerRead = 12
+	}
+	if cfg.BACnet.COVLifetimeSec <= 0 {
+		cfg.BACnet.COVLifetimeSec = 300
 	}
 	return cfg, nil
 }
