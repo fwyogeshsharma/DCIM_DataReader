@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gosnmp/gosnmp"
+	"go.uber.org/zap"
 
 	"github.com/faberwork/fwedr/internal/target"
 	"github.com/faberwork/fwedr/pkg/packet"
@@ -27,6 +28,11 @@ type Collector struct {
 	// 0 in production — real devices have no such agent.
 	mgmtPort      int
 	mgmtTimeoutMs int
+
+	// log is used for diagnostic debug lines (e.g. a sensor walk that returns
+	// PDUs but produces zero metric packets — the signature of an OID mismatch).
+	// May be nil; all uses must guard.
+	log *zap.Logger
 }
 
 type basePacket struct {
@@ -42,6 +48,7 @@ func NewCollector(
 	orgID, dcID, floorID, netID, grpID, readerID string,
 	signer *packet.Signer,
 	mgmtPort, mgmtTimeoutMs int,
+	log *zap.Logger,
 ) *Collector {
 	return &Collector{
 		target:        t,
@@ -50,6 +57,7 @@ func NewCollector(
 		signer:        signer,
 		mgmtPort:      mgmtPort,
 		mgmtTimeoutMs: mgmtTimeoutMs,
+		log:           log,
 	}
 }
 
@@ -128,6 +136,17 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 		switch c.target.DeviceType {
 		case "sensor", "pdu", "floor_pdu":
 			if p, err := c.collectSensors(); err == nil {
+				pkts = append(pkts, p...)
+			}
+		case "server":
+			// Servers carry chassis/CPU temp in ENTITY-SENSOR-MIB. The heavy
+			// HR/UCD walks live in the SLOW tier (often disabled), so collect the
+			// light temp here so the heatmap covers servers regardless.
+			if p, err := c.collectServerTemp(); err == nil {
+				pkts = append(pkts, p...)
+			}
+		case "ups":
+			if p, err := c.collectUPSTemp(); err == nil {
 				pkts = append(pkts, p...)
 			}
 		}
@@ -501,6 +520,63 @@ func (c *Collector) collectUPS() ([]*v1.TelemetryPacket, error) {
 	return pkts, nil
 }
 
+// collectUPSTemp reads upsBatteryTemperature (whole °C). Emitted as
+// environment.temperature_c (tag BATTERY) so UPS thermals join the heatmap
+// alongside network/server/sensor temperature. Lives in the ENVIRONMENT tier
+// because the rest of the UPS walk is in the often-disabled SLOW tier.
+func (c *Collector) collectUPSTemp() ([]*v1.TelemetryPacket, error) {
+	pkt, err := c.client.Get([]string{OIDUpsBatteryTemperature})
+	if err != nil {
+		return nil, err
+	}
+	var pkts []*v1.TelemetryPacket
+	for _, p := range pkt.Variables {
+		switch p.Type {
+		case gosnmp.NoSuchObject, gosnmp.NoSuchInstance, gosnmp.EndOfMibView, gosnmp.Null:
+			continue
+		}
+		meta := c.hostMeta()
+		meta["sensor_index"] = "battery"
+		pkts = append(pkts, c.newMetric("environment.temperature_c", "BATTERY", ToFloat64(p), meta))
+	}
+	return pkts, nil
+}
+
+// ─── server temperature (ENTITY-SENSOR-MIB) ──────────────────────────────────
+
+// collectServerTemp walks ENTITY-SENSOR-MIB entPhySensorValue. Servers expose
+// chassis/inlet temp at index 1 and CPU die temp at index 2 (×10 Celsius).
+// Emitted as environment.temperature_c tagged CHASSIS / CPU to match the
+// network-device (CISCO-ENVMON / gNMI) convention so all temperature lives under
+// one metric name for the heatmap.
+func (c *Collector) collectServerTemp() ([]*v1.TelemetryPacket, error) {
+	pdus, err := c.client.Walk(OIDEntPhySensorValue)
+	if err != nil {
+		return nil, err
+	}
+	var pkts []*v1.TelemetryPacket
+	for _, p := range pdus {
+		idx := LastOIDComponent(p.Name)
+		meta := c.hostMeta()
+		meta["sensor_index"] = idx
+		pkts = append(pkts, c.newMetric("environment.temperature_c", entSensorTag(idx), ToFloat64(p)/10.0, meta))
+	}
+	return pkts, nil
+}
+
+// entSensorTag maps an entPhySensorValue row index to the same tag vocabulary
+// the network temp path uses (index 1 = chassis/inlet, 2 = CPU).
+func entSensorTag(idx string) string {
+	switch idx {
+	case "1":
+		return "CHASSIS"
+	case "2":
+		return "CPU"
+	default:
+		return "SENSOR" + idx
+	}
+}
+
 // ─── sensors ─────────────────────────────────────────────────────────────────
 
 func (c *Collector) collectSensors() ([]*v1.TelemetryPacket, error) {
@@ -541,25 +617,36 @@ func (c *Collector) collectRaritanSensors() ([]*v1.TelemetryPacket, error) {
 			pkts = append(pkts, c.newMetric("environment.humidity_percent", idx, val, meta))
 		}
 	}
+	c.warnEmptySensorWalk("raritan", len(valuePDUs), len(pkts))
 	return pkts, nil
 }
 
 func (c *Collector) collectVertivSensors() ([]*v1.TelemetryPacket, error) {
 	var pkts []*v1.TelemetryPacket
-	if p, err := walkEnvMetric(c.client, OIDVertivTempValue, "environment.temperature_c", c); err == nil {
-		pkts = append(pkts, p...)
+	seen := 0
+	if p, n, err := walkEnvMetric(c.client, OIDVertivTempValue, "environment.temperature_c", c); err == nil {
+		pkts, seen = append(pkts, p...), seen+n
 	}
-	if p, err := walkEnvMetric(c.client, OIDVertivHumValue, "environment.humidity_percent", c); err == nil {
-		pkts = append(pkts, p...)
+	if p, n, err := walkEnvMetric(c.client, OIDVertivHumValue, "environment.humidity_percent", c); err == nil {
+		pkts, seen = append(pkts, p...), seen+n
 	}
-	if p, err := walkEnvMetric(c.client, OIDVertivDewValue, "environment.dew_point_c", c); err == nil {
-		pkts = append(pkts, p...)
+	if p, n, err := walkEnvMetric(c.client, OIDVertivDewValue, "environment.dew_point_c", c); err == nil {
+		pkts, seen = append(pkts, p...), seen+n
 	}
+	c.warnEmptySensorWalk("vertiv", seen, len(pkts))
 	return pkts, nil
 }
 
+// collectAPCSensors reads the APC NetBotz sensor table. Classification is by the
+// per-row LABEL column (.2.{idx}: "Temperature"/"Humidity"/"Airflow"), falling
+// back to the row index (1=temperature, 2=humidity, 3=airflow) when the label is
+// absent. The simulator's type column (.11.{idx}) carries the sensor STATE
+// (4=normal), not a usable type code, so the old switch on it matched nothing and
+// dropped every reading. Per-type scaling matches the simulator encoding:
+// temperature and airflow are ×10 (÷10 here); humidity is written as a whole
+// percent (no division).
 func (c *Collector) collectAPCSensors() ([]*v1.TelemetryPacket, error) {
-	typeMap := walkIndexedInt(c.client, OIDAPCNetBotzSensorType)
+	labelMap := walkIndexedStr(c.client, OIDAPCNetBotzLabel)
 	valuePDUs, err := c.client.Walk(OIDAPCNetBotzValue)
 	if err != nil {
 		return nil, err
@@ -569,17 +656,42 @@ func (c *Collector) collectAPCSensors() ([]*v1.TelemetryPacket, error) {
 		idx := LastOIDComponent(p.Name)
 		meta := c.hostMeta()
 		meta["sensor_index"] = idx
-		val := ToFloat64(p) / 10.0
-		switch typeMap[idx] {
-		case 1: // temperature
-			pkts = append(pkts, c.newMetric("environment.temperature_c", idx, val, meta))
-		case 2: // humidity
-			pkts = append(pkts, c.newMetric("environment.humidity_percent", idx, val, meta))
-		case 3: // airflow
-			pkts = append(pkts, c.newMetric("environment.airflow_cfm", idx, val, meta))
+		raw := ToFloat64(p)
+
+		switch apcSensorKind(labelMap[idx], idx) {
+		case "temperature":
+			pkts = append(pkts, c.newMetric("environment.temperature_c", idx, raw/10.0, meta))
+		case "humidity":
+			pkts = append(pkts, c.newMetric("environment.humidity_percent", idx, raw, meta))
+		case "airflow":
+			pkts = append(pkts, c.newMetric("environment.airflow_cfm", idx, raw/10.0, meta))
 		}
 	}
+	c.warnEmptySensorWalk("apc", len(valuePDUs), len(pkts))
 	return pkts, nil
+}
+
+// apcSensorKind classifies an APC NetBotz sensor row by its label, falling back
+// to the row index (1=temperature, 2=humidity, 3=airflow) when the label is
+// empty or unrecognised.
+func apcSensorKind(label, idx string) string {
+	switch l := strings.ToLower(label); {
+	case strings.Contains(l, "temp"):
+		return "temperature"
+	case strings.Contains(l, "humid"):
+		return "humidity"
+	case strings.Contains(l, "airflow"), strings.Contains(l, "air flow"):
+		return "airflow"
+	}
+	switch idx {
+	case "1":
+		return "temperature"
+	case "2":
+		return "humidity"
+	case "3":
+		return "airflow"
+	}
+	return ""
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -687,10 +799,14 @@ func walkIndexedStr(cl *Client, oid string) map[string]string {
 	return m
 }
 
-func walkEnvMetric(cl *Client, oid, name string, c *Collector) ([]*v1.TelemetryPacket, error) {
+// walkEnvMetric walks one environment OID and emits one metric per PDU (÷10 to
+// undo the simulator's ×10 encoding). Returns the packets and the number of PDUs
+// the walk returned (so callers can detect a walk that yielded rows but no usable
+// packets — the signature of an OID mismatch).
+func walkEnvMetric(cl *Client, oid, name string, c *Collector) ([]*v1.TelemetryPacket, int, error) {
 	pdus, err := cl.Walk(oid)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var pkts []*v1.TelemetryPacket
 	for _, p := range pdus {
@@ -699,7 +815,21 @@ func walkEnvMetric(cl *Client, oid, name string, c *Collector) ([]*v1.TelemetryP
 		meta["sensor_index"] = idx
 		pkts = append(pkts, c.newMetric(name, idx, ToFloat64(p)/10.0, meta))
 	}
-	return pkts, nil
+	return pkts, len(pdus), nil
+}
+
+// warnEmptySensorWalk logs a debug line when a sensor walk returned PDUs but
+// produced zero metric packets — i.e. every reading was filtered out by
+// type/label classification, the classic symptom of a wrong type/value OID.
+func (c *Collector) warnEmptySensorWalk(vendor string, pduCount, pktCount int) {
+	if c.log == nil || pduCount == 0 || pktCount > 0 {
+		return
+	}
+	c.log.Debug("sensor walk returned PDUs but produced no metrics — check sensor OID mapping",
+		zap.String("vendor", vendor),
+		zap.String("hostname", c.target.SourceID()),
+		zap.String("device_type", c.target.DeviceType),
+		zap.Int("pdus", pduCount))
 }
 
 func hrStorageTypeName(t int) string {

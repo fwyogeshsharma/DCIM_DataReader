@@ -25,9 +25,9 @@ import (
 )
 
 const (
-	defaultBatchSize       = 256
+	defaultBatchSize       = 512
 	defaultFlushIntervalMs = 200
-	defaultMaxInFlight     = 2
+	defaultMaxInFlight     = 8
 )
 
 // Publisher drains the queue and pushes packets to DCS in batches.

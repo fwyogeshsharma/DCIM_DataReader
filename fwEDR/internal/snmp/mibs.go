@@ -60,17 +60,25 @@ const (
 	OIDUpsEstimatedMinutesRemain   = "1.3.6.1.2.1.33.1.2.3.0"
 	OIDUpsEstimatedChargeRemaining = "1.3.6.1.2.1.33.1.2.4.0"
 	OIDUpsBatteryVoltage           = "1.3.6.1.2.1.33.1.2.5.0"
-	OIDUpsInputTable               = "1.3.6.1.2.1.33.1.3.3"
-	OIDUpsInputFrequency           = "1.3.6.1.2.1.33.1.3.3.1.2"
-	OIDUpsInputVoltage             = "1.3.6.1.2.1.33.1.3.3.1.3"
-	OIDUpsOutputTable              = "1.3.6.1.2.1.33.1.4.4"
-	OIDUpsOutputVoltage            = "1.3.6.1.2.1.33.1.4.4.1.2"
-	OIDUpsOutputCurrent            = "1.3.6.1.2.1.33.1.4.4.1.3"
-	OIDUpsOutputLoad               = "1.3.6.1.2.1.33.1.4.4.1.5"
+	// upsBatteryTemperature (whole °C). The simulator serves it at .2.8.0
+	// because .2.7 carries upsBatteryCurrent. Collected by the ENVIRONMENT tier
+	// and emitted as environment.temperature_c (tag BATTERY) for the heatmap.
+	OIDUpsBatteryTemperature = "1.3.6.1.2.1.33.1.2.8.0"
+	OIDUpsInputTable         = "1.3.6.1.2.1.33.1.3.3"
+	OIDUpsInputFrequency     = "1.3.6.1.2.1.33.1.3.3.1.2"
+	OIDUpsInputVoltage       = "1.3.6.1.2.1.33.1.3.3.1.3"
+	OIDUpsOutputTable        = "1.3.6.1.2.1.33.1.4.4"
+	OIDUpsOutputVoltage      = "1.3.6.1.2.1.33.1.4.4.1.2"
+	OIDUpsOutputCurrent      = "1.3.6.1.2.1.33.1.4.4.1.3"
+	OIDUpsOutputLoad         = "1.3.6.1.2.1.33.1.4.4.1.5"
 
-	// Raritan PX2 / DPX2 sensor table
+	// Raritan PX2 / DPX2 sensor table. Column layout (RARITAN-PX2-MIB,
+	// externalSensorTable .3.1.N): .2=index, .3=type, .4=value, .5=state.
+	// The simulator (snmprec_generator._sensor_entries) writes type at .3.1.x —
+	// reading type from .2 returns the row index, not the sensor type, so every
+	// reading was misclassified and dropped.
 	OIDRaritanSensorTable = "1.3.6.1.4.1.13742.6.5.5.3"
-	OIDRaritanSensorType  = "1.3.6.1.4.1.13742.6.5.5.3.1.2"
+	OIDRaritanSensorType  = "1.3.6.1.4.1.13742.6.5.5.3.1.3"
 	OIDRaritanSensorValue = "1.3.6.1.4.1.13742.6.5.5.3.1.4"
 	OIDRaritanSensorState = "1.3.6.1.4.1.13742.6.5.5.3.1.5"
 
@@ -91,6 +99,12 @@ const (
 	OIDAPCNetBotzLabel      = "1.3.6.1.4.1.318.1.1.10.4.2.2.1.2"
 	OIDAPCNetBotzValue      = "1.3.6.1.4.1.318.1.1.10.4.2.2.1.10"
 	OIDAPCNetBotzSensorType = "1.3.6.1.4.1.318.1.1.10.4.2.2.1.11"
+
+	// ENTITY-SENSOR-MIB — entPhySensorValue (columnar, walk from prefix).
+	// Servers expose chassis/inlet temp at index 1 and CPU die temp at index 2.
+	// The simulator encodes both ×10 Celsius. Collected by the ENVIRONMENT tier
+	// and emitted as environment.temperature_c (tags CHASSIS / CPU).
+	OIDEntPhySensorValue = "1.3.6.1.2.1.99.1.1.1.4"
 
 	// IP-MIB — ipAddrTable
 	OIDIpAdEntAddr    = "1.3.6.1.2.1.4.20.1.1" // ipAdEntAddr: OID suffix is the IP address

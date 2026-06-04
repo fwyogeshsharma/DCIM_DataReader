@@ -139,8 +139,22 @@ func run(cfgPath string, forceRediscover bool) error {
 			if len(buf) == 0 {
 				return
 			}
-			if err := pub.EnqueueBatch(buf); err != nil {
-				log.Warn("enqueue batch failed", zap.Error(err), zap.Int("dropped", len(buf)))
+			// Backpressure before dropping: the queue only returns ErrFull when
+			// the publisher is transiently behind (DCS reconnecting, a counter
+			// burst). Retry briefly so a short stall is absorbed instead of
+			// silently losing telemetry — the cause of the demo "queue: full"
+			// drops. Capped (~1s) so a genuinely-down DCS can't block the fan-in
+			// goroutine forever; only then do we drop and move on.
+			var err error
+			for attempt := 0; attempt < 50; attempt++ {
+				if err = pub.EnqueueBatch(buf); err == nil {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if err != nil {
+				log.Warn("enqueue batch failed after backpressure — dropping",
+					zap.Error(err), zap.Int("dropped", len(buf)))
 			}
 			buf = buf[:0]
 		}

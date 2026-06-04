@@ -272,9 +272,9 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	cfg.SNMP.BreakerCooldownMs = 30000
 	cfg.SNMP.MetricsLogIntervalMs = 60000
 	cfg.SNMP.LogThrottleMs = 30000
-	cfg.Publisher.BatchSize = 256
+	cfg.Publisher.BatchSize = 512
 	cfg.Publisher.FlushIntervalMs = 200
-	cfg.Publisher.MaxInFlight = 2
+	cfg.Publisher.MaxInFlight = 8
 	cfg.Discovery.Enrich = true // default on; YAML "enrich: false" overrides
 	cfg.SNMP.WalkMedium = true  // default on; full walk unless YAML overrides
 	cfg.SNMP.WalkSlow = true
@@ -322,13 +322,13 @@ func LoadEDR(path string) (*EDRConfig, error) {
 		cfg.SNMP.ShardBasePort = 16100
 	}
 	if cfg.Publisher.BatchSize <= 0 {
-		cfg.Publisher.BatchSize = 256
+		cfg.Publisher.BatchSize = 512
 	}
 	if cfg.Publisher.FlushIntervalMs <= 0 {
 		cfg.Publisher.FlushIntervalMs = 200
 	}
 	if cfg.Publisher.MaxInFlight <= 0 {
-		cfg.Publisher.MaxInFlight = 2
+		cfg.Publisher.MaxInFlight = 8
 	}
 	if cfg.GNMI.FallbackPort <= 0 {
 		cfg.GNMI.FallbackPort = 57400

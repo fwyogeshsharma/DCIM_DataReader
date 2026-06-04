@@ -13,6 +13,14 @@ dcs:
 queue:
   max_bytes: 536870912  # 512 MB
 
+# EDR → DCS batching. Higher max_in_flight + batch_size drain the local queue
+# faster than the gNMI/SNMP producers fill it, so it never reaches max_bytes and
+# starts dropping. Raise max_in_flight if DCS has spare ingest capacity.
+publisher:
+  batch_size:        512
+  flush_interval_ms: 200
+  max_in_flight:     8
+
 # Simulator topology file — EDR reads device IPs, datacenter, country, city,
 # rack, room etc. from this JSON. Required to populate location columns in DB.
 topology_file: "C:\\Users\\Faber\\Desktop\\fwDCIM\\Datacenter_Network_Simulator\\topologies\\dual_dc_enterprise.json"
@@ -34,8 +42,8 @@ snmp:
   timeout_ms:          5000   # sim is slow under load; give walks time to complete instead of timing out + retrying
   retries:             0      # don't double-hit a slow single-process simulator
   trap_addr:           "127.0.0.1:162"
-  max_concurrent:      4      # GLOBAL concurrent SNMP socket cap (all tiers). Clamped to shards*2 in shard mode. Low on Windows to avoid WSAENOBUFS socket exhaustion.
-  rate_limit_per_sec:  20     # global SNMP req/sec token bucket — keep modest for the single-process shard responders.
+  max_concurrent:      3      # GLOBAL concurrent SNMP socket cap (all tiers). The simulator is ONE snmpsim process (single asyncio loop, single UDP socket) — it serializes requests, so high concurrency is wasted and only risks UDP-buffer bursts. 3 keeps 2 heavy walks overlapped (latency hiding) + 1 slot for FAST liveness.
+  rate_limit_per_sec:  30     # global SNMP req/sec token bucket — modest ceiling matched to the single serial responder.
   walk_medium:         true   # interface state (also builds interfaces table — needed for link-event interface correlation)
   walk_topology:       false  # topology comes from the JSON (instant, complete) — skip slow LLDP topology walk and avoid duplicate rows
   walk_slow:           false  # SKIP heavy counter/HR/UPS/sensor walks — biggest SNMP load, not needed for inventory or link topology

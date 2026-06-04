@@ -34,6 +34,11 @@ type Queue struct {
 	maxBytes int64
 	mu       sync.Mutex
 	path     string
+
+	// usedBytes tracks in-use payload bytes incrementally so the hot push/pop
+	// paths never call bbolt's O(n) Bucket.Stats(). Maintained under mu: pushes
+	// add, pops/evictions subtract. Seeded once at Open from a single Stats().
+	usedBytes int64
 }
 
 // Open opens or creates the queue at path.
@@ -61,7 +66,15 @@ func Open(path string, maxBytes int64) (*Queue, error) {
 		return nil, fmt.Errorf("queue: init bucket: %w", err)
 	}
 
-	return &Queue{db: db, maxBytes: maxBytes, path: path}, nil
+	q := &Queue{db: db, maxBytes: maxBytes, path: path}
+	// Seed usedBytes once from the on-disk bucket so the cap is honored across
+	// restarts (a crash can leave an undrained backlog). One Stats() at startup
+	// is fine; the hot paths then maintain the counter incrementally.
+	_ = db.View(func(tx *bolt.Tx) error {
+		q.usedBytes = int64(tx.Bucket(bucketName).Stats().LeafInuse)
+		return nil
+	})
+	return q, nil
 }
 
 // Push appends a packet to the tail. Single-packet API kept for compatibility;
@@ -94,19 +107,21 @@ func (q *Queue) PushBatch(pkts []*v1.TelemetryPacket) error {
 		entries = append(entries, kv{data: data, severity: pkt.Severity})
 	}
 
-	return q.db.Update(func(tx *bolt.Tx) error {
+	// Work on a local copy of the byte counter; commit it to q.usedBytes only
+	// after the txn succeeds. bbolt rolls the whole txn back on any returned
+	// error (including ErrFull), so a partial batch never persists — the counter
+	// must mirror that all-or-nothing semantics.
+	used := q.usedBytes
+	err := q.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
-		stats := b.Stats()
-		usedBytes := int64(stats.LeafInuse)
-
 		for _, e := range entries {
-			if usedBytes >= q.maxBytes {
+			if used >= q.maxBytes {
 				if e.severity == "critical" || e.severity == "major" {
-					if err := evictOldestNonCritical(b); err != nil {
+					freed, everr := evictOldestNonCritical(b)
+					if everr != nil {
 						return ErrFull
 					}
-					// re-read stats after eviction
-					usedBytes = int64(b.Stats().LeafInuse)
+					used -= freed
 				} else {
 					return ErrFull
 				}
@@ -120,10 +135,15 @@ func (q *Queue) PushBatch(pkts []*v1.TelemetryPacket) error {
 			if err := b.Put(key, e.data); err != nil {
 				return err
 			}
-			usedBytes += int64(len(e.data))
+			used += int64(len(e.data))
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	q.usedBytes = used
+	return nil
 }
 
 // Pop removes and returns the oldest packet. Single-packet API kept for
@@ -150,27 +170,38 @@ func (q *Queue) PopBatch(n int) ([]*v1.TelemetryPacket, error) {
 	defer q.mu.Unlock()
 
 	var rawValues [][]byte
+	var freed int64
 	err := q.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
 		c := b.Cursor()
+		// Collect keys+values in one forward pass (no per-delete cursor restart,
+		// which was O(n²) and throttled the drain), then delete by key. bbolt
+		// returns slices into the mmap that go invalid once the txn ends, so copy.
+		keys := make([][]byte, 0, n)
 		for k, v := c.First(); k != nil && len(rawValues) < n; k, v = c.Next() {
-			// Copy v — bbolt returns a slice into the mmap that becomes invalid
-			// after the cursor advances or the txn ends.
-			cp := make([]byte, len(v))
-			copy(cp, v)
-			rawValues = append(rawValues, cp)
-			if err := b.Delete(k); err != nil {
-				return err
-			}
-			c = b.Cursor() // restart cursor after delete
+			vc := make([]byte, len(v))
+			copy(vc, v)
+			rawValues = append(rawValues, vc)
+			kc := make([]byte, len(k))
+			copy(kc, k)
+			keys = append(keys, kc)
+			freed += int64(len(v))
 		}
 		if len(rawValues) == 0 {
 			return ErrEmpty
+		}
+		for _, k := range keys {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+	if q.usedBytes -= freed; q.usedBytes < 0 {
+		q.usedBytes = 0
 	}
 
 	out := make([]*v1.TelemetryPacket, 0, len(rawValues))
@@ -199,8 +230,9 @@ func (q *Queue) Len() int {
 func (q *Queue) Close() error { return q.db.Close() }
 
 // evictOldestNonCritical deletes the oldest entry whose severity is not
-// critical/major.  Returns error if no such entry exists.
-func evictOldestNonCritical(b *bolt.Bucket) error {
+// critical/major and returns the number of payload bytes freed. Returns an
+// error if no such entry exists.
+func evictOldestNonCritical(b *bolt.Bucket) (int64, error) {
 	c := b.Cursor()
 	for k, v := c.First(); k != nil; k, v = c.Next() {
 		var m struct {
@@ -208,8 +240,12 @@ func evictOldestNonCritical(b *bolt.Bucket) error {
 		}
 		_ = json.Unmarshal(v, &m)
 		if m.Severity != "critical" && m.Severity != "major" {
-			return b.Delete(k)
+			n := int64(len(v))
+			if err := b.Delete(k); err != nil {
+				return 0, err
+			}
+			return n, nil
 		}
 	}
-	return errors.New("queue: no evictable entry")
+	return 0, errors.New("queue: no evictable entry")
 }

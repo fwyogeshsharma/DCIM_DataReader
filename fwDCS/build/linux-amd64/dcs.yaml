@@ -20,7 +20,7 @@ log:
   format: "json"
 
 aggregator:
-  enabled:     false
+  enabled:     true
   endpoint:    "https://fwdcim.faberwork.com/api/v1/ingest"
   ingest_key:  "74613fe24e4da087f46d584c6558870a3bed6b993a6416ced4df17f9a0f1e824"
   interval_ms: 5000

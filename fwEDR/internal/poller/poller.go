@@ -245,7 +245,19 @@ func (p *Poller) startGNMIAfterDiscovery(ctx context.Context, walkWG *sync.WaitG
 		walkWG.Wait()
 		close(done)
 	}()
-	const maxWait = 5 * time.Minute
+	// Safety net only — don't hold telemetry off forever if a few devices are
+	// slow or unreachable. Scale with fleet size (~8s/device) so a larger
+	// inventory gets proportionally longer to finish its one-shot walk instead of
+	// tripping a fixed 5-minute deadline mid-wave. Bounded [60s, 15m]. With the
+	// faster discovery jitter the walk normally completes well inside this and we
+	// take the `done` path.
+	maxWait := time.Duration(len(p.targets)) * 8 * time.Second
+	if maxWait < time.Minute {
+		maxWait = time.Minute
+	}
+	if maxWait > 15*time.Minute {
+		maxWait = 15 * time.Minute
+	}
 	select {
 	case <-done:
 		p.log.Info("snmp discovery walk complete — starting gNMI telemetry subscription")
@@ -271,11 +283,17 @@ func (p *Poller) runTarget(ctx context.Context, t *target.Target, firstWalkDone 
 	// pipeline with telemetry during discovery.
 
 	// Spread the initial walk across a window so 1000+ targets don't burst the
-	// responder at once (thundering herd). FastIntervalMs is reused purely as the
-	// jitter window now that it no longer drives a poll ticker.
-	spread := time.Duration(p.snmpCfg.FastIntervalMs) * time.Millisecond
-	if spread <= 0 {
-		spread = 30 * time.Second
+	// responder at once (thundering herd). Scale the window with the fleet size
+	// (~50ms/device) so a SMALL fleet — the simulator's ~40 devices — starts
+	// within a couple of seconds instead of idling up to a full poll interval
+	// (which pushed the discovery tail past the gNMI-start safety timeout).
+	// Bounded [500ms, FastIntervalMs] so large fleets keep the old wide spread.
+	spread := time.Duration(len(p.targets)) * 50 * time.Millisecond
+	if maxSpread := time.Duration(p.snmpCfg.FastIntervalMs) * time.Millisecond; maxSpread > 0 && spread > maxSpread {
+		spread = maxSpread
+	}
+	if spread < 500*time.Millisecond {
+		spread = 500 * time.Millisecond
 	}
 	select {
 	case <-ctx.Done():
@@ -610,6 +628,7 @@ func (p *Poller) pollSNMP(ctx context.Context, t *target.Target, tier snmp.Tier)
 		p.identity.GroupID, p.identity.ReaderID,
 		p.signer,
 		p.snmpCfg.MgmtPort, p.snmpCfg.Timeout,
+		p.log,
 	)
 	pkts, err := collector.Collect(tier)
 	ti := int(tier)
