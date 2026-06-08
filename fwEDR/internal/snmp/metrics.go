@@ -70,14 +70,15 @@ func NewCollector(
 type Tier int
 
 const (
-	TierFast        Tier = iota // sys.uptime only — 1 Get per device
-	TierMedium                  // interface state (admin/oper/speed) — 3 walks per device
-	TierSlow                    // interface counters, server HR/UCD, UPS, sensors
-	TierTopology                // LLDP neighbor walks — separate tier, fired once after discovery + periodic refresh
-	TierEnvironment             // environment sensors ONLY (temperature/humidity) for sensor/PDU devices — light, for the heatmap without the heavy SLOW counter walk
+	TierFast         Tier = iota // sys.uptime only — 1 Get per device
+	TierMedium                   // interface state (admin/oper/speed) — 3 walks per device
+	TierSlow                     // interface counters, server HR/UCD, UPS, sensors
+	TierTopology                 // LLDP neighbor walks — separate tier, fired once after discovery + periodic refresh
+	TierEnvironment              // environment sensors ONLY (temperature/humidity) for sensor/PDU devices — light, for the heatmap without the heavy SLOW counter walk
+	TierServerHealth             // server CPU/RAM via UCD-SNMP scalars ONLY — light (a few Gets, no HOST-RESOURCES walks), independent of the heavy SLOW tier
 
 	// NumTiers is the count of Tier values; keep tier-indexed arrays sized to it.
-	NumTiers = int(TierEnvironment) + 1
+	NumTiers = int(TierServerHealth) + 1
 )
 
 // Collect runs the MIB walks for the given tier and returns metric packets.
@@ -161,6 +162,16 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 				pkts = append(pkts, p...)
 			}
 			if p, err := c.collectUPSEnterprise(); err == nil {
+				pkts = append(pkts, p...)
+			}
+		}
+	case TierServerHealth:
+		// Light server CPU/RAM tier: UCD-SNMP scalars ONLY (cpu user/system/idle,
+		// mem total/avail/cached/buffer) — a handful of Gets, no HOST-RESOURCES
+		// walks. Lets us collect server CPU/RAM without enabling the heavy SLOW
+		// tier. Best-effort, non-fatal; no-op for non-server device types.
+		if c.target.DeviceType == "server" {
+			if p, err := c.collectUCD(); err == nil {
 				pkts = append(pkts, p...)
 			}
 		}

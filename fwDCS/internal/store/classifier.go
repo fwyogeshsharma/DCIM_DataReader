@@ -177,6 +177,16 @@ func typeToRole(dt string) (role string, isFabricSwitch bool) {
 		return "sensor", false
 	case "energy_monitor":
 		return "energy_monitor", false
+	case "crah":
+		return "crah", false
+	case "chiller":
+		return "chiller", false
+	case "pump":
+		return "pump", false
+	case "cooling_tower":
+		return "cooling_tower", false
+	case "valve":
+		return "valve", false
 	default:
 		return "unclassified", false
 	}

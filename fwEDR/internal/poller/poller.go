@@ -334,6 +334,26 @@ func (p *Poller) runTarget(ctx context.Context, t *target.Target, firstWalkDone 
 			walkedOnce = true
 		}
 		if ok {
+			// Lightweight liveness heartbeat: after the one-shot walk, keep doing a
+			// single FAST (sysName+uptime) GET on an interval so a source-side rename
+			// propagates to the DB without a full re-walk. Much cheaper than rewalk —
+			// one OID-set, no interface/counter/sensor walks. Keeps the session open
+			// (the heartbeat reuses it). Only when rewalk isn't already running.
+			if hb := time.Duration(p.snmpCfg.LivenessIntervalMs) * time.Millisecond; hb > 0 {
+				p.log.Debug("initial SNMP walk complete — entering FAST liveness heartbeat",
+					zap.String("target", t.SourceID()), zap.Duration("interval", hb))
+				ticker := time.NewTicker(hb)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						p.closeConn(t)
+						return
+					case <-ticker.C:
+						p.pollSNMP(ctx, t, snmp.TierFast) // 1 GET: sysName+uptime → rename + last_seen
+					}
+				}
+			}
 			// One-shot done: release this device's SNMP session. Traps don't use
 			// it, and ~hundreds of idle UDP sockets lingering is what exhausts
 			// Windows socket buffers (WSAENOBUFS) — keeping only in-flight walks
@@ -400,6 +420,11 @@ func (p *Poller) walkAll(ctx context.Context, t *target.Target) bool {
 	// counter/HR/UCD load. No-op for non-sensor device types (see Collect).
 	if p.snmpCfg.WalkSensors {
 		p.pollSNMP(ctx, t, snmp.TierEnvironment)
+	}
+	// Light server CPU/RAM tier (UCD scalars only). Independent of WalkSlow so we
+	// get server CPU/RAM without the heavy HR/counter walks. No-op for non-servers.
+	if p.snmpCfg.WalkServerHealth {
+		p.pollSNMP(ctx, t, snmp.TierServerHealth)
 	}
 	return ok
 }
@@ -900,7 +925,7 @@ func (p *Poller) metricsLoop(ctx context.Context) {
 	}
 	ticker := time.NewTicker(iv)
 	defer ticker.Stop()
-	tierName := [snmp.NumTiers]string{"fast", "medium", "slow", "topology", "environment"}
+	tierName := [snmp.NumTiers]string{"fast", "medium", "slow", "topology", "environment", "server_health"}
 	for {
 		select {
 		case <-ctx.Done():

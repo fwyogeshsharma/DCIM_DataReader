@@ -7,6 +7,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -150,6 +151,13 @@ func (db *DB) UpsertDevice(ctx context.Context, pkt *v1.TelemetryPacket) error {
 	// row's hostname to a new, non-colliding value never trips it.
 	mgmtIP := pkt.Meta["mgmt_ip"]
 	if mgmtIP != "" {
+		// Capture current identity BEFORE the update so we can record a rename in
+		// the events table (audit trail). Cheap single-row lookup, upsert path only.
+		var oldID, oldHostname string
+		_ = db.pool.QueryRow(ctx,
+			`SELECT id::text, hostname FROM devices WHERE org_id=$1 AND mgmt_ip=$2::INET`,
+			pkt.OrgId, mgmtIP).Scan(&oldID, &oldHostname)
+
 		tag, err := db.pool.Exec(ctx, `
 			UPDATE devices SET
 				hostname        = $7,
@@ -193,6 +201,12 @@ func (db *DB) UpsertDevice(ctx context.Context, pkt *v1.TelemetryPacket) error {
 			return err
 		}
 		if tag.RowsAffected() > 0 {
+			// Record a hostname change (rename) as a device_change event so it
+			// surfaces in the UI events stream. Only for an existing device whose
+			// name actually changed; best-effort — never fails the upsert.
+			if oldID != "" && oldHostname != "" && hostname != "" && oldHostname != hostname {
+				db.recordHostnameChange(ctx, oldID, oldHostname, hostname, mgmtIP, collectorAgent)
+			}
 			return nil
 		}
 		// no existing row for this mgmt_ip → first sight; fall through to INSERT.
@@ -261,6 +275,27 @@ func (db *DB) UpsertDevice(ctx context.Context, pkt *v1.TelemetryPacket) error {
 		rackUnit,
 	)
 	return err
+}
+
+// recordHostnameChange writes a device_change event capturing a device rename
+// (old → new hostname) into the events table, so the change appears in the UI
+// events stream alongside traps/alarms — an audit trail of identity changes.
+// Best-effort: a failure here must never break the device upsert.
+func (db *DB) recordHostnameChange(ctx context.Context, deviceID, oldName, newName, mgmtIP, agent string) {
+	payload, _ := json.Marshal(map[string]string{
+		"field": "hostname",
+		"old":   oldName,
+		"new":   newName,
+	})
+	if _, err := db.pool.Exec(ctx, `
+		INSERT INTO events (device_id, source_hostname, ts, kind, event_name, severity,
+		                    source_ip, event_payload, collector_agent)
+		VALUES ($1::uuid, $2, now(), 'device_change', 'hostname_changed', 'informational',
+		        NULLIF($3,'')::INET, $4, $5)`,
+		deviceID, newName, mgmtIP, string(payload), agent); err != nil {
+		// No logger on DB; swallow — the rename itself already persisted.
+		_ = err
+	}
 }
 
 // collectorAgentFromReaderID infers IDR|EDR from the reader_id prefix.
@@ -506,6 +541,7 @@ type EnergyRow struct {
 	Circuit           string // CktNN for per-circuit rows; "" for panel
 	Phase             string // PhA/PhB/PhC for phase rows; "" otherwise
 	Value             float64
+	Scope             string // it|cooling|facility — meter classification for PUE/DCiE; "" if unknown
 	Attributes        string // pre-encoded JSONB
 	CollectorAgent    string
 	CollectorProtocol string
@@ -538,6 +574,7 @@ func (db *DB) WriteEnergyBatch(ctx context.Context, rows []EnergyRow) error {
 			circuit            TEXT,
 			phase              TEXT,
 			value              DOUBLE PRECISION,
+			scope              TEXT,
 			attributes         JSONB,
 			collector_agent    TEXT,
 			collector_protocol TEXT
@@ -560,18 +597,18 @@ func (db *DB) WriteEnergyBatch(ctx context.Context, rows []EnergyRow) error {
 		if proto == "" {
 			proto = "BACNET"
 		}
-		return []any{r.DeviceID, r.TS, r.MetricName, r.Tag, r.Circuit, r.Phase, r.Value, attrs, agent, proto}, nil
+		return []any{r.DeviceID, r.TS, r.MetricName, r.Tag, r.Circuit, r.Phase, r.Value, r.Scope, attrs, agent, proto}, nil
 	})
 	if _, err := tx.CopyFrom(ctx,
 		pgx.Identifier{"_energy_stage"},
-		[]string{"device_id", "ts", "metric_name", "tag", "circuit", "phase", "value", "attributes", "collector_agent", "collector_protocol"},
+		[]string{"device_id", "ts", "metric_name", "tag", "circuit", "phase", "value", "scope", "attributes", "collector_agent", "collector_protocol"},
 		src); err != nil {
 		return fmt.Errorf("energy batch: copy: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO energy_metrics (device_id, ts, metric_name, tag, circuit, phase, value, attributes, collector_agent, collector_protocol)
-		SELECT device_id, ts, metric_name, tag, circuit, phase, value, attributes, collector_agent, collector_protocol
+		INSERT INTO energy_metrics (device_id, ts, metric_name, tag, circuit, phase, value, scope, attributes, collector_agent, collector_protocol)
+		SELECT device_id, ts, metric_name, tag, circuit, phase, value, scope, attributes, collector_agent, collector_protocol
 		FROM _energy_stage
 		ON CONFLICT (device_id, metric_name, tag, ts) DO NOTHING`); err != nil {
 		return fmt.Errorf("energy batch: upsert: %w", err)

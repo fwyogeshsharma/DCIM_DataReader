@@ -51,7 +51,7 @@ type LinkEdge struct {
 	DstMgmtIP       string
 	SrcDatacenterID string
 	SrcFloorID      string
-	Layer           string // "network" | "management" | "power"
+	Layer           string // "network" | "management" | "power" | "cooling"
 	SrcPortIndex    int    // 0-based; +1 = SNMP ifIndex
 	DstPortIndex    int
 }
@@ -111,6 +111,23 @@ func LoadTargets(path string) ([]config.TargetConfig, error) {
 		return nil, fmt.Errorf("topology: decode %s: %w", path, err)
 	}
 
+	// Power-graph helpers — used to count a Verdigris EV2's *active* circuits
+	// (breakers with a real load wired to them) so the BACnet manager reads only
+	// connected circuits instead of the meter's full physical capacity. Mirrors
+	// the simulator's own derivation in api/routers/bacnet.py.
+	idType := make(map[string]string, len(topo.Nodes))
+	for _, n := range topo.Nodes {
+		idType[n.ID] = n.Device.DeviceType
+	}
+	powerAdj := make(map[string][]string)
+	for _, e := range topo.Edges {
+		if e.Layer != "power" {
+			continue
+		}
+		powerAdj[e.Src] = append(powerAdj[e.Src], e.Dst)
+		powerAdj[e.Dst] = append(powerAdj[e.Dst], e.Src)
+	}
+
 	out := make([]config.TargetConfig, 0, len(topo.Nodes))
 	for _, n := range topo.Nodes {
 		d := n.Device
@@ -160,6 +177,7 @@ func LoadTargets(path string) ([]config.TargetConfig, error) {
 		// BACnet manager at MgmtIP:47808 (EV2 is mgmt-only — no SNMP power data).
 		if d.DeviceType == "energy_monitor" {
 			tc.BACnetEnabled = true
+			tc.ActiveCircuits = activeCircuitsFor(n.ID, powerAdj, idType)
 		}
 		out = append(out, tc)
 	}
@@ -207,7 +225,10 @@ func LoadTopologyLinks(path string) ([]LinkEdge, error) {
 		if layer == "production" {
 			layer = "network" // DCS layer convention
 		}
-		if layer != "network" && layer != "management" && layer != "power" {
+		// cooling = chilled-water loop edges (chiller↔pump↔valve↔cooling_tower, plus
+		// CRAH/sensor ties). Forwarded so the plant topology is queryable in DCS;
+		// link-trap correlation only touches the network layer, so this is inert there.
+		if layer != "network" && layer != "management" && layer != "power" && layer != "cooling" {
 			continue
 		}
 		s, ok1 := idx[e.Src]
@@ -228,6 +249,33 @@ func LoadTopologyLinks(path string) ([]LinkEdge, error) {
 		})
 	}
 	return out, nil
+}
+
+// activeCircuitsFor counts the breakers actually wired to a load on the panel an
+// EV2 monitors — i.e. how many per-circuit objects carry real data. It walks the
+// power graph exactly like the simulator (api/routers/bacnet.py):
+//
+//  1. the EV2's power neighbour is the panel/PDU it clamps onto;
+//  2. that panel's *other* power neighbours, excluding upstream feeds
+//     (ups/generator), are the downstream loads → one circuit each.
+//
+// Returns 0 when the EV2 has no power edges (unknown topology) so the caller can
+// fall back to the meter's full physical capacity.
+func activeCircuitsFor(ev2ID string, powerAdj map[string][]string, idType map[string]string) int {
+	neighbors := powerAdj[ev2ID]
+	if len(neighbors) == 0 {
+		return 0
+	}
+	pduID := neighbors[0] // a meter clamps onto exactly one panel
+	upstream := map[string]bool{"ups": true, "generator": true}
+	active := 0
+	for _, nb := range powerAdj[pduID] {
+		if nb == ev2ID || upstream[idType[nb]] {
+			continue
+		}
+		active++
+	}
+	return active
 }
 
 func normalizeVendor(v string) string {

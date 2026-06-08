@@ -5,6 +5,8 @@ import (
 	"net"
 	"regexp"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +35,27 @@ type binding struct {
 	conn  *net.UDPConn // connected request/response socket (lazy)
 	objs  []objMeta
 	index map[[2]int]objMeta
+
+	// lastAlarm tracks each alarm Binary Input's last-known state (key =
+	// objType,instance) so an alarm event is emitted only on the inactive→active
+	// edge, not re-fired on every poll while it stays active. Touched by both the
+	// poll loop and the COV goroutine → guarded by alarmMu.
+	alarmMu   sync.Mutex
+	lastAlarm map[[2]int]bool
+}
+
+// alarmChanged records the new state for an alarm object and reports whether it
+// differs from the last-known state — i.e. a real inactive→active (raise) or
+// active→inactive (clear) transition. Re-reads of an unchanged state return
+// false, so an event fires once per edge, not on every poll. A device's first
+// reading defaults the prior state to inactive, so a clear is never emitted
+// before the alarm has ever been active.
+func (b *binding) alarmChanged(key [2]int, active bool) bool {
+	b.alarmMu.Lock()
+	defer b.alarmMu.Unlock()
+	was := b.lastAlarm[key]
+	b.lastAlarm[key] = active
+	return active != was
 }
 
 // Manager polls Verdigris EV2 energy monitors via BACnet/IP — periodic
@@ -76,14 +99,23 @@ func NewManager(
 			log.Warn("bacnet: bad target address", zap.String("ip", ip), zap.Error(err))
 			continue
 		}
-		circuits := circuitsFor(t.ModelName)
+		// Read only circuits with a load wired to them (from the topology power
+		// graph) so spare breakers don't write junk zero rows. When the topology
+		// gives no count (0), or it exceeds the meter's physical capacity, fall
+		// back to full capacity — today's behaviour, safe for real meters.
+		capacity := circuitsFor(t.ModelName)
+		circuits := t.ActiveCircuits
+		if circuits <= 0 || circuits > capacity {
+			circuits = capacity
+		}
 		objs := objectsFor(circuits, cfg.ReadCircuits)
 		b := &binding{
-			t:     t,
-			base:  m.baseFor(t),
-			addr:  addr,
-			objs:  objs,
-			index: metaIndex(objs),
+			t:         t,
+			base:      m.baseFor(t),
+			addr:      addr,
+			objs:      objs,
+			index:     metaIndex(objs),
+			lastAlarm: make(map[[2]int]bool),
 		}
 		m.bindings = append(m.bindings, b)
 		m.byIP[ip] = b
@@ -277,10 +309,49 @@ func (m *Manager) emit(ctx context.Context, out chan<- *v1.TelemetryPacket,
 	if scale == 0 {
 		scale = 1
 	}
-	pkt := m.newMetric(b, meta.name, meta.tag, val/scale, ts)
+	v := val / scale
+	// The 0/1 reading always lands in energy_metrics (state + trend).
+	m.send(ctx, out, m.newMetric(b, meta.name, meta.tag, v, ts))
+
+	// Alarm Binary Inputs additionally raise an event on each state change — a
+	// critical event when the alarm goes active, an informational "clear" when it
+	// resolves — so the UI can both surface and auto-close the issue. Edge-gating
+	// avoids re-firing while the state holds.
+	if active := v >= 0.5; isAlarmMetric(meta.name) && b.alarmChanged([2]int{meta.objType, meta.inst}, active) {
+		m.send(ctx, out, m.newAlarmEvent(b, meta.name, active, ts))
+	}
+}
+
+func (m *Manager) send(ctx context.Context, out chan<- *v1.TelemetryPacket, pkt *v1.TelemetryPacket) {
 	select {
 	case out <- pkt:
 	case <-ctx.Done():
+	}
+}
+
+// isAlarmMetric reports whether a metric name is one of the EV2 alarm Binary
+// Inputs (energy.alarm_*). Kept in sync with objects.go panelObjects.
+func isAlarmMetric(name string) bool { return strings.HasPrefix(name, "energy.alarm_") }
+
+// energyScope classifies an EV2 power meter by what it measures, derived from the
+// meter's name, so the UI can compute PUE (facility/it) and DCiE (it/facility):
+//
+//	*RPP*            → "it"        (rack power panels — IT load)
+//	*COOL*/*CHILLER* → "cooling"   (cooling-plant subsystem)
+//	*FAC*            → "facility"  (whole-facility total)
+//
+// "" when the name matches none (scope unknown).
+func energyScope(name string) string {
+	u := strings.ToUpper(name)
+	switch {
+	case strings.Contains(u, "RPP"):
+		return "it"
+	case strings.Contains(u, "COOL"), strings.Contains(u, "CHILLER"):
+		return "cooling"
+	case strings.Contains(u, "FAC"):
+		return "facility"
+	default:
+		return ""
 	}
 }
 
@@ -296,6 +367,7 @@ func (m *Manager) newMetric(b *binding, name, tag string, val float64, ts int64)
 		"datacenter":         t.DatacenterName,
 		"datacenter_city":    t.DatacenterCity,
 		"room":               t.Room,
+		"energy_scope":       energyScope(t.SourceID()), // it|cooling|facility — for PUE/DCiE
 		"collector_agent":    "EDR",
 		"collector_protocol": "BACNET",
 	}
@@ -322,6 +394,61 @@ func (m *Manager) newMetric(b *binding, name, tag string, val float64, ts int64)
 		Value:        val,
 		Meta:         mta,
 		Kind:         "energy", // routed to the dedicated energy_metrics table by DCS
+		Signature:    sig,
+		Nonce:        nonce,
+	}
+}
+
+// newAlarmEvent builds a Kind="alarm" packet for an EV2 alarm state change. DCS
+// routes alarm/event/trap kinds to the events table (event_name = pkt.Name,
+// severity = pkt.Severity), so the alarm surfaces in the UI alongside SNMP
+// traps. active=true is the raise (critical); active=false is the clear
+// (informational). mgmt_ip/hostname let DCS resolve the originating device.
+func (m *Manager) newAlarmEvent(b *binding, name string, active bool, ts int64) *v1.TelemetryPacket {
+	t := b.t
+	severity, state, val := "informational", "clear", 0.0
+	if active {
+		severity, state, val = "critical", "active", 1.0
+	}
+	mta := map[string]string{
+		"hostname":           t.SourceID(),
+		"mgmt_ip":            t.MgmtIP,
+		"source_ip":          t.MgmtIP,
+		"device_type":        t.DeviceType,
+		"vendor":             t.Vendor,
+		"model_name":         t.ModelName,
+		"country":            t.Country,
+		"datacenter":         t.DatacenterName,
+		"datacenter_city":    t.DatacenterCity,
+		"room":               t.Room,
+		"alarm_state":        state,
+		"source":             "BACNET",
+		"collector_agent":    "EDR",
+		"collector_protocol": "BACNET",
+	}
+	for k, v := range t.Labels {
+		mta[k] = v
+	}
+	id := packet.NewID()
+	nonce := m.signer.NextNonce()
+	canonical := packet.CanonicalBytes(id, t.SourceID(), ts, name, "", val, nonce)
+	sig := m.signer.Sign(canonical)
+	return &v1.TelemetryPacket{
+		Id:           id,
+		OrgId:        b.base.orgID,
+		DatacenterId: b.base.dcID,
+		FloorId:      b.base.floorID,
+		NetworkId:    b.base.netID,
+		GroupId:      b.base.grpID,
+		SourceType:   "device",
+		SourceId:     t.SourceID(),
+		ReaderId:     b.base.readerID,
+		TimestampNs:  ts,
+		Name:         name,
+		Value:        val,
+		Meta:         mta,
+		Kind:         "alarm", // routed to the events table by DCS
+		Severity:     severity,
 		Signature:    sig,
 		Nonce:        nonce,
 	}

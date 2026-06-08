@@ -142,6 +142,15 @@ type SNMPConfig struct {
 	RewalkIntervalMs    int `yaml:"rewalk_interval_ms"`
 	WalkRetryIntervalMs int `yaml:"walk_retry_interval_ms"`
 
+	// LivenessIntervalMs > 0 enables a lightweight FAST-only heartbeat after the
+	// one-shot walk: a single sysName+uptime GET per device on this interval — NOT
+	// a full re-walk (no interface/counter/sensor walks). It refreshes last_seen
+	// and, crucially, re-reads sysName so a source-side rename propagates to the DB
+	// (and thus the UI and future events) without the cost of RewalkIntervalMs.
+	// 0 = off (pure one-shot). Ignored when RewalkIntervalMs > 0 (re-walk already
+	// re-reads sysName). default 0.
+	LivenessIntervalMs int `yaml:"liveness_interval_ms"`
+
 	// Per-tier toggles for the inventory walk. FAST (system/liveness) always runs.
 	// Set walk_slow:false to skip the heavy counter/HR/UPS/sensor walks — the
 	// biggest SNMP load and not needed for device inventory or link topology.
@@ -151,6 +160,10 @@ type SNMPConfig struct {
 	WalkSlow     bool `yaml:"walk_slow"`     // counters, server HR/UCD, UPS, sensors. default true
 	WalkTopology bool `yaml:"walk_topology"` // LLDP neighbor discovery → topology_links. default true
 	WalkSensors  bool `yaml:"walk_sensors"`  // environment sensors ONLY (temperature/humidity from sensor+PDU devices) WITHOUT the heavy counter walk. default false — opt-in for the heatmap
+	// WalkServerHealth collects server CPU/RAM via UCD-SNMP scalars ONLY (a few
+	// Gets, no HOST-RESOURCES walks) — independent of the heavy walk_slow tier. Lets
+	// you get server CPU/RAM cheaply. default false — opt-in.
+	WalkServerHealth bool `yaml:"walk_server_health"`
 
 	// Sharding: spread devices across N snmpsim responder processes to avoid the
 	// single-process wedge and raise throughput. Shard 0 stays on port 161 (so
@@ -242,9 +255,14 @@ type TargetConfig struct {
 	// BACnetEnabled marks a device as a BACnet/IP target (Verdigris EV2 energy
 	// monitors). Set automatically for device_type=energy_monitor by the topology
 	// loader. The BACnet manager polls these at MgmtIP:bacnet.port.
-	BACnetEnabled bool              `yaml:"bacnet"`
-	Vendor        string            `yaml:"vendor"` // cisco|juniper|arista|apc|raritan|vertiv|eaton|generic
-	Labels        map[string]string `yaml:"labels"` // arbitrary key=value passed into attributes
+	BACnetEnabled bool `yaml:"bacnet"`
+	// ActiveCircuits is the number of EV2 circuits with a load actually wired to
+	// them (derived from the topology power graph). The BACnet manager reads only
+	// these circuits instead of the meter's full physical capacity, so spare
+	// breakers don't write junk zero rows. 0 = unknown → read full capacity.
+	ActiveCircuits int               `yaml:"active_circuits"`
+	Vendor         string            `yaml:"vendor"` // cisco|juniper|arista|apc|raritan|vertiv|eaton|generic
+	Labels         map[string]string `yaml:"labels"` // arbitrary key=value passed into attributes
 
 	// Per-device routing key overrides. When non-empty these override the
 	// global identity.datacenter_id / identity.floor_id for this device's

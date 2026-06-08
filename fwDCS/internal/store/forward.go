@@ -385,6 +385,7 @@ type FwdEnergy struct {
 	Tag               string
 	Circuit           string
 	Phase             string
+	Scope             string // it|cooling|facility — for PUE/DCiE
 	Attributes        string // raw JSONB text ('{}' when none)
 	CollectorAgent    string
 	CollectorProtocol string
@@ -398,6 +399,7 @@ func (db *DB) EnergySince(ctx context.Context,
 
 	rows, err := db.pool.Query(ctx, `
 		SELECT e.device_id, e.metric_name, e.value, e.tag, e.circuit, e.phase,
+		       COALESCE(e.scope, ''),
 		       COALESCE(e.attributes::text, '{}'),
 		       e.collector_agent, e.collector_protocol, e.ts
 		FROM energy_metrics e
@@ -416,7 +418,7 @@ func (db *DB) EnergySince(ctx context.Context,
 	for rows.Next() {
 		var e FwdEnergy
 		if err := rows.Scan(&e.DeviceID, &e.MetricName, &e.Value, &e.Tag,
-			&e.Circuit, &e.Phase, &e.Attributes,
+			&e.Circuit, &e.Phase, &e.Scope, &e.Attributes,
 			&e.CollectorAgent, &e.CollectorProtocol, &e.TS); err != nil {
 			return nil, err
 		}

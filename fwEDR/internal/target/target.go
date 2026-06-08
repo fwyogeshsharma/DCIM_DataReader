@@ -46,6 +46,11 @@ type Target struct {
 	Community   string // v2c community
 	Caps        Capability
 
+	// ActiveCircuits is the count of EV2 circuits with a load wired to them
+	// (from the topology power graph). The BACnet manager reads only this many
+	// circuits instead of the meter's full capacity. 0 = unknown → read all.
+	ActiveCircuits int
+
 	// Per-device routing key overrides. When non-empty these override the
 	// global identity.datacenter_id / identity.floor_id in packet headers so
 	// multi-datacenter topology files are handled correctly.
@@ -108,6 +113,7 @@ func FromConfig(tc config.TargetConfig, global config.SNMPConfig) *Target {
 		SNMPVersion:    ver,
 		Community:      comm,
 		Caps:           caps,
+		ActiveCircuits: tc.ActiveCircuits,
 		DatacenterID:   tc.DatacenterID,
 		FloorID:        tc.FloorID,
 		ModelName:      tc.ModelName,

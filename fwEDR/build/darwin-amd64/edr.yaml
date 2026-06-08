@@ -42,12 +42,15 @@ snmp:
   timeout_ms:          5000   # sim is slow under load; give walks time to complete instead of timing out + retrying
   retries:             0      # don't double-hit a slow single-process simulator
   trap_addr:           "127.0.0.1:162"
+  mgmt_port:           1161   # SIMULATOR-ONLY SET/mgmt agent. Serves the LIVE in-memory device name on a GET sysName, so the liveness heartbeat reads the truly-current name instantly instead of lagging the 161 .snmprec. Leave UNSET (0) in production — real devices have no such agent.
+  liveness_interval_ms: 60000 # after the one-shot walk, do a single sysName+uptime GET per device every 60s (NOT a full re-walk). Refreshes last_seen and propagates a source-side rename to the DB/UI/events cheaply. 0 = off.
   max_concurrent:      3      # GLOBAL concurrent SNMP socket cap (all tiers). The simulator is ONE snmpsim process (single asyncio loop, single UDP socket) — it serializes requests, so high concurrency is wasted and only risks UDP-buffer bursts. 3 keeps 2 heavy walks overlapped (latency hiding) + 1 slot for FAST liveness.
   rate_limit_per_sec:  30     # global SNMP req/sec token bucket — modest ceiling matched to the single serial responder.
   walk_medium:         true   # interface state (also builds interfaces table — needed for link-event interface correlation)
   walk_topology:       false  # topology comes from the JSON (instant, complete) — skip slow LLDP topology walk and avoid duplicate rows
   walk_slow:           false  # SKIP heavy counter/HR/UPS/sensor walks — biggest SNMP load, not needed for inventory or link topology
   walk_sensors:        true   # environment sensors ONLY (temperature/humidity from sensor+PDU devices) for the heatmap — light, independent of walk_slow
+  walk_server_health:  true   # server CPU/RAM via UCD-SNMP scalars ONLY (a few Gets, no HOST-RESOURCES walks) — light, independent of walk_slow
   breaker_threshold:   3
   breaker_cooldown_ms: 30000
   metrics_log_interval_ms: 0   # 0 = no periodic "snmp poll metrics" log line (quiet once idle)
