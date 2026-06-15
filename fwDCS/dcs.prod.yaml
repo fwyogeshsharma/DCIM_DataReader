@@ -4,7 +4,7 @@ grpc:
   addr: ":9090"
 
 rest:
-  addr: ":8080"
+  addr: ":8081"
 
 postgres:
   dsn: "postgresql://fwdcim:fwdcim@127.0.0.1:5438/fwdcim?sslmode=disable"
