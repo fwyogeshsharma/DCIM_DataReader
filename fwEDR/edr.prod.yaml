@@ -19,9 +19,8 @@ publisher:
   flush_interval_ms: 200
   max_in_flight:     8
 
-# Simulator topology JSON — mounted into the container by docker-compose at this
-# path (host source set in the compose `volumes:` for the edr service).
-topology_file: "/etc/edr/topology.json"
+# Simulator topology JSON — absolute path on the VM (native run, no container).
+topology_file: "/home/fabercomp_gmail_com/DCIM/Datacenter_Network_Simulator/topologies/dual_dc_enterprise.json"
 
 discovery:
   subnets:
