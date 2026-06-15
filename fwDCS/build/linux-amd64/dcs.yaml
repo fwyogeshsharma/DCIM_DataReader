@@ -19,6 +19,29 @@ log:
   level:  "info"
   format: "json"
 
+# TimescaleDB data lifecycle. Reconciled on EVERY boot (not a one-shot
+# migration): change a value, restart DCS, policies are re-applied to match.
+# This is the disk-pressure knob for small/demo clouds.
+#
+# Durations: Go duration strings ("20m", "90m", "24h") + "Nd" day suffix ("7d").
+# Empty string ("") disables that policy. enabled: false skips all of this.
+#
+# chunk_interval MUST be small when raw_retention is small — a chunk frees disk
+# only once ALL its rows are past retention, so 1-day chunks never drop under a
+# 20m retention. Keep chunk_interval <= raw_retention.
+retention:
+  enabled: true
+  metrics:
+    chunk_interval:   "5m"     # future chunk size
+    raw_retention:    "20m"    # drop raw rows older than this
+    compress_after:   ""       # "" = off (not worth it at 20m); e.g. "2d" in prod
+    rollup_retention: "24h"    # keep 5m rollup this long for trend charts
+  energy:
+    chunk_interval:   "5m"
+    raw_retention:    "20m"
+    compress_after:   ""
+    rollup_retention: "168h"   # 7d of 5m energy rollup
+
 aggregator:
   enabled:     true
   endpoint:    "https://fwdcim.faberwork.com/api/v1/ingest"
