@@ -179,6 +179,11 @@ func LoadTargets(path string) ([]config.TargetConfig, error) {
 			tc.BACnetEnabled = true
 			tc.ActiveCircuits = activeCircuitsFor(n.ID, powerAdj, idType)
 		}
+		// Chiller-plant devices expose process telemetry (water temps, flow,
+		// pressures, fan/motor power, alarms) over BACnet too — poll them as well.
+		if isPlantDeviceType(d.DeviceType) {
+			tc.BACnetEnabled = true
+		}
 		out = append(out, tc)
 	}
 	return out, nil
@@ -276,6 +281,18 @@ func activeCircuitsFor(ev2ID string, powerAdj map[string][]string, idType map[st
 		active++
 	}
 	return active
+}
+
+// isPlantDeviceType reports whether a device_type is a chiller-plant BACnet
+// device (chiller/pump/cooling_tower/valve/crah). Kept in sync with the bacnet
+// package's plantObjects map.
+func isPlantDeviceType(dt string) bool {
+	switch dt {
+	case "chiller", "pump", "cooling_tower", "valve", "crah":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeVendor(v string) string {

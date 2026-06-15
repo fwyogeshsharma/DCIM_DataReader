@@ -188,8 +188,7 @@ func (p *Pipeline) processEnergy(ctx context.Context, pkt *v1.TelemetryPacket) (
 		"hostname", "device_type", "vendor",
 		"mgmt_ip", "prod_ip", "loopback_ip", "oob_ip",
 		"collector_agent", "collector_protocol",
-		"snmp_enabled", "gnmi_enabled",
-		"energy_scope") // promoted to its own column
+		"snmp_enabled", "gnmi_enabled")
 
 	return store.EnergyRow{
 		DeviceID:          deviceID,
@@ -199,7 +198,6 @@ func (p *Pipeline) processEnergy(ctx context.Context, pkt *v1.TelemetryPacket) (
 		Circuit:           circuit,
 		Phase:             phase,
 		Value:             pkt.Value,
-		Scope:             pkt.Meta["energy_scope"], // it|cooling|facility for PUE/DCiE
 		Attributes:        store.AttributesJSON(attrs),
 		CollectorAgent:    agent,
 		CollectorProtocol: proto,

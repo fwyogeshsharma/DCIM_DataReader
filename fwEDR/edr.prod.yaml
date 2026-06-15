@@ -1,0 +1,84 @@
+# EDR demo config — identical to local. Runs with host networking so 127.0.0.1
+# reaches the simulator (run separately on this same box) and DCS on :9090.
+identity:
+  org_id:     "faber"
+  network_id: "net-prod"
+  group_id:   "grp-core"
+  reader_id:  ""
+
+dcs:
+  endpoint: "localhost:9090"
+  tls:
+    insecure: true
+
+queue:
+  max_bytes: 536870912  # 512 MB
+
+publisher:
+  batch_size:        512
+  flush_interval_ms: 200
+  max_in_flight:     8
+
+# Simulator topology JSON — mounted into the container by docker-compose at this
+# path (host source set in the compose `volumes:` for the edr service).
+topology_file: "/etc/edr/topology.json"
+
+discovery:
+  subnets:
+    - "192.168.1.0/24"
+    - "192.168.2.0/24"
+  snmp_agent: "127.0.0.1"
+  seed_ip:    "192.168.0.7"
+  interval_hours: 0
+  enrich:         true
+
+snmp:
+  community:           "public"
+  version:             2
+  poll_interval_ms:    30000
+  timeout_ms:          5000
+  retries:             0
+  trap_addr:           "127.0.0.1:162"
+  mgmt_port:           1161   # simulator live-name agent (host networking → reaches sim)
+  liveness_interval_ms: 15000
+  max_concurrent:      3
+  rate_limit_per_sec:  30
+  walk_medium:         true
+  walk_topology:       false
+  walk_slow:           false
+  walk_sensors:        true
+  walk_server_health:  true
+  breaker_threshold:   3
+  breaker_cooldown_ms: 30000
+  metrics_log_interval_ms: 0
+  shards:              1
+  shard_base_port:     16100
+  shard_spawn:         false
+  shard_responder_path: ""
+  shard_data_dir:       ""
+
+gnmi:
+  enabled:          true
+  proxy_addr:       "127.0.0.1:50051"
+  fallback_port:    57400
+  proxy_probe_interval_ms: 5000
+  poll_interval_ms: 30000
+  tls:
+    insecure: true
+  username: ""
+  password: ""
+
+bacnet:
+  enabled:          true
+  port:             47808
+  poll_interval_ms: 30000
+  timeout_ms:       2000
+  retries:          1
+  read_circuits:    true
+  objects_per_read: 12
+  use_cov:          true
+  cov_lifetime_sec: 300
+
+log:
+  level:  "info"
+  format: "json"

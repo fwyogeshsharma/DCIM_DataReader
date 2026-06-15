@@ -1,0 +1,53 @@
+# DCS demo config — identical to local. DCS runs with host networking, so these
+# 127.0.0.1 addresses reach Postgres/Redis published on the box.
+grpc:
+  addr: ":9090"
+
+rest:
+  addr: ":8080"
+
+postgres:
+  dsn: "postgresql://fwdcim:fwdcim@127.0.0.1:5438/fwdcim?sslmode=disable"
+
+redis:
+  addr:     "127.0.0.1:6379"
+  password: ""
+  db:       0
+
+tls:
+  insecure: true
+
+log:
+  level:  "info"
+  format: "json"
+
+# Demo retention — tiny disk footprint. Reconciled every boot; edit + restart
+# dcs to retune. Bump raw_retention if you want more history during the demo.
+retention:
+  enabled: true
+  metrics:
+    chunk_interval:   "5m"
+    raw_retention:    "20m"
+    compress_after:   ""
+    rollup_retention: "24h"
+  energy:
+    chunk_interval:   "5m"
+    raw_retention:    "20m"
+    compress_after:   ""
+    rollup_retention: "168h"
+
+# Push to fwdcim cloud. Mirrors local — enable + key if the demo forwards upstream.
+aggregator:
+  enabled:     true
+  endpoint:    "https://fwdcim.faberwork.com/api/v1/ingest"
+  ingest_key:  "74613fe24e4da087f46d584c6558870a3bed6b993a6416ced4df17f9a0f1e824"
+  interval_ms: 5000
+  batch_limit: 1000
+  org_id:      "faber"
+  network_id:  "net-prod"
+  group_id:    "grp-core"
+
+topology:
+  root:                  "192.168.0.7"   # DC1-ER1 seed/edge router; "" = auto
+  recompute_interval_ms: 30000
+  classify_roles:        true

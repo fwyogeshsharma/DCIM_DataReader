@@ -17,8 +17,41 @@ type DCSConfig struct {
 	Ingest     IngestConfig     `yaml:"ingest"`
 	Aggregator AggregatorConfig `yaml:"aggregator"`
 	Topology   TopologyConfig   `yaml:"topology"`
+	Retention  RetentionConfig  `yaml:"retention"`
 	TLS        TLSConfig        `yaml:"tls"`
 	Log        LogConfig        `yaml:"log"`
+}
+
+// RetentionConfig controls TimescaleDB data lifecycle for the metrics and
+// energy_metrics hypertables. Reconciled on EVERY boot from this config — NOT a
+// one-shot migration. Change a value, restart DCS, and the policies are dropped
+// and re-applied to match. This is the disk-pressure knob for small/demo
+// deployments: shrink raw_retention + chunk_interval to keep the database tiny.
+//
+// Durations are Go duration strings ("20m", "24h", "90m") with an extra "d"
+// day suffix ("7d"). An empty string disables that policy (data kept forever /
+// no compression). Enabled=false skips reconciliation entirely.
+type RetentionConfig struct {
+	Enabled bool            `yaml:"enabled"`
+	Metrics RetentionPolicy `yaml:"metrics"`
+	Energy  RetentionPolicy `yaml:"energy"`
+}
+
+// RetentionPolicy is the per-hypertable lifecycle. The same shape applies to
+// both `metrics` and `energy_metrics`.
+type RetentionPolicy struct {
+	// ChunkInterval sizes FUTURE chunks. For short raw_retention this MUST be
+	// small (e.g. "5m"): TimescaleDB drops a chunk only once ALL its rows are
+	// past retention, so a 1-day chunk never frees space under a 20m retention.
+	ChunkInterval string `yaml:"chunk_interval"`
+	// RawRetention drops raw chunks older than this. "" = keep forever.
+	RawRetention string `yaml:"raw_retention"`
+	// CompressAfter columnar-compresses chunks older than this. "" = no
+	// compression (pointless when raw_retention is already tiny).
+	CompressAfter string `yaml:"compress_after"`
+	// RollupRetention drops the 5-minute continuous aggregate older than this.
+	// "" = keep forever. Trend charts read from the rollup once raw is gone.
+	RollupRetention string `yaml:"rollup_retention"`
 }
 
 // TopologyConfig controls the dynamic parent-child hierarchy DCS computes by
@@ -116,6 +149,12 @@ func LoadDCS(path string) (*DCSConfig, error) {
 	cfg.Aggregator.BatchLimit = 1000
 	cfg.Topology.RecomputeIntervalMs = 30000
 	cfg.Topology.ClassifyRoles = true // default on; YAML can set false explicitly
+	// Retention defaults tuned for a small/demo deployment: keep raw telemetry
+	// only ~20 min on tiny 5-min chunks so disk stays minimal; bump these in
+	// dcs.yaml for production. yaml.v3 leaves unspecified keys at these values.
+	cfg.Retention.Enabled = true
+	cfg.Retention.Metrics = RetentionPolicy{ChunkInterval: "5m", RawRetention: "20m", RollupRetention: "24h"}
+	cfg.Retention.Energy = RetentionPolicy{ChunkInterval: "5m", RawRetention: "20m", RollupRetention: "168h"}
 	if err := loadYAML(path, cfg); err != nil {
 		return nil, err
 	}

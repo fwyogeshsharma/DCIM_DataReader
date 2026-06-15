@@ -35,6 +35,7 @@ type binding struct {
 	conn  *net.UDPConn // connected request/response socket (lazy)
 	objs  []objMeta
 	index map[[2]int]objMeta
+	scope string // energy_metrics scope: it|cooling|facility (EV2) or cooling (plant)
 
 	// lastAlarm tracks each alarm Binary Input's last-known state (key =
 	// objType,instance) so an alarm event is emitted only on the inactive→active
@@ -99,22 +100,33 @@ func NewManager(
 			log.Warn("bacnet: bad target address", zap.String("ip", ip), zap.Error(err))
 			continue
 		}
-		// Read only circuits with a load wired to them (from the topology power
-		// graph) so spare breakers don't write junk zero rows. When the topology
-		// gives no count (0), or it exceeds the meter's physical capacity, fall
-		// back to full capacity — today's behaviour, safe for real meters.
-		capacity := circuitsFor(t.ModelName)
-		circuits := t.ActiveCircuits
-		if circuits <= 0 || circuits > capacity {
-			circuits = capacity
+		// Object set + scope depend on the BACnet device kind. Chiller-plant
+		// devices (chiller/pump/cooling_tower/valve/crah) expose a fixed per-type
+		// point list; EV2 power meters expose panel + per-circuit objects.
+		var objs []objMeta
+		scope := "cooling" // plant devices are the cooling subsystem
+		if plant, ok := plantObjects[t.DeviceType]; ok {
+			objs = plant
+		} else {
+			// EV2: read only circuits with a load wired to them (from the topology
+			// power graph) so spare breakers don't write junk zero rows. When the
+			// topology gives no count (0), or it exceeds the meter's physical
+			// capacity, fall back to full capacity — safe for real meters.
+			capacity := circuitsFor(t.ModelName)
+			circuits := t.ActiveCircuits
+			if circuits <= 0 || circuits > capacity {
+				circuits = capacity
+			}
+			objs = objectsFor(circuits, cfg.ReadCircuits)
+			scope = energyScope(t.SourceID()) // it|cooling|facility
 		}
-		objs := objectsFor(circuits, cfg.ReadCircuits)
 		b := &binding{
 			t:         t,
 			base:      m.baseFor(t),
 			addr:      addr,
 			objs:      objs,
 			index:     metaIndex(objs),
+			scope:     scope,
 			lastAlarm: make(map[[2]int]bool),
 		}
 		m.bindings = append(m.bindings, b)
@@ -248,6 +260,9 @@ func (m *Manager) runCOV(ctx context.Context, out chan<- *v1.TelemetryPacket) {
 	subscribe := func() {
 		pid := 1
 		for _, b := range m.bindings {
+			if isPlantType(b.t.DeviceType) {
+				continue // plant devices are poll-only; panelObjects are EV2-specific
+			}
 			for _, o := range panelObjects {
 				req := buildSubscribeCOV(m.nextInvoke(), pid, o.objType, o.inst, m.cfg.COVLifetimeSec)
 				_, _ = sock.WriteToUDP(req, b.addr)
@@ -329,9 +344,10 @@ func (m *Manager) send(ctx context.Context, out chan<- *v1.TelemetryPacket, pkt 
 	}
 }
 
-// isAlarmMetric reports whether a metric name is one of the EV2 alarm Binary
-// Inputs (energy.alarm_*). Kept in sync with objects.go panelObjects.
-func isAlarmMetric(name string) bool { return strings.HasPrefix(name, "energy.alarm_") }
+// isAlarmMetric reports whether a metric name is an alarm Binary Input — EV2
+// (energy.alarm_*) or chiller-plant (cooling.alarm_*). Such points additionally
+// raise events on state change.
+func isAlarmMetric(name string) bool { return strings.Contains(name, ".alarm_") }
 
 // energyScope classifies an EV2 power meter by what it measures, derived from the
 // meter's name, so the UI can compute PUE (facility/it) and DCiE (it/facility):
@@ -367,7 +383,7 @@ func (m *Manager) newMetric(b *binding, name, tag string, val float64, ts int64)
 		"datacenter":         t.DatacenterName,
 		"datacenter_city":    t.DatacenterCity,
 		"room":               t.Room,
-		"energy_scope":       energyScope(t.SourceID()), // it|cooling|facility — for PUE/DCiE
+		"energy_scope":       b.scope, // it|cooling|facility — for PUE/DCiE
 		"collector_agent":    "EDR",
 		"collector_protocol": "BACNET",
 	}

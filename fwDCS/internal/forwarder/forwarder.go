@@ -131,7 +131,6 @@ type aggEnergyMetric struct {
 	Tag               string          `json:"tag,omitempty"`
 	Circuit           string          `json:"circuit,omitempty"`
 	Phase             string          `json:"phase,omitempty"`
-	Scope             string          `json:"scope,omitempty"` // it|cooling|facility — PUE/DCiE
 	Attributes        json.RawMessage `json:"attributes,omitempty"`
 	CollectorAgent    string          `json:"collector_agent,omitempty"`
 	CollectorProtocol string          `json:"collector_protocol,omitempty"`
@@ -653,7 +652,6 @@ func (f *Forwarder) buildPayloads(
 				Tag:               e.Tag,
 				Circuit:           e.Circuit,
 				Phase:             e.Phase,
-				Scope:             e.Scope,
 				CollectorAgent:    e.CollectorAgent,
 				CollectorProtocol: e.CollectorProtocol,
 				TS:                e.TS.UTC().Format(time.RFC3339),
@@ -775,37 +773,21 @@ func (f *Forwarder) chunkPayload(p *aggPayload) []*aggPayload {
 	// budget already leaves ample headroom for it.
 	const envelope = 512
 
-	deviceBudget := maxPostBytes - envelope
-
 	var chunks []*aggPayload
 	cur := base()
 	curBytes := envelope
 	for _, d := range p.Devices {
 		db := jsonLen(d)
-		// A device whose own serialized size exceeds the budget (high-port switch
-		// with a large metric backlog) can't ride a shared chunk. Split it across
-		// its nested arrays into several sub-devices, each ≤ budget, and emit each
-		// as its own chunk. The Aggregator upserts the device by mgmt_ip/hostname
-		// and INSERTs metrics ON CONFLICT DO NOTHING, so re-sending the device's
-		// scalar identity with a slice of its metrics is idempotent and safe — no
-		// 413, no lost data.
-		if db > deviceBudget {
-			if len(cur.Devices) > 0 {
-				chunks = append(chunks, cur)
-				cur = base()
-				curBytes = envelope
-			}
-			for _, sd := range splitDeviceByBytes(d, deviceBudget) {
-				c := base()
-				c.Devices = append(c.Devices, sd)
-				chunks = append(chunks, c)
-			}
-			continue
-		}
 		if len(cur.Devices) > 0 && curBytes+db > maxPostBytes {
 			chunks = append(chunks, cur)
 			cur = base()
 			curBytes = envelope
+		}
+		if db > maxPostBytes {
+			f.log.Warn("forwarder: single device exceeds POST byte budget — sending alone, may 413",
+				zap.String("hostname", d.Hostname),
+				zap.Int("bytes", db),
+				zap.Int("budget", maxPostBytes))
 		}
 		cur.Devices = append(cur.Devices, d)
 		curBytes += db
@@ -836,58 +818,6 @@ func (f *Forwarder) chunkPayload(p *aggPayload) []*aggPayload {
 
 // jsonLen returns the serialized byte length of v (0 on marshal error, which
 // then just packs conservatively).
-// splitDeviceByBytes breaks one oversized device into several sub-devices, each
-// serializing to ≤ budget. Every sub-device repeats the device's scalar fields
-// (cheap — a few hundred bytes) but carries only a slice of the nested arrays:
-// interfaces (with their addresses), then energy metrics, then metrics, packed by
-// measured size. Because the Aggregator upserts the device idempotently and
-// appends metrics ON CONFLICT DO NOTHING, the duplicated scalars are harmless and
-// each nested row is sent exactly once. A single nested item larger than budget
-// still ships alone (unavoidable, and not realistic for one metric/interface).
-func splitDeviceByBytes(d aggDevice, budget int) []aggDevice {
-	skel := d
-	skel.Interfaces, skel.Metrics, skel.EnergyMetrics = nil, nil, nil
-	base := jsonLen(skel)
-
-	// Room for nested items per chunk, after the repeated scalar skeleton. Guard
-	// against a pathologically large scalar skeleton so we always make progress.
-	room := budget - base - 256
-	if room < 4096 {
-		room = 4096
-	}
-
-	var chunks []aggDevice
-	cur := skel
-	curLen := 0
-	flush := func() {
-		chunks = append(chunks, cur)
-		cur = skel
-		curLen = 0
-	}
-	add := func(itemLen int, place func(*aggDevice)) {
-		if curLen > 0 && curLen+itemLen > room {
-			flush()
-		}
-		place(&cur)
-		curLen += itemLen
-	}
-
-	for _, it := range d.Interfaces {
-		it := it
-		add(jsonLen(it), func(c *aggDevice) { c.Interfaces = append(c.Interfaces, it) })
-	}
-	for _, e := range d.EnergyMetrics {
-		e := e
-		add(jsonLen(e), func(c *aggDevice) { c.EnergyMetrics = append(c.EnergyMetrics, e) })
-	}
-	for _, m := range d.Metrics {
-		m := m
-		add(jsonLen(m), func(c *aggDevice) { c.Metrics = append(c.Metrics, m) })
-	}
-	flush() // trailing items (or the bare skeleton if the device had no nested rows)
-	return chunks
-}
-
 func jsonLen(v any) int {
 	b, err := json.Marshal(v)
 	if err != nil {

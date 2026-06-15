@@ -58,6 +58,16 @@ func run(cfgPath string) error {
 	defer db.Close()
 	log.Info("postgres connected", zap.String("dsn", cfg.Postgres.DSN))
 
+	// Reconcile TimescaleDB retention/compression from config on every boot.
+	// Change values in dcs.yaml + restart to re-tune disk usage.
+	if err := db.ApplyRetention(ctx, cfg.Retention); err != nil {
+		return fmt.Errorf("retention: %w", err)
+	}
+	log.Info("retention policies reconciled",
+		zap.Bool("enabled", cfg.Retention.Enabled),
+		zap.String("metrics_raw", cfg.Retention.Metrics.RawRetention),
+		zap.String("energy_raw", cfg.Retention.Energy.RawRetention))
+
 	// Redis
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.Redis.Addr,
