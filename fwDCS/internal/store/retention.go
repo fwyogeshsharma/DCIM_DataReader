@@ -110,11 +110,37 @@ func (db *DB) reconcileRetention(ctx context.Context, relation, dur string) erro
 	if iv == "" {
 		return nil
 	}
+	// schedule_interval controls how OFTEN the policy runs (TimescaleDB defaults
+	// it to 1 day). With a tiny raw_retention like 20m, a daily sweep lets raw
+	// rows pile up for a full day before each drop — the table balloons to ~GBs
+	// then collapses (sawtooth). Run the job at half the retention window (capped
+	// to a sane [5m, 12h] range) so dropped chunks are reclaimed promptly and the
+	// table size stays bounded near the retention window.
+	sched := scheduleFor(iv)
 	if _, err := db.pool.Exec(ctx,
-		fmt.Sprintf(`SELECT add_retention_policy('%s', INTERVAL '%s', if_not_exists => true)`, relation, iv)); err != nil {
+		fmt.Sprintf(`SELECT add_retention_policy('%s', INTERVAL '%s', schedule_interval => INTERVAL '%s', if_not_exists => true)`, relation, iv, sched)); err != nil {
 		return fmt.Errorf("retention: add policy %s: %w", relation, err)
 	}
 	return nil
+}
+
+// scheduleFor picks how often a retention policy runs, given its drop_after
+// interval (always "<n> seconds" from toInterval). Half the retention window,
+// clamped to [5m, 12h]: frequent enough that a small raw_retention (e.g. 20m)
+// reclaims chunks promptly instead of growing for a day, but never hammering
+// the scheduler for large windows (e.g. 168h rollup → capped at 12h).
+func scheduleFor(iv string) string {
+	var secs int64
+	fmt.Sscanf(iv, "%d seconds", &secs)
+	half := secs / 2
+	const minS, maxS = int64(300), int64(43200) // 5m .. 12h
+	if half < minS {
+		half = minS
+	}
+	if half > maxS {
+		half = maxS
+	}
+	return fmt.Sprintf("%d seconds", half)
 }
 
 // toInterval converts a Go duration string ("20m", "24h") — plus an extra "Nd"
