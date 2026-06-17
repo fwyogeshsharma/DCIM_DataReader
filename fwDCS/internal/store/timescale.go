@@ -893,14 +893,20 @@ func (db *DB) WriteTopologyLink(ctx context.Context, pkt *v1.TelemetryPacket) er
 	// link whenever the advertised neighbor name didn't exactly match devices.hostname
 	// (rename, shard-sync lag, etc.). Hostname is the fallback. dc/floor blank so
 	// cross-DC links resolve.
+	// The remote neighbor may live in a DIFFERENT network than the reporting
+	// device: with per-datacenter network_id (net-<country>-<city>), an inter-DC
+	// backbone link crosses networks. Resolve the destination network-AGNOSTICALLY
+	// ("" network) — mgmt_ip and hostname are unique per tenant, so this is safe —
+	// otherwise every cross-DC link silently dropped (dst not found in the source's
+	// network).
 	dstID := ""
 	if rmip := pkt.Meta["remote_mgmt_ip"]; rmip != "" {
-		dstID, _ = db.DeviceIDByIP(ctx, pkt.OrgId, "", "", pkt.NetworkId, pkt.GroupId, rmip)
+		dstID, _ = db.DeviceIDByIP(ctx, pkt.OrgId, "", "", "", pkt.GroupId, rmip)
 	}
 	if dstID == "" {
 		if remSysName := pkt.Meta["remote_sys_name"]; remSysName != "" {
 			dstID, _ = db.DeviceIDByOrgAndHostname(ctx,
-				pkt.OrgId, pkt.NetworkId, pkt.GroupId, remSysName)
+				pkt.OrgId, "", pkt.GroupId, remSysName)
 		}
 	}
 	if dstID == "" {
@@ -982,7 +988,7 @@ func (db *DB) DeviceIDByOrgAndHostname(ctx context.Context,
 	var id string
 	err := db.pool.QueryRow(ctx, `
 		SELECT id FROM devices
-		WHERE org_id=$1 AND network_id=$2 AND group_id=$3
+		WHERE org_id=$1 AND ($2='' OR network_id=$2) AND group_id=$3
 		  AND hostname=$4
 		LIMIT 1`,
 		orgID, netID, grpID, hostname,
@@ -1029,7 +1035,7 @@ func (db *DB) DeviceByIP(ctx context.Context,
 	err := db.pool.QueryRow(ctx, `
 		SELECT id, hostname
 		FROM   devices
-		WHERE  org_id=$1 AND network_id=$4 AND group_id=$5
+		WHERE  org_id=$1 AND ($4='' OR network_id=$4) AND group_id=$5
 		  AND  ($2='' OR datacenter_id=$2)
 		  AND  ($3='' OR floor_id=$3)
 		  AND  ($6::INET IN (mgmt_ip, prod_ip, loopback_ip, oob_ip))
