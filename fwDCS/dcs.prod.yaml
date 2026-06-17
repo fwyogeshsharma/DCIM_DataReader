@@ -41,7 +41,7 @@ aggregator:
   enabled:     true
   endpoint:    "https://fwdcim.faberwork.com/api/v1/ingest"
   ingest_key:  "74613fe24e4da087f46d584c6558870a3bed6b993a6416ced4df17f9a0f1e824"
-  interval_ms: 5000
+  interval_ms: 30000   # push cadence; higher = less CPU/marshal work (was 5000)
   batch_limit: 1000
   org_id:      "faber"
   network_id:  "net-prod"
@@ -49,5 +49,5 @@ aggregator:
 
 topology:
   root:                  "192.168.0.7"   # DC1-ER1 seed/edge router; "" = auto
-  recompute_interval_ms: 30000
+  recompute_interval_ms: 120000   # BFS over all devices; higher = less CPU (was 30000)
   classify_roles:        true

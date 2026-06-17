@@ -160,7 +160,7 @@ func (m *Manager) baseFor(t *target.Target) basePacket {
 		orgID:    m.identity.OrgID,
 		dcID:     dc,
 		floorID:  fl,
-		netID:    m.identity.NetworkID,
+		netID:    t.NetworkID(m.identity.NetworkID),
 		grpID:    m.identity.GroupID,
 		readerID: m.identity.ReaderID,
 	}

@@ -1,0 +1,13 @@
+# pysnmp/snmpsim runtime lockfiles — regenerated when EDR spawns responders
+.snmp_lf
+.snmp_lf_*
+
+# runtime state
+targets.json
+*.db
+*.snapshot
+
+# source backups
+*.bak
+*.bak_*
+*.orig

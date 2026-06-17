@@ -169,6 +169,17 @@ func LoadTargets(path string) ([]config.TargetConfig, error) {
 			RackNum:        d.RackNum,
 			RackUnit:       d.RackUnit,
 		}
+		// Servers run TWO SNMP agents: the OS agent on the PROD IP (ifTable, LLDP,
+		// HOST-RESOURCES; sysName = the host name) and the BMC agent on the MGMT IP
+		// (enterprise health; sysName = "<name>-bmc"). The simulator routes by
+		// community = the agent's IP. Default community here is the mgmt IP, which
+		// hits the BMC agent — so SNMP liveness adopted "<name>-bmc" and the hostname
+		// flapped against the plain name from registration/Redfish, and the interface
+		// walk found no ifTable. Route a server's SNMP to its OS agent (community =
+		// prod IP). Hardware health still comes from Redfish on the mgmt IP.
+		if d.DeviceType == "server" && prodIP != "" {
+			tc.Community = prodIP
+		}
 		if gnmiCapable[d.DeviceType] && prodIP != "" {
 			tc.GNMIEnabled = true
 			tc.GNMIIP = mgmtIP // connect to per-device gNMI server on mgmt IP
@@ -284,11 +295,11 @@ func activeCircuitsFor(ev2ID string, powerAdj map[string][]string, idType map[st
 }
 
 // isPlantDeviceType reports whether a device_type is a chiller-plant BACnet
-// device (chiller/pump/cooling_tower/valve/crah). Kept in sync with the bacnet
+// device (chiller/pump/cooling_tower/valve/crah/cdu). Kept in sync with the bacnet
 // package's plantObjects map.
 func isPlantDeviceType(dt string) bool {
 	switch dt {
-	case "chiller", "pump", "cooling_tower", "valve", "crah":
+	case "chiller", "pump", "cooling_tower", "valve", "crah", "cdu":
 		return true
 	default:
 		return false

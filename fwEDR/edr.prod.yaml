@@ -34,19 +34,19 @@ discovery:
 snmp:
   community:           "public"
   version:             2
-  poll_interval_ms:    30000
+  poll_interval_ms:    60000
   timeout_ms:          5000
   retries:             0
   trap_addr:           "127.0.0.1:162"
   mgmt_port:           1161   # simulator live-name agent (host networking → reaches sim)
-  liveness_interval_ms: 15000
+  liveness_interval_ms: 30000
   max_concurrent:      3
   rate_limit_per_sec:  30
   walk_medium:         true
   walk_topology:       false
   walk_slow:           false
   walk_sensors:        true
-  walk_server_health:  true
+  walk_server_health:  false   # servers are polled via Redfish (see redfish: block), not SNMP
   breaker_threshold:   3
   breaker_cooldown_ms: 30000
   metrics_log_interval_ms: 0
@@ -61,7 +61,7 @@ gnmi:
   proxy_addr:       "127.0.0.1:50051"
   fallback_port:    57400
   proxy_probe_interval_ms: 5000
-  poll_interval_ms: 30000
+  poll_interval_ms: 60000   # gNMI SAMPLE interval; higher = less stream/CPU (was 30000)
   tls:
     insecure: true
   username: ""
@@ -70,13 +70,26 @@ gnmi:
 bacnet:
   enabled:          true
   port:             47808
-  poll_interval_ms: 30000
+  poll_interval_ms: 60000   # ReadPropertyMultiple cadence; higher = less CPU (was 30000)
   timeout_ms:       2000
   retries:          1
   read_circuits:    true
   objects_per_read: 12
   use_cov:          true
   cov_lifetime_sec: 300
+
+# Servers expose OS usage (CPU/mem/disk/net via the Oem extension) AND BMC
+# hardware health (temps/fans/PSU/power/chassis state) over Redfish on the mgmt
+# IP. One light pull per interval — the server analog of gNMI for sw/routers.
+redfish:
+  enabled:          true
+  port:             8443
+  username:         "admin"
+  password:         "password"
+  poll_interval_ms: 60000   # BMC GET cadence; higher = less CPU (was 30000)
+  timeout_ms:       5000
+  max_concurrent:   4
+  tls_insecure:     false   # simulator serves plain HTTP; set true for HTTPS BMCs
 
 log:
   level:  "info"

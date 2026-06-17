@@ -197,12 +197,26 @@ type Forwarder struct {
 
 // New constructs a Forwarder. Call Run in a goroutine to start it.
 func New(db *store.DB, cfg config.AggregatorConfig, log *zap.Logger) *Forwarder {
+	// A push fans out many scope/chunk POSTs concurrently, every interval. Go's
+	// DEFAULT transport keeps only 2 idle conns per host, so every extra
+	// concurrent POST opened a brand-new TCP connection that was then closed —
+	// piling into TIME_WAIT and exhausting Windows ephemeral ports
+	// ("connectex: Only one usage of each socket address"), which turned into a
+	// retry storm that pegged the CPU. A generous keep-alive pool makes the
+	// POSTs reuse connections instead of churning sockets.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 200
+	tr.MaxIdleConnsPerHost = 64
+	tr.MaxConnsPerHost = 64 // cap total conns to one host → bounds socket use
+	tr.IdleConnTimeout = 90 * time.Second
+	tr.ForceAttemptHTTP2 = true
 	return &Forwarder{
 		db:  db,
 		cfg: cfg,
 		log: log,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: tr,
 		},
 	}
 }
@@ -242,52 +256,75 @@ func (f *Forwarder) Run(ctx context.Context) {
 	}
 }
 
-// push executes one full push cycle: query → build payload → POST → advance cursors.
+// push executes one full push cycle across every network present in the org.
+// Devices carry a per-country network_id, so we forward each network separately:
+// per-network cursors prevent one network advancing past another's unsent rows,
+// and each payload ships under its own network_id. When no devices exist yet we
+// fall back to the configured network_id so a fresh DB still has a valid scope.
 func (f *Forwarder) push(ctx context.Context) error {
+	nets, err := f.db.DistinctNetworks(ctx, f.cfg.OrgID)
+	if err != nil {
+		return fmt.Errorf("distinct networks: %w", err)
+	}
+	if len(nets) == 0 {
+		nets = []string{f.cfg.NetworkID}
+	}
+	var firstErr error
+	for _, netID := range nets {
+		if err := f.pushNetwork(ctx, netID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// pushNetwork runs one query → build payload → POST → advance cursors cycle for a
+// single network_id. Cursors are keyed per (table, network_id).
+func (f *Forwarder) pushNetwork(ctx context.Context, netID string) error {
 	batchLimit := f.cfg.BatchLimit
 	if batchLimit <= 0 {
 		batchLimit = 1000
 	}
 	metricLimit := batchLimit * 50 // metrics volume >> device volume
 
-	// ── 1. Load cursors ──────────────────────────────────────────────────────
-	devCursor, _ := f.db.GetForwarderCursor(ctx, "devices")
-	metricsCursor, _ := f.db.GetForwarderCursor(ctx, "metrics")
-	energyCursor, _ := f.db.GetForwarderCursor(ctx, "energy")
-	topoCursor, _ := f.db.GetForwarderCursor(ctx, "topology")
-	eventsCursor, _ := f.db.GetForwarderCursor(ctx, "events")
+	// ── 1. Load cursors (per network) ────────────────────────────────────────
+	devCursor, _ := f.db.GetForwarderCursor(ctx, "devices", netID)
+	metricsCursor, _ := f.db.GetForwarderCursor(ctx, "metrics", netID)
+	energyCursor, _ := f.db.GetForwarderCursor(ctx, "energy", netID)
+	topoCursor, _ := f.db.GetForwarderCursor(ctx, "topology", netID)
+	eventsCursor, _ := f.db.GetForwarderCursor(ctx, "events", netID)
 
 	// ── 2. Query data ─────────────────────────────────────────────────────────
 	changedDevices, err := f.db.DevicesUpdatedSince(ctx,
-		f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID,
+		f.cfg.OrgID, netID, f.cfg.GroupID,
 		devCursor, batchLimit)
 	if err != nil {
 		return fmt.Errorf("devices query: %w", err)
 	}
 
 	recentMetrics, err := f.db.MetricsSince(ctx,
-		f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID,
+		f.cfg.OrgID, netID, f.cfg.GroupID,
 		metricsCursor, metricLimit)
 	if err != nil {
 		return fmt.Errorf("metrics query: %w", err)
 	}
 
 	recentEnergy, err := f.db.EnergySince(ctx,
-		f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID,
+		f.cfg.OrgID, netID, f.cfg.GroupID,
 		energyCursor, metricLimit)
 	if err != nil {
 		return fmt.Errorf("energy query: %w", err)
 	}
 
 	topoLinks, err := f.db.TopologyLinksSince(ctx,
-		f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID,
+		f.cfg.OrgID, netID, f.cfg.GroupID,
 		topoCursor, batchLimit)
 	if err != nil {
 		return fmt.Errorf("topology query: %w", err)
 	}
 
 	events, err := f.db.EventsSince(ctx,
-		f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID,
+		f.cfg.OrgID, netID, f.cfg.GroupID,
 		eventsCursor, batchLimit)
 	if err != nil {
 		return fmt.Errorf("events query: %w", err)
@@ -361,7 +398,7 @@ func (f *Forwarder) push(ctx context.Context) error {
 			hostnames = append(hostnames, h)
 		}
 		linkDevices, err := f.db.DevicesByHostnames(ctx,
-			f.cfg.OrgID, f.cfg.NetworkID, f.cfg.GroupID, hostnames)
+			f.cfg.OrgID, netID, f.cfg.GroupID, hostnames)
 		if err != nil {
 			return fmt.Errorf("link-endpoint devices query: %w", err)
 		}
@@ -405,7 +442,7 @@ func (f *Forwarder) push(ctx context.Context) error {
 	// and upserts devices by org+datacenter+floor+network+group+hostname. Our
 	// devices carry per-device dc/floor, so we group everything by that scope
 	// and emit one payload per group.
-	payloads := f.buildPayloads(
+	payloads := f.buildPayloads(netID,
 		allDevices, ifacesByDevice, addrsByIface,
 		metricsByDevice, energyByDevice, topoLinks, events,
 	)
@@ -471,19 +508,19 @@ func (f *Forwarder) push(ctx context.Context) error {
 
 	// ── 7. Advance cursors (only when the batch was non-empty) ────────────────
 	if len(changedDevices) > 0 {
-		_ = f.db.SetForwarderCursor(ctx, "devices", changedDevices[len(changedDevices)-1].UpdatedAt)
+		_ = f.db.SetForwarderCursor(ctx, "devices", netID, changedDevices[len(changedDevices)-1].UpdatedAt)
 	}
 	if len(recentMetrics) > 0 {
-		_ = f.db.SetForwarderCursor(ctx, "metrics", recentMetrics[len(recentMetrics)-1].TS)
+		_ = f.db.SetForwarderCursor(ctx, "metrics", netID, recentMetrics[len(recentMetrics)-1].TS)
 	}
 	if len(recentEnergy) > 0 {
-		_ = f.db.SetForwarderCursor(ctx, "energy", recentEnergy[len(recentEnergy)-1].TS)
+		_ = f.db.SetForwarderCursor(ctx, "energy", netID, recentEnergy[len(recentEnergy)-1].TS)
 	}
 	if len(topoLinks) > 0 {
-		_ = f.db.SetForwarderCursor(ctx, "topology", topoLinks[len(topoLinks)-1].UpdatedAt)
+		_ = f.db.SetForwarderCursor(ctx, "topology", netID, topoLinks[len(topoLinks)-1].UpdatedAt)
 	}
 	if len(events) > 0 {
-		_ = f.db.SetForwarderCursor(ctx, "events", events[len(events)-1].TS)
+		_ = f.db.SetForwarderCursor(ctx, "events", netID, events[len(events)-1].TS)
 	}
 
 	return nil
@@ -525,6 +562,7 @@ func (f *Forwarder) floorOrDefault(floor string) string {
 // org+datacenter+floor+network+group+hostname and requires topology link
 // endpoints to share the payload, so each scope is shipped independently.
 func (f *Forwarder) buildPayloads(
+	netID string,
 	devices []store.FwdDevice,
 	ifacesByDevice map[string][]store.FwdInterface,
 	addrsByIface map[string][]store.FwdAddress,
@@ -549,7 +587,7 @@ func (f *Forwarder) buildPayloads(
 				OrgID:         f.cfg.OrgID,
 				DatacenterID:  dc,
 				FloorID:       floor,
-				NetworkID:     f.cfg.NetworkID,
+				NetworkID:     netID,
 				GroupID:       f.cfg.GroupID,
 				Devices:       make([]aggDevice, 0),
 				TopologyLinks: make([]aggTopoLink, 0),
@@ -778,16 +816,29 @@ func (f *Forwarder) chunkPayload(p *aggPayload) []*aggPayload {
 	curBytes := envelope
 	for _, d := range p.Devices {
 		db := jsonLen(d)
+		// A device whose own nested metrics exceed the budget can't ride in one
+		// POST. Split its metrics across fragments (device identity repeats; the
+		// Aggregator upserts the device idempotently and APPENDS metrics) so every
+		// chunk clears the proxy limit. Without this the device shipped alone, got
+		// 413'd, the metrics cursor never advanced, and each tick rebuilt an
+		// ever-larger payload — the CPU/memory runaway.
+		if db > maxPostBytes {
+			if len(cur.Devices) > 0 {
+				chunks = append(chunks, cur)
+				cur = base()
+				curBytes = envelope
+			}
+			for _, frag := range splitDevice(d, maxPostBytes-envelope) {
+				fc := base()
+				fc.Devices = append(fc.Devices, frag)
+				chunks = append(chunks, fc)
+			}
+			continue
+		}
 		if len(cur.Devices) > 0 && curBytes+db > maxPostBytes {
 			chunks = append(chunks, cur)
 			cur = base()
 			curBytes = envelope
-		}
-		if db > maxPostBytes {
-			f.log.Warn("forwarder: single device exceeds POST byte budget — sending alone, may 413",
-				zap.String("hostname", d.Hostname),
-				zap.Int("bytes", db),
-				zap.Int("budget", maxPostBytes))
 		}
 		cur.Devices = append(cur.Devices, d)
 		curBytes += db
@@ -814,6 +865,52 @@ func (f *Forwarder) chunkPayload(p *aggPayload) []*aggPayload {
 	}
 
 	return chunks
+}
+
+// splitDevice partitions a device that alone exceeds the byte budget into
+// fragments small enough to POST. The first fragment carries the full device
+// (header + interfaces + addresses) plus as many metrics as fit; each subsequent
+// fragment repeats only a lightweight identity stub with the remaining metrics /
+// energy. The Aggregator upserts the device idempotently and appends metrics, so
+// fragmenting loses nothing. A single metric larger than the budget (never
+// expected) still ships alone in its own fragment.
+func splitDevice(d aggDevice, budget int) []aggDevice {
+	head := d // frag 0: full device, metrics filled in below
+	head.Metrics = nil
+	head.EnergyMetrics = nil
+	headCost := jsonLen(head)
+
+	stub := aggDevice{ID: d.ID, Hostname: d.Hostname, DeviceType: d.DeviceType, IsReachable: d.IsReachable}
+	stubCost := jsonLen(stub)
+
+	var frags []aggDevice
+	cur := head
+	curBytes := headCost
+	flush := func() {
+		frags = append(frags, cur)
+		cur = stub
+		cur.Metrics = nil
+		cur.EnergyMetrics = nil
+		curBytes = stubCost
+	}
+	for _, m := range d.Metrics {
+		mb := jsonLen(m)
+		if (len(cur.Metrics)+len(cur.EnergyMetrics)) > 0 && curBytes+mb > budget {
+			flush()
+		}
+		cur.Metrics = append(cur.Metrics, m)
+		curBytes += mb
+	}
+	for _, e := range d.EnergyMetrics {
+		eb := jsonLen(e)
+		if (len(cur.Metrics)+len(cur.EnergyMetrics)) > 0 && curBytes+eb > budget {
+			flush()
+		}
+		cur.EnergyMetrics = append(cur.EnergyMetrics, e)
+		curBytes += eb
+	}
+	frags = append(frags, cur)
+	return frags
 }
 
 // jsonLen returns the serialized byte length of v (0 on marshal error, which

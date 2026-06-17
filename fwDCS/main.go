@@ -188,25 +188,43 @@ func run(cfgPath string) error {
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			run := func() {
-				root, n, err := db.RecomputeHierarchy(ctx,
-					cfg.Aggregator.OrgID, cfg.Aggregator.NetworkID, cfg.Aggregator.GroupID,
-					cfg.Topology.Root)
+				// Devices carry a per-country network_id, so the spanning tree + role
+				// classification run once PER network (each is its own BFS scope). A
+				// single configured network_id would skip every device in another
+				// country. Discover the live set each cycle so new countries are
+				// picked up automatically.
+				nets, err := db.DistinctNetworks(ctx, cfg.Aggregator.OrgID)
 				if err != nil {
-					log.Warn("topology hierarchy recompute failed", zap.Error(err))
+					log.Warn("topology hierarchy: distinct networks failed", zap.Error(err))
 					return
 				}
-				log.Info("topology hierarchy recomputed",
-					zap.String("root", root), zap.Int("devices", n))
+				if len(nets) == 0 {
+					nets = []string{cfg.Aggregator.NetworkID}
+				}
+				for _, netID := range nets {
+					root, n, err := db.RecomputeHierarchy(ctx,
+						cfg.Aggregator.OrgID, netID, cfg.Aggregator.GroupID,
+						cfg.Topology.Root)
+					if err != nil {
+						log.Warn("topology hierarchy recompute failed",
+							zap.String("network_id", netID), zap.Error(err))
+						continue
+					}
+					log.Info("topology hierarchy recomputed",
+						zap.String("network_id", netID), zap.String("root", root), zap.Int("devices", n))
 
-				// Fabric-role classification runs right after the graph is rebuilt,
-				// so neighbor device_types (Signal 3) are current.
-				if cfg.Topology.ClassifyRoles {
-					nr, cerr := db.ClassifyRoles(ctx,
-						cfg.Aggregator.OrgID, cfg.Aggregator.NetworkID, cfg.Aggregator.GroupID)
-					if cerr != nil {
-						log.Warn("device role classify failed", zap.Error(cerr))
-					} else {
-						log.Info("device roles classified", zap.Int("changed", nr))
+					// Fabric-role classification runs right after the graph is rebuilt,
+					// so neighbor device_types (Signal 3) are current.
+					if cfg.Topology.ClassifyRoles {
+						nr, cerr := db.ClassifyRoles(ctx,
+							cfg.Aggregator.OrgID, netID, cfg.Aggregator.GroupID)
+						if cerr != nil {
+							log.Warn("device role classify failed",
+								zap.String("network_id", netID), zap.Error(cerr))
+						} else {
+							log.Info("device roles classified",
+								zap.String("network_id", netID), zap.Int("changed", nr))
+						}
 					}
 				}
 			}

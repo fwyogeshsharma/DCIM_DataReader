@@ -19,6 +19,7 @@ type EDRConfig struct {
 	SNMP         SNMPConfig      `yaml:"snmp"`
 	GNMI         GNMIConfig      `yaml:"gnmi"`
 	BACnet       BACnetConfig    `yaml:"bacnet"`
+	Redfish      RedfishConfig   `yaml:"redfish"`
 	Targets      []TargetConfig  `yaml:"targets"`
 	Log          LogConfig       `yaml:"log"`
 }
@@ -238,6 +239,23 @@ type BACnetConfig struct {
 	COVLifetimeSec int  `yaml:"cov_lifetime_sec"` // COV subscription lifetime; renewed before expiry (default 300)
 }
 
+// RedfishConfig holds the Redfish (HTTP) collector settings. EDR polls each
+// server's BMC (device_type=server) over Redfish on the mgmt IP — the modern
+// server analog of gNMI for switches/routers. One light pull per interval reads
+// the ComputerSystem (OS usage via the Oem extension), Thermal (temps/fans),
+// Power (watts/PSUs) and Managers (BMC info) resources. Replaces SNMP polling of
+// server health — keep snmp.walk_server_health off when this is enabled.
+type RedfishConfig struct {
+	Enabled        bool   `yaml:"enabled"`          // default false; set true to poll servers via Redfish
+	Port           int    `yaml:"port"`             // BMC HTTP(S) port (default 443)
+	Username       string `yaml:"username"`         // HTTP Basic user (default "admin")
+	Password       string `yaml:"password"`         // HTTP Basic password (default "password")
+	PollIntervalMs int    `yaml:"poll_interval_ms"` // GET cadence per server (default 30000)
+	TimeoutMs      int    `yaml:"timeout_ms"`       // per-request timeout (default 5000)
+	MaxConcurrent  int    `yaml:"max_concurrent"`   // max servers polled in parallel (default 4)
+	TLSInsecure    bool   `yaml:"tls_insecure"`     // use https + skip cert verify (default false = plain http)
+}
+
 // TargetConfig describes one device to poll. IP roles follow DCIM conventions —
 // see internal/target/target.go for full semantics.
 type TargetConfig struct {
@@ -331,6 +349,13 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	cfg.GNMI.PollInterval = 30000
 	cfg.GNMI.FallbackPort = 57400
 	cfg.GNMI.ProxyProbeIntervalMs = 5000
+	cfg.Redfish.Enabled = true // default on; YAML "enabled: false" overrides
+	cfg.Redfish.Port = 443
+	cfg.Redfish.Username = "admin"
+	cfg.Redfish.Password = "password"
+	cfg.Redfish.PollIntervalMs = 30000
+	cfg.Redfish.TimeoutMs = 5000
+	cfg.Redfish.MaxConcurrent = 4
 	if err := loadYAML(path, cfg); err != nil {
 		return nil, err
 	}
@@ -391,6 +416,24 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	}
 	if cfg.BACnet.PollIntervalMs <= 0 {
 		cfg.BACnet.PollIntervalMs = 30000
+	}
+	if cfg.Redfish.Port <= 0 {
+		cfg.Redfish.Port = 443
+	}
+	if cfg.Redfish.PollIntervalMs <= 0 {
+		cfg.Redfish.PollIntervalMs = 30000
+	}
+	if cfg.Redfish.TimeoutMs <= 0 {
+		cfg.Redfish.TimeoutMs = 5000
+	}
+	if cfg.Redfish.MaxConcurrent <= 0 {
+		cfg.Redfish.MaxConcurrent = 4
+	}
+	if cfg.Redfish.Username == "" {
+		cfg.Redfish.Username = "admin"
+	}
+	if cfg.Redfish.Password == "" {
+		cfg.Redfish.Password = "password"
 	}
 	if cfg.BACnet.TimeoutMs <= 0 {
 		cfg.BACnet.TimeoutMs = 2000

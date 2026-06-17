@@ -55,11 +55,15 @@ const (
 	OIDUcdMemBuffer    = "1.3.6.1.4.1.2021.4.15.0"
 
 	// UPS-MIB (RFC 1628)
+	// Battery group layout matches the simulator's _ups_entries: status .1, minutes
+	// remaining .4, charge% .5, voltage .6, temperature .8 (.2/.3/.7 unused). The
+	// minutes/charge/voltage columns previously read .3/.4/.5 — off by one — so
+	// ups_charge_percent actually returned the minutes value, etc.
 	OIDUpsBatteryStatus            = "1.3.6.1.2.1.33.1.2.1.0"
 	OIDUpsSecondsOnBattery         = "1.3.6.1.2.1.33.1.2.2.0"
-	OIDUpsEstimatedMinutesRemain   = "1.3.6.1.2.1.33.1.2.3.0"
-	OIDUpsEstimatedChargeRemaining = "1.3.6.1.2.1.33.1.2.4.0"
-	OIDUpsBatteryVoltage           = "1.3.6.1.2.1.33.1.2.5.0"
+	OIDUpsEstimatedMinutesRemain   = "1.3.6.1.2.1.33.1.2.4.0"
+	OIDUpsEstimatedChargeRemaining = "1.3.6.1.2.1.33.1.2.5.0"
+	OIDUpsBatteryVoltage           = "1.3.6.1.2.1.33.1.2.6.0"
 	// upsBatteryTemperature (whole °C). The simulator serves it at .2.8.0
 	// because .2.7 carries upsBatteryCurrent. Collected by the ENVIRONMENT tier
 	// and emitted as environment.temperature_c (tag BATTERY) for the heatmap.

@@ -649,7 +649,7 @@ func (p *Poller) pollSNMP(ctx context.Context, t *target.Target, tier snmp.Tier)
 	collector := snmp.NewCollector(
 		t, cl,
 		p.identity.OrgID, snmpDCID,
-		snmpFloorID, p.identity.NetworkID,
+		snmpFloorID, t.NetworkID(p.identity.NetworkID),
 		p.identity.GroupID, p.identity.ReaderID,
 		p.signer,
 		p.snmpCfg.MgmtPort, p.snmpCfg.Timeout,

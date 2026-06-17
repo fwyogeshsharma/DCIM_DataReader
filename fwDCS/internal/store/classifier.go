@@ -396,6 +396,18 @@ func (db *DB) ClassifyRoles(ctx context.Context, orgID, netID, grpID string) (in
 		} else {
 			res = roleResult{role: role, confidence: 1.0, source: "inferred"}
 		}
+		// Never leave a device unclassified when its device_type is known: fall
+		// back to the type as the role (e.g. cdu → cdu, an unknown type → itself,
+		// or a fabric switch that scored too low → switch). Only true fabric
+		// sub-roles (core/spine/leaf) come from the scorer; everything else is just
+		// its type.
+		if (res.role == "" || res.role == "unclassified") && d.dtype != "" {
+			res.role = d.dtype
+			res.source = "device_type"
+			if res.confidence == 0 {
+				res.confidence = 1.0
+			}
+		}
 		ids = append(ids, d.id)
 		roles = append(roles, res.role)
 		confs = append(confs, res.confidence)

@@ -50,7 +50,7 @@ snmp:
   walk_topology:       false  # topology comes from the JSON (instant, complete) — skip slow LLDP topology walk and avoid duplicate rows
   walk_slow:           false  # SKIP heavy counter/HR/UPS/sensor walks — biggest SNMP load, not needed for inventory or link topology
   walk_sensors:        true   # environment sensors ONLY (temperature/humidity from sensor+PDU devices) for the heatmap — light, independent of walk_slow
-  walk_server_health:  true   # server CPU/RAM via UCD-SNMP scalars ONLY (a few Gets, no HOST-RESOURCES walks) — light, independent of walk_slow
+  walk_server_health:  false  # servers polled via Redfish (see redfish: block), not SNMP
   breaker_threshold:   3
   breaker_cooldown_ms: 30000
   metrics_log_interval_ms: 0   # 0 = no periodic "snmp poll metrics" log line (quiet once idle)
@@ -96,6 +96,20 @@ bacnet:
   objects_per_read: 12      # objects per ReadPropertyMultiple (APDU-size safe)
   use_cov:          true    # SubscribeCOV push for panel + alarm objects
   cov_lifetime_sec: 300
+
+# Redfish (HTTP) — per-server BMC on the mgmt IP. Collects OS usage (CPU/mem/disk/
+# net via the Oem extension) + hardware health (temps/fans/PSU/power/chassis state)
+# in one light pull per interval. The server analog of gNMI; replaces SNMP server
+# health (walk_server_health is off above). Power on/off events still arrive via traps.
+redfish:
+  enabled:          true
+  port:             443
+  username:         "admin"
+  password:         "password"
+  poll_interval_ms: 30000
+  timeout_ms:       5000
+  max_concurrent:   4
+  tls_insecure:     false   # simulator serves plain HTTP; set true for HTTPS BMCs
 
 log:
   level:  "info"

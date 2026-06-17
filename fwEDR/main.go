@@ -20,6 +20,7 @@ import (
 	"github.com/faberwork/fwedr/internal/poller"
 	"github.com/faberwork/fwedr/internal/publisher"
 	"github.com/faberwork/fwedr/internal/queue"
+	"github.com/faberwork/fwedr/internal/redfish"
 	"github.com/faberwork/fwedr/internal/shardsim"
 	"github.com/faberwork/fwedr/internal/snmp"
 	"github.com/faberwork/fwedr/internal/target"
@@ -273,6 +274,11 @@ func run(cfgPath string, forceRediscover bool) error {
 	// before TierFast can run for every target.
 	emitRegistrationPackets(targets, cfg.Identity, signer, pktCh, log)
 
+	// Per-country network_id resolver for the sources that lack a *target.Target
+	// in scope (topology links by host/IP, traps by community IP). Must match the
+	// per-target ids the collectors stamp, or DCS can't resolve those packets.
+	netIDFor := buildNetIDResolver(targets, cfg.Identity.NetworkID)
+
 	// Interface IP addresses are collected by the poller's pooled MEDIUM walk
 	// (see snmp.Collector.collectInterfaceAddresses) — folded in there so it reuses
 	// the persistent pooled socket. The old standalone enrichment pass opened a
@@ -305,7 +311,7 @@ func run(cfgPath string, forceRediscover bool) error {
 					topoIv = 10 * time.Minute
 				}
 				for {
-					n := emitTopologyLinks(links, cfg.Identity, signer, pktCh, log)
+					n := emitTopologyLinks(links, cfg.Identity, netIDFor, signer, pktCh, log)
 					log.Info("topology links emitted from JSON",
 						zap.Int("emitted", n), zap.Int("total", len(links)))
 					select {
@@ -324,7 +330,8 @@ func run(cfgPath string, forceRediscover bool) error {
 		trapReceiver := snmp.NewTrapReceiver(
 			cfg.SNMP.TrapAddr,
 			cfg.Identity.OrgID, cfg.Identity.DatacenterID,
-			cfg.Identity.FloorID, cfg.Identity.NetworkID,
+			cfg.Identity.FloorID,
+			netIDFor,
 			cfg.Identity.GroupID, cfg.Identity.ReaderID,
 			trapSigner, pktCh, log,
 		)
@@ -352,6 +359,17 @@ func run(cfgPath string, forceRediscover bool) error {
 		bm := bacnet.NewManager(targets, cfg.BACnet, cfg.Identity, signer, log)
 		if bm.Count() > 0 {
 			go bm.Run(ctx, pktCh)
+		}
+	}
+
+	// Redfish manager — polls each server's BMC over HTTP (device_type=server) for
+	// OS usage (CPU/mem/disk/net via the Oem extension) and hardware health (temps,
+	// fans, PSU watts, chassis power state). The server analog of gNMI; replaces
+	// SNMP polling of server health. No-op when disabled or when no servers exist.
+	if cfg.Redfish.Enabled {
+		rf := redfish.NewManager(targets, cfg.Redfish, cfg.Identity, signer, log)
+		if rf.Count() > 0 {
+			go rf.Run(ctx, pktCh)
 		}
 	}
 
@@ -559,7 +577,7 @@ func emitInterfaceAddressPackets(
 			OrgId:        id.OrgID,
 			DatacenterId: ifaDCID,
 			FloorId:      ifaFloorID,
-			NetworkId:    id.NetworkID,
+			NetworkId:    t.NetworkID(id.NetworkID),
 			GroupId:      id.GroupID,
 			SourceType:   "device",
 			SourceId:     t.SourceID(),
@@ -582,6 +600,34 @@ func emitInterfaceAddressPackets(
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// buildNetIDResolver returns a lookup from a device's hostname or any of its IPs
+// to its per-country network id, used by the two packet sources that don't carry
+// a *target.Target in scope (topology-link emit, SNMP trap receiver). The device
+// identity in DCS is keyed partly by network_id, so these MUST agree with the
+// per-target network id stamped by the collectors — otherwise a trap/link can't
+// resolve the device (DeviceByIP filters strictly by network_id). Unknown keys
+// fall back to the global id. Built from the startup target set (rediscovery is
+// off in the steady-state deployment).
+func buildNetIDResolver(targets []*target.Target, fallback string) func(keys ...string) string {
+	m := make(map[string]string, len(targets)*4)
+	for _, t := range targets {
+		nid := t.NetworkID(fallback)
+		for _, k := range []string{t.SourceID(), t.IP, t.MgmtIP, t.ProdIP, t.LoopbackIP, t.OOBIP} {
+			if k != "" {
+				m[k] = nid
+			}
+		}
+	}
+	return func(keys ...string) string {
+		for _, k := range keys {
+			if nid, ok := m[k]; ok {
+				return nid
+			}
+		}
+		return fallback
 	}
 }
 
@@ -646,7 +692,7 @@ func emitRegistrationPackets(
 			OrgId:        id.OrgID,
 			DatacenterId: dcID,
 			FloorId:      floorID,
-			NetworkId:    id.NetworkID,
+			NetworkId:    t.NetworkID(id.NetworkID),
 			GroupId:      id.GroupID,
 			SourceType:   "device",
 			SourceId:     t.SourceID(),
@@ -687,6 +733,7 @@ func emitRegistrationPackets(
 func emitTopologyLinks(
 	links []topology.LinkEdge,
 	id config.IdentityConfig,
+	netIDFor func(keys ...string) string,
 	signer *packet.Signer,
 	out chan<- *v1.TelemetryPacket,
 	log *zap.Logger,
@@ -735,7 +782,7 @@ func emitTopologyLinks(
 			OrgId:        id.OrgID,
 			DatacenterId: dcID,
 			FloorId:      floorID,
-			NetworkId:    id.NetworkID,
+			NetworkId:    netIDFor(e.SrcHost, e.SrcMgmtIP),
 			GroupId:      id.GroupID,
 			SourceType:   "device",
 			SourceId:     e.SrcHost,

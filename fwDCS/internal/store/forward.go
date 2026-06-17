@@ -564,10 +564,10 @@ func (db *DB) EventsSince(ctx context.Context,
 // GetForwarderCursor returns the last successfully pushed timestamp for the
 // named cursor. Returns the zero time.Time when no cursor exists yet (causes
 // the forwarder to pull all historical rows on first run).
-func (db *DB) GetForwarderCursor(ctx context.Context, name string) (time.Time, error) {
+func (db *DB) GetForwarderCursor(ctx context.Context, name, netID string) (time.Time, error) {
 	var t time.Time
 	err := db.pool.QueryRow(ctx, `
-		SELECT cursor FROM forwarder_cursors WHERE name=$1`, name,
+		SELECT cursor FROM forwarder_cursors WHERE name=$1 AND network_id=$2`, name, netID,
 	).Scan(&t)
 	if err != nil {
 		// pgx returns pgx.ErrNoRows when there's no matching row — treat as
@@ -578,15 +578,37 @@ func (db *DB) GetForwarderCursor(ctx context.Context, name string) (time.Time, e
 	return t, nil
 }
 
-// SetForwarderCursor upserts the cursor for the given name.
-func (db *DB) SetForwarderCursor(ctx context.Context, name string, t time.Time) error {
+// SetForwarderCursor upserts the cursor for the given (name, network_id). Cursors
+// are per-network so one network never advances another network's high-water mark.
+func (db *DB) SetForwarderCursor(ctx context.Context, name, netID string, t time.Time) error {
 	_, err := db.pool.Exec(ctx, `
-		INSERT INTO forwarder_cursors (name, cursor, updated_at)
-		VALUES ($1, $2, now())
-		ON CONFLICT (name) DO UPDATE
+		INSERT INTO forwarder_cursors (name, network_id, cursor, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (name, network_id) DO UPDATE
 		  SET cursor     = EXCLUDED.cursor,
 		      updated_at = now()`,
-		name, t,
+		name, netID, t,
 	)
 	return err
+}
+
+// DistinctNetworks returns every network_id present in the org's devices, so the
+// topology runner and forwarder can operate once per network (devices carry a
+// per-country network_id). Empty when no devices exist yet.
+func (db *DB) DistinctNetworks(ctx context.Context, orgID string) ([]string, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT DISTINCT network_id FROM devices WHERE org_id=$1 ORDER BY network_id`, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var nets []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		nets = append(nets, n)
+	}
+	return nets, rows.Err()
 }

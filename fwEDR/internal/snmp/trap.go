@@ -58,7 +58,7 @@ type TrapReceiver struct {
 	orgID    string
 	dcID     string
 	floorID  string
-	netID    string
+	netIDFor func(keys ...string) string // resolves the device's per-country network_id by IP
 	grpID    string
 	readerID string
 	signer   *packet.Signer
@@ -67,8 +67,14 @@ type TrapReceiver struct {
 }
 
 // NewTrapReceiver creates a TrapReceiver. out receives decoded trap packets.
+// netIDFor maps a trap's source device IP to its network_id (per-country), with a
+// global fallback — it MUST agree with the id the collectors stamp for the same
+// device, or DCS can't resolve the trap to its device row (DeviceByIP filters by
+// network_id).
 func NewTrapReceiver(
-	addr, orgID, dcID, floorID, netID, grpID, readerID string,
+	addr, orgID, dcID, floorID string,
+	netIDFor func(keys ...string) string,
+	grpID, readerID string,
 	signer *packet.Signer,
 	out chan<- *v1.TelemetryPacket,
 	log *zap.Logger,
@@ -78,7 +84,7 @@ func NewTrapReceiver(
 		orgID:    orgID,
 		dcID:     dcID,
 		floorID:  floorID,
-		netID:    netID,
+		netIDFor: netIDFor,
 		grpID:    grpID,
 		readerID: readerID,
 		signer:   signer,
@@ -168,6 +174,28 @@ func (r *TrapReceiver) handle(raw []byte, srcIP string) {
 		meta["vb."+oid] = PDUString(v)
 	}
 
+	// DEBUG: dump the full decoded trap so we can compare desktop-UI vs web-UI
+	// link breaks. The link-correlation bug (one break → events on the wrong
+	// neighbour link) hinges on which device the trap is attributed to (community)
+	// and the ifIndex/ifName varbinds. Log them raw, per trap, at info level.
+	{
+		fields := []zap.Field{
+			zap.String("trap_name", name),
+			zap.String("trap_oid", trapOID),
+			zap.String("community", community),
+			zap.String("resolved_device_ip", deviceIP),
+			zap.String("udp_src", srcIP),
+			zap.String("if_index_vb", meta["vb.1.3.6.1.2.1.2.2.1.1.1"]),
+			zap.String("if_name_vb", meta["vb.1.3.6.1.2.1.2.2.1.2.1"]),
+		}
+		var allVBs []string
+		for _, v := range decoded.Variables {
+			allVBs = append(allVBs, strings.TrimPrefix(v.Name, ".")+"="+PDUString(v))
+		}
+		fields = append(fields, zap.Strings("varbinds", allVBs))
+		r.log.Info("trap received (debug dump)", fields...)
+	}
+
 	now := time.Now().UnixNano()
 	id := packet.NewID()
 	nonce := r.signer.NextNonce()
@@ -182,7 +210,7 @@ func (r *TrapReceiver) handle(raw []byte, srcIP string) {
 		OrgId:        r.orgID,
 		DatacenterId: r.dcID,
 		FloorId:      r.floorID,
-		NetworkId:    r.netID,
+		NetworkId:    r.netIDFor(deviceIP),
 		GroupId:      r.grpID,
 		SourceType:   "device",
 		SourceId:     deviceIP,
