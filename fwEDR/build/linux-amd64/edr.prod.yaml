@@ -80,4 +80,4 @@ bacnet:
 
 log:
   level:  "info"
-  format: "json"
+  format: "console"
