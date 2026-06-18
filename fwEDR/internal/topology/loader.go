@@ -2,102 +2,13 @@
 package topology
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/faberwork/fwedr/pkg/config"
 )
-
-// TopologyInfo identifies the topology that was actually loaded. It is computed
-// from the file's own bytes, so it is independent of the simulator AND of the
-// filename: the same content always yields the same Hash, and any change (an
-// edge added, a device renamed) yields a new one.
-type TopologyInfo struct {
-	Path  string // resolved JSON file actually used
-	Name  string // file basename without extension, e.g. "dual_dc_enterprise"
-	Hash  string // first 12 hex chars of sha256(file bytes)
-	Nodes int
-	Edges int
-}
-
-// Resolve turns the configured topology_file — which may be a FILE or a
-// DIRECTORY — into the concrete JSON to load, plus a content fingerprint.
-//
-// Directory mode lets an operator switch topology without editing config:
-//   - exactly one *.json in the dir → that file is used;
-//   - several        → the most recently modified is chosen (caller logs which);
-//   - none           → error (caller falls back to SNMP discovery).
-//
-// Everything here is pure filesystem + a file read — the simulator process is
-// never contacted.
-func Resolve(pathOrDir string) (TopologyInfo, error) {
-	st, err := os.Stat(pathOrDir)
-	if err != nil {
-		return TopologyInfo{}, fmt.Errorf("topology: stat %s: %w", pathOrDir, err)
-	}
-
-	file := pathOrDir
-	if st.IsDir() {
-		file, err = newestJSON(pathOrDir)
-		if err != nil {
-			return TopologyInfo{}, err
-		}
-	}
-
-	data, err := os.ReadFile(file)
-	if err != nil {
-		return TopologyInfo{}, fmt.Errorf("topology: read %s: %w", file, err)
-	}
-	sum := sha256.Sum256(data)
-
-	var topo topoFile
-	if err := json.Unmarshal(data, &topo); err != nil {
-		return TopologyInfo{}, fmt.Errorf("topology: decode %s: %w", file, err)
-	}
-
-	base := filepath.Base(file)
-	return TopologyInfo{
-		Path:  file,
-		Name:  strings.TrimSuffix(base, filepath.Ext(base)),
-		Hash:  hex.EncodeToString(sum[:])[:12],
-		Nodes: len(topo.Nodes),
-		Edges: len(topo.Edges),
-	}, nil
-}
-
-// newestJSON returns the most recently modified *.json in dir, erroring if the
-// directory holds none.
-func newestJSON(dir string) (string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return "", fmt.Errorf("topology: read dir %s: %w", dir, err)
-	}
-	var best string
-	var bestMod time.Time
-	for _, e := range entries {
-		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".json") {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if best == "" || fi.ModTime().After(bestMod) {
-			best = filepath.Join(dir, e.Name())
-			bestMod = fi.ModTime()
-		}
-	}
-	if best == "" {
-		return "", fmt.Errorf("topology: no *.json found in directory %s", dir)
-	}
-	return best, nil
-}
 
 // gnmiCapable device types — these get gnmi:true when a topology is loaded.
 var gnmiCapable = map[string]bool{

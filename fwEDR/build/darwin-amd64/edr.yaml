@@ -21,14 +21,9 @@ publisher:
   flush_interval_ms: 200
   max_in_flight:     8
 
-# Topology source — EDR reads device IPs, datacenter, country, city, rack, room
-# etc. from a simulator topology JSON. May be a FILE or a DIRECTORY:
-#   - file: that exact JSON is used.
-#   - dir:  EDR auto-picks the topology — one *.json is used directly; if several,
-#           the most-recently-modified wins (re-export / touch the one you want).
-# EDR logs which it chose + a content fingerprint ("topology selected name=... hash=...").
-# Leave "" to skip topology and use SNMP subnet discovery instead.
-topology_file: "C:\\Users\\Faber\\Documents\\DCIM_DataReader\\Datacenter_Network_Simulator\\topologies"
+# Simulator topology file — EDR reads device IPs, datacenter, country, city,
+# rack, room etc. from this JSON. Required to populate location columns in DB.
+topology_file: "C:\\Users\\Faber\\Documents\\DCIM_DataReader\\Datacenter_Network_Simulator\\topologies\\dual_dc_enterprise.json"
 
 # Subnet discovery — only active when topology_file is "".
 discovery:

@@ -190,28 +190,8 @@ func run(cfgPath string, forceRediscover bool) error {
 	// Build targets: topology file → manual config → dynamic SNMP discovery.
 	targets := make([]*target.Target, 0)
 
-	// Resolve the configured topology_file (a FILE or a DIRECTORY) to the concrete
-	// JSON and fingerprint it from its own bytes, so we — and downstream — know
-	// exactly which topology is live without depending on the simulator. The same
-	// resolved path feeds both target loading and link emission below.
-	topoPath := ""
 	if cfg.TopologyFile != "" {
-		if ti, err := topology.Resolve(cfg.TopologyFile); err != nil {
-			log.Warn("topology resolve failed",
-				zap.String("configured", cfg.TopologyFile), zap.Error(err))
-		} else {
-			topoPath = ti.Path
-			log.Info("topology selected",
-				zap.String("name", ti.Name),
-				zap.String("hash", ti.Hash),
-				zap.Int("nodes", ti.Nodes),
-				zap.Int("edges", ti.Edges),
-				zap.String("path", ti.Path))
-		}
-	}
-
-	if topoPath != "" {
-		topoTargets, err := topology.LoadTargets(topoPath)
+		topoTargets, err := topology.LoadTargets(cfg.TopologyFile)
 		if err != nil {
 			log.Warn("topology load failed", zap.Error(err))
 		} else {
@@ -314,8 +294,8 @@ func run(cfgPath string, forceRediscover bool) error {
 	// LLDP topology tier is disabled (snmp.walk_topology:false) to avoid duplicate
 	// rows. Re-emitted on the topology interval so rows stay fresh and links to
 	// not-yet-registered devices retry.
-	if topoPath != "" {
-		if links, err := topology.LoadTopologyLinks(topoPath); err != nil {
+	if cfg.TopologyFile != "" {
+		if links, err := topology.LoadTopologyLinks(cfg.TopologyFile); err != nil {
 			log.Warn("topology links load failed", zap.Error(err))
 		} else if len(links) > 0 {
 			go func() {

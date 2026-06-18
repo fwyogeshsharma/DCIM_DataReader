@@ -15,7 +15,7 @@ type EDRConfig struct {
 	Queue        QueueConfig     `yaml:"queue"`
 	Publisher    PublisherConfig `yaml:"publisher"`
 	Discovery    DiscoveryConfig `yaml:"discovery"`
-	TopologyFile string          `yaml:"topology_file"` // topology JSON file OR a directory (auto-picks newest *.json); "" = SNMP discovery
+	TopologyFile string          `yaml:"topology_file"` // path to simulator topology JSON
 	SNMP         SNMPConfig      `yaml:"snmp"`
 	GNMI         GNMIConfig      `yaml:"gnmi"`
 	BACnet       BACnetConfig    `yaml:"bacnet"`
