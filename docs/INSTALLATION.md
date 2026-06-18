@@ -19,23 +19,21 @@ See [USAGE.md](USAGE.md) for day-to-day operation and [ARCHITECTURE.md](ARCHITEC
 
 ---
 
-## 2. Start the data stores (Docker)
+## 2. Data stores (Docker)
 
-DCS needs PostgreSQL (TimescaleDB) and Redis. They run in Docker; the apps run as native binaries.
+DCS needs PostgreSQL (TimescaleDB) and Redis. They run in Docker; the apps run as
+native binaries. Both compose files start the same two services:
 
-```bash
-docker-compose -f docker-compose.data.yml up -d
-```
-
-This starts:
 - **Postgres (TimescaleDB)** on `localhost:5438`, db/user/pass all `fwdcim`
 - **Redis** on `localhost:6379`
 
-Check they are healthy:
+There are two compose files — **use the one for your setup** (the exact command is
+in each run section below):
 
-```bash
-docker-compose -f docker-compose.data.yml ps
-```
+| File | Use | Difference |
+|---|---|---|
+| `docker-compose.yml` | **Local** | plain — stops with your session |
+| `docker-compose.data.yml` | **Production** | `restart: unless-stopped` + healthchecks so the stores survive reboots |
 
 DCS creates its own schema on first connect — no manual SQL step.
 
@@ -93,7 +91,11 @@ ready) → EDR**. Pick the matching section below.
 
 For running everything on one workstation.
 
-1. **Start data stores** (Section 2): `docker-compose -f docker-compose.data.yml up -d`
+1. **Start data stores** with the plain compose file:
+   ```bash
+   docker-compose up -d          # uses docker-compose.yml
+   docker-compose ps             # check they are running
+   ```
 2. **Use the local config** — `fwDCS/dcs.yaml` and `fwEDR/edr.yaml` already point at
    `localhost`. EDR's `dcs.endpoint` should be `localhost:9090`. Set `topology_file`
    to your topology JSON, or leave empty to use subnet discovery.
@@ -119,7 +121,12 @@ For running everything on one workstation.
 
 1. **Pull the repo** on the server and use the **prebuilt binary** for the
    platform (don't build on a small VM — see Section 3).
-2. **Start data stores** on the server: `docker-compose -f docker-compose.data.yml up -d`
+2. **Start data stores** on the server with the production compose file
+   (auto-restarts on reboot):
+   ```bash
+   docker-compose -f docker-compose.data.yml up -d
+   docker-compose -f docker-compose.data.yml ps    # check they are healthy
+   ```
 3. **Edit the prod config** before first run:
 
    **DCS — `fwDCS/dcs.prod.yaml`:**
@@ -172,7 +179,10 @@ For running everything on one workstation.
 To run a binary directly instead of via a script, point `-config` at the YAML,
 e.g. `./fwDCS/build/linux-amd64/dcs -config dcs.prod.yaml`.
 
-Stop (either setup) in reverse order: EDR → DCS → `docker-compose -f docker-compose.data.yml down`.
+**Stop** (reverse order: EDR → DCS → data stores). Use the compose file matching
+your setup:
+- Local: `docker-compose down`
+- Production: `docker-compose -f docker-compose.data.yml down`
 
 ---
 

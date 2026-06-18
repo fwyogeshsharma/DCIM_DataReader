@@ -6,9 +6,11 @@ Day-to-day operation. For first-time setup see [INSTALLATION.md](INSTALLATION.md
 
 ## Start / stop
 
-Order matters: data stores → DCS → EDR.
+Order matters: data stores → DCS → EDR. Use the `*_prod` scripts +
+`docker-compose.data.yml` in production, or the `*_local` scripts +
+`docker-compose.yml` locally.
 
-**Linux / macOS** (`.sh` scripts auto-detect OS + arch):
+**Production — Linux / macOS** (`.sh` scripts auto-detect OS + arch):
 
 ```bash
 docker-compose -f docker-compose.data.yml up -d   # Postgres + Redis
@@ -16,7 +18,7 @@ docker-compose -f docker-compose.data.yml up -d   # Postgres + Redis
 ./fwEDR/edr_prod.sh                                # EDR
 ```
 
-**Windows** (PowerShell):
+**Production — Windows** (PowerShell):
 
 ```powershell
 docker-compose -f docker-compose.data.yml up -d
@@ -24,7 +26,16 @@ docker-compose -f docker-compose.data.yml up -d
 .\fwEDR\edr_prod.ps1
 ```
 
-Stop in reverse: Ctrl-C EDR, then DCS, then `docker-compose -f docker-compose.data.yml down`.
+**Local** — same order, but use the plain compose file and `*_local` scripts:
+
+```bash
+docker-compose up -d            # docker-compose.yml
+./fwDCS/dcs_local.sh            # or .\fwDCS\dcs_local.ps1 on Windows
+./fwEDR/edr_local.sh            # or .\fwEDR\edr_local.ps1
+```
+
+Stop in reverse: Ctrl-C EDR, then DCS, then bring the data stores down with the
+matching file (`docker-compose down` locally, `docker-compose -f docker-compose.data.yml down` in prod).
 
 Health checks:
 
