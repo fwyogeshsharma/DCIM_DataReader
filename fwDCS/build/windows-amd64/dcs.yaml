@@ -17,7 +17,7 @@ tls:
 
 log:
   level:  "info"
-  format: "json"
+  format: "console"
 
 # TimescaleDB data lifecycle. Reconciled on EVERY boot (not a one-shot
 # migration): change a value, restart DCS, policies are re-applied to match.
