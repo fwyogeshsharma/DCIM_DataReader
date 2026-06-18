@@ -1,7 +1,7 @@
 # Architecture Overview — DCS & EDR
 
-A simple overview of how the collector plane fits together. For the full design
-reference (schema, internals), see [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
+A simple overview of how the collector plane fits together. See
+[INSTALLATION.md](INSTALLATION.md) to set it up and [USAGE.md](USAGE.md) to run it.
 
 ---
 
