@@ -41,8 +41,9 @@ aggregator:
   enabled:     true
   endpoint:    "https://fwdcim.faberwork.com/api/v1/ingest"
   ingest_key:  "74613fe24e4da087f46d584c6558870a3bed6b993a6416ced4df17f9a0f1e824"
-  interval_ms: 5000
-  batch_limit: 1000
+  interval_ms:      5000    # hot-table poll cadence (tables with new rows)
+  idle_interval_ms: 60000   # drained-table re-check cadence; backs off empty scans to cut idle CPU
+  batch_limit:      1000
   org_id:      "faber"
   network_id:  "net-prod"
   group_id:    "grp-core"
