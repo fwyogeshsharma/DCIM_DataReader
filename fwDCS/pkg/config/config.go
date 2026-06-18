@@ -95,6 +95,16 @@ type AggregatorConfig struct {
 	// topology) from being scanned every tick once fully forwarded, cutting
 	// idle CPU. Set <= IntervalMs to disable backoff (poll every tick).
 	IdleIntervalMs int `yaml:"idle_interval_ms"`
+
+	// EventDebounceMs is how long the forwarder coalesces an event-triggered
+	// wake before pushing (default 300 ms). EVERY event DCS writes — any trap,
+	// alarm, link state change, hostname change, or future event type, with no
+	// per-type allowlist — signals the forwarder to push immediately instead of
+	// waiting for the next IntervalMs tick, so the change reflects on the UI in
+	// ~EventDebounceMs rather than seconds. The debounce collapses a burst (e.g.
+	// a link-flap storm) into ONE forced push that bypasses idle backoff, which
+	// also bounds forced pushes to at most one per window. <= 0 → 300 ms default.
+	EventDebounceMs int `yaml:"event_debounce_ms"`
 	OrgID      string `yaml:"org_id"`
 	NetworkID  string `yaml:"network_id"`
 	GroupID    string `yaml:"group_id"`
@@ -157,6 +167,7 @@ func LoadDCS(path string) (*DCSConfig, error) {
 	cfg.Aggregator.IntervalMs = 5000
 	cfg.Aggregator.BatchLimit = 1000
 	cfg.Aggregator.IdleIntervalMs = 60000
+	cfg.Aggregator.EventDebounceMs = 300
 	cfg.Topology.RecomputeIntervalMs = 30000
 	cfg.Topology.ClassifyRoles = true // default on; YAML can set false explicitly
 	// Retention defaults tuned for a small/demo deployment: keep raw telemetry
@@ -191,6 +202,9 @@ func LoadDCS(path string) (*DCSConfig, error) {
 	}
 	if cfg.Aggregator.IdleIntervalMs <= 0 {
 		cfg.Aggregator.IdleIntervalMs = 60000
+	}
+	if cfg.Aggregator.EventDebounceMs <= 0 {
+		cfg.Aggregator.EventDebounceMs = 300
 	}
 	if cfg.Topology.RecomputeIntervalMs <= 0 {
 		cfg.Topology.RecomputeIntervalMs = 30000

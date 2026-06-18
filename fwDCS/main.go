@@ -155,11 +155,23 @@ func run(cfgPath string) error {
 		if cfg.Aggregator.Endpoint == "" || cfg.Aggregator.IngestKey == "" {
 			log.Warn("aggregator forwarder enabled but endpoint or ingest_key is empty — skipping")
 		} else {
-			fwd := forwarder.New(db, cfg.Aggregator, log)
+			// Event-driven push: the store fires this hook after every committed
+			// event (any trap/alarm/link change/rename — no per-type filter). A
+			// buffered cap-1 channel coalesces bursts: if a wake is already
+			// pending the send is dropped, so a trap storm collapses to one push.
+			eventNotify := make(chan struct{}, 1)
+			db.SetEventHook(func() {
+				select {
+				case eventNotify <- struct{}{}:
+				default: // a wake is already queued — coalesce
+				}
+			})
+			fwd := forwarder.New(db, cfg.Aggregator, log, eventNotify)
 			go fwd.Run(ctx)
 			log.Info("aggregator forwarder enabled",
 				zap.String("endpoint", cfg.Aggregator.Endpoint),
-				zap.Int("interval_ms", cfg.Aggregator.IntervalMs))
+				zap.Int("interval_ms", cfg.Aggregator.IntervalMs),
+				zap.Int("event_debounce_ms", cfg.Aggregator.EventDebounceMs))
 		}
 	}
 

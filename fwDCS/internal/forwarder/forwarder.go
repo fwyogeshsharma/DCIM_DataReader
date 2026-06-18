@@ -204,6 +204,13 @@ type Forwarder struct {
 	// lock.
 	gates        map[string]*pollGate
 	maxIdleSkips int
+
+	// notify is signalled by the store after any event row is committed. Run
+	// selects on it alongside the ticker and fires a forced push so events
+	// (traps, alarms, link changes, renames) reach the Aggregator in ~debounce
+	// instead of waiting up to a full tick. nil disables event-driven push.
+	notify   <-chan struct{}
+	debounce time.Duration
 }
 
 // pollGate tracks consecutive empty polls (misses) and how many upcoming ticks
@@ -257,8 +264,10 @@ func (f *Forwarder) recordPoll(table, netID string, found bool) {
 	g.skipLeft = skips
 }
 
-// New constructs a Forwarder. Call Run in a goroutine to start it.
-func New(db *store.DB, cfg config.AggregatorConfig, log *zap.Logger) *Forwarder {
+// New constructs a Forwarder. Call Run in a goroutine to start it. notify, when
+// non-nil, is a coalescing signal (buffered cap-1) the store fires after every
+// committed event so Run can push immediately; pass nil to run tick-only.
+func New(db *store.DB, cfg config.AggregatorConfig, log *zap.Logger, notify <-chan struct{}) *Forwarder {
 	// A push fans out many scope/chunk POSTs concurrently, every interval. Go's
 	// DEFAULT transport keeps only 2 idle conns per host, so every extra
 	// concurrent POST opened a brand-new TCP connection that was then closed —
@@ -286,6 +295,11 @@ func New(db *store.DB, cfg config.AggregatorConfig, log *zap.Logger) *Forwarder 
 		maxIdleSkips = cfg.IdleIntervalMs/interval - 1
 	}
 
+	debounce := time.Duration(cfg.EventDebounceMs) * time.Millisecond
+	if cfg.EventDebounceMs <= 0 {
+		debounce = 300 * time.Millisecond
+	}
+
 	return &Forwarder{
 		db:  db,
 		cfg: cfg,
@@ -296,6 +310,8 @@ func New(db *store.DB, cfg config.AggregatorConfig, log *zap.Logger) *Forwarder 
 		},
 		gates:        make(map[string]*pollGate),
 		maxIdleSkips: maxIdleSkips,
+		notify:       notify,
+		debounce:     debounce,
 	}
 }
 
@@ -317,7 +333,9 @@ func (f *Forwarder) Run(ctx context.Context) {
 
 	f.log.Info("aggregator forwarder started",
 		zap.String("endpoint", f.cfg.Endpoint),
-		zap.Duration("interval", interval))
+		zap.Duration("interval", interval),
+		zap.Duration("event_debounce", f.debounce),
+		zap.Bool("event_driven", f.notify != nil))
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -327,9 +345,39 @@ func (f *Forwarder) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := f.push(ctx); err != nil {
+			// Regular cadence: gated by per-table idle backoff.
+			if err := f.push(ctx, false); err != nil {
 				f.log.Warn("aggregator forwarder push failed", zap.Error(err))
 			}
+		case <-f.notify:
+			// An event landed (trap/alarm/link change/rename — any kind). Coalesce
+			// a short burst (a link-flap storm fires many at once) then force a
+			// full push so the change reflects on the UI in ~debounce, not a tick.
+			if f.debounce > 0 {
+				select {
+				case <-time.After(f.debounce):
+				case <-ctx.Done():
+					return
+				}
+			}
+			// Drain signals that piled up during the debounce window: this push
+			// reads everything pending via the cursor, so those wakes are already
+			// covered. Bounds forced pushes to at most one per debounce window.
+			f.drainNotify()
+			if err := f.push(ctx, true); err != nil {
+				f.log.Warn("aggregator forwarder event push failed", zap.Error(err))
+			}
+		}
+	}
+}
+
+// drainNotify empties any pending coalesced signals without blocking.
+func (f *Forwarder) drainNotify() {
+	for {
+		select {
+		case <-f.notify:
+		default:
+			return
 		}
 	}
 }
@@ -339,7 +387,10 @@ func (f *Forwarder) Run(ctx context.Context) {
 // per-network cursors prevent one network advancing past another's unsent rows,
 // and each payload ships under its own network_id. When no devices exist yet we
 // fall back to the configured network_id so a fresh DB still has a valid scope.
-func (f *Forwarder) push(ctx context.Context) error {
+// force=true (event-driven wake) bypasses per-table idle backoff so a fresh
+// event — and the device-row/topology change already committed before it — is
+// queried and shipped this cycle regardless of any table's backoff state.
+func (f *Forwarder) push(ctx context.Context, force bool) error {
 	nets, err := f.db.DistinctNetworks(ctx, f.cfg.OrgID)
 	if err != nil {
 		return fmt.Errorf("distinct networks: %w", err)
@@ -349,7 +400,7 @@ func (f *Forwarder) push(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, netID := range nets {
-		if err := f.pushNetwork(ctx, netID); err != nil && firstErr == nil {
+		if err := f.pushNetwork(ctx, netID, force); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -358,7 +409,7 @@ func (f *Forwarder) push(ctx context.Context) error {
 
 // pushNetwork runs one query → build payload → POST → advance cursors cycle for a
 // single network_id. Cursors are keyed per (table, network_id).
-func (f *Forwarder) pushNetwork(ctx context.Context, netID string) error {
+func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) error {
 	batchLimit := f.cfg.BatchLimit
 	if batchLimit <= 0 {
 		batchLimit = 1000
@@ -373,6 +424,10 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string) error {
 	// A table not polled this tick stays nil, so it simply contributes nothing
 	// to the payload; its cursor is untouched and unsent rows wait for the next
 	// non-skipped tick.
+	//
+	// force (event-driven wake) overrides every gate so this cycle queries all
+	// tables: the new event's device-row update and topology is_active flip were
+	// committed just before the event, so they must be pulled in the same push.
 	var (
 		changedDevices []store.FwdDevice
 		recentMetrics  []store.FwdMetric
@@ -382,7 +437,7 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string) error {
 		err            error
 	)
 
-	if f.shouldPoll("devices", netID) {
+	if force || f.shouldPoll("devices", netID) {
 		devCursor, _ := f.db.GetForwarderCursor(ctx, "devices", netID)
 		changedDevices, err = f.db.DevicesUpdatedSince(ctx,
 			f.cfg.OrgID, netID, f.cfg.GroupID, devCursor, batchLimit)
@@ -392,7 +447,7 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string) error {
 		f.recordPoll("devices", netID, len(changedDevices) > 0)
 	}
 
-	if f.shouldPoll("metrics", netID) {
+	if force || f.shouldPoll("metrics", netID) {
 		metricsCursor, _ := f.db.GetForwarderCursor(ctx, "metrics", netID)
 		recentMetrics, err = f.db.MetricsSince(ctx,
 			f.cfg.OrgID, netID, f.cfg.GroupID, metricsCursor, metricLimit)
@@ -402,7 +457,7 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string) error {
 		f.recordPoll("metrics", netID, len(recentMetrics) > 0)
 	}
 
-	if f.shouldPoll("energy", netID) {
+	if force || f.shouldPoll("energy", netID) {
 		energyCursor, _ := f.db.GetForwarderCursor(ctx, "energy", netID)
 		recentEnergy, err = f.db.EnergySince(ctx,
 			f.cfg.OrgID, netID, f.cfg.GroupID, energyCursor, metricLimit)
@@ -412,7 +467,7 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string) error {
 		f.recordPoll("energy", netID, len(recentEnergy) > 0)
 	}
 
-	if f.shouldPoll("topology", netID) {
+	if force || f.shouldPoll("topology", netID) {
 		topoCursor, _ := f.db.GetForwarderCursor(ctx, "topology", netID)
 		topoLinks, err = f.db.TopologyLinksSince(ctx,
 			f.cfg.OrgID, netID, f.cfg.GroupID, topoCursor, batchLimit)
@@ -422,7 +477,7 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string) error {
 		f.recordPoll("topology", netID, len(topoLinks) > 0)
 	}
 
-	if f.shouldPoll("events", netID) {
+	if force || f.shouldPoll("events", netID) {
 		eventsCursor, _ := f.db.GetForwarderCursor(ctx, "events", netID)
 		events, err = f.db.EventsSince(ctx,
 			f.cfg.OrgID, netID, f.cfg.GroupID, eventsCursor, batchLimit)
@@ -603,10 +658,28 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string) error {
 	}
 
 	f.log.Info("aggregator forwarder push ok",
+		zap.String("network_id", netID),
+		zap.Bool("event_triggered", force),
 		zap.Int("scopes", len(payloads)),
 		zap.Int("devices", totDev),
 		zap.Int("topology_links", totTopo),
 		zap.Int("events", totEv))
+
+	// Per-event proof: one line per event we just shipped, so the DCS side has a
+	// verifiable record (id + name + scope + ts) that each event reached the
+	// Aggregator — not just an aggregate count. Events are low-volume vs metrics,
+	// so this stays cheap.
+	for _, e := range events {
+		f.log.Info("event forwarded → aggregator",
+			zap.String("network_id", netID),
+			zap.String("event_id", e.ID),
+			zap.String("kind", e.Kind),
+			zap.String("event_name", e.EventName),
+			zap.String("severity", e.Severity),
+			zap.String("hostname", e.Hostname),
+			zap.String("collector_agent", e.CollectorAgent),
+			zap.Time("ts", e.TS))
+	}
 
 	// ── 7. Advance cursors (only when the batch was non-empty) ────────────────
 	if len(changedDevices) > 0 {

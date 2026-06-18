@@ -23,11 +23,33 @@ import (
 // DB wraps the PostgreSQL/TimescaleDB connection pool.
 type DB struct {
 	pool *pgxpool.Pool
+
+	// onEvent, when set, is called once after every event row is committed
+	// (WriteEvent and recordHostnameChange). It lets the aggregator forwarder
+	// wake and push immediately instead of waiting for its next tick. The hook
+	// must be cheap and non-blocking — it runs on the ingest worker goroutine.
+	// nil when no forwarder is wired (hook never set), so event writes are a
+	// plain no-op pass-through. Set once at startup before ingest begins, so no
+	// locking is needed.
+	onEvent func()
 }
 
 // Pool exposes the underlying connection pool for integration test harnesses
 // (e.g. cmd/linktest) that need ad-hoc read queries. Not used by the pipeline.
 func (db *DB) Pool() *pgxpool.Pool { return db.pool }
+
+// SetEventHook registers a callback fired after every committed event row. Used
+// by main to signal the aggregator forwarder for an immediate, event-driven
+// push. Pass nil to disable. Set once at startup before ingest starts.
+func (db *DB) SetEventHook(fn func()) { db.onEvent = fn }
+
+// notifyEvent fires the event hook if one is registered. Called only after a
+// successful event insert so a wake always corresponds to real, queryable data.
+func (db *DB) notifyEvent() {
+	if db.onEvent != nil {
+		db.onEvent()
+	}
+}
 
 // New creates a DB, runs schema migrations, and returns a ready store.
 func New(ctx context.Context, dsn string) (*DB, error) {
@@ -295,7 +317,9 @@ func (db *DB) recordHostnameChange(ctx context.Context, deviceID, oldName, newNa
 		deviceID, newName, mgmtIP, string(payload), agent); err != nil {
 		// No logger on DB; swallow — the rename itself already persisted.
 		_ = err
+		return
 	}
+	db.notifyEvent() // rename is an event — wake the forwarder for an immediate push
 }
 
 // collectorAgentFromReaderID infers IDR|EDR from the reader_id prefix.
@@ -660,7 +684,11 @@ func (db *DB) WriteEvent(ctx context.Context, deviceID, sourceHostname string, p
 		mapToJSON(pkt.Meta),
 		agent,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	db.notifyEvent() // any committed event wakes the forwarder for an immediate push
+	return nil
 }
 
 // LinkRow is one topology_links row resolved verbatim — its two endpoints are
