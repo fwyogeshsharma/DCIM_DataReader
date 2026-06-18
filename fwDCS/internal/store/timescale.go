@@ -204,7 +204,38 @@ func (db *DB) UpsertDevice(ctx context.Context, pkt *v1.TelemetryPacket) error {
 				rack_unit       = COALESCE($26::SMALLINT, rack_unit),
 				is_reachable    = TRUE,
 				last_seen_at    = now(),
-				updated_at      = now(),
+				-- Liveness (last_seen_at) bumps every poll, but updated_at — which the
+				-- aggregator forwarder uses as its change cursor — must move ONLY when a
+				-- tracked field actually changes. Otherwise every 15s uptime poll bumped
+				-- updated_at and the forwarder re-shipped every (unchanged) device
+				-- forever. Compare each new value (post-COALESCE, so an empty meta field
+				-- = "no change") against the current row; touch updated_at only on a diff.
+				updated_at      = CASE WHEN (
+					   hostname        IS DISTINCT FROM $7
+					OR device_type     IS DISTINCT FROM $8
+					OR vendor          IS DISTINCT FROM COALESCE(NULLIF($9,''),  vendor)
+					OR model_name      IS DISTINCT FROM COALESCE(NULLIF($10,''), model_name)
+					OR os_name         IS DISTINCT FROM COALESCE(NULLIF($11,''), os_name)
+					OR os_version      IS DISTINCT FROM COALESCE(NULLIF($12,''), os_version)
+					OR sys_description IS DISTINCT FROM COALESCE(NULLIF($13,''), sys_description)
+					OR prod_ip         IS DISTINCT FROM COALESCE(NULLIF($14,'')::INET, prod_ip)
+					OR loopback_ip     IS DISTINCT FROM COALESCE(NULLIF($15,'')::INET, loopback_ip)
+					OR oob_ip          IS DISTINCT FROM COALESCE(NULLIF($16,'')::INET, oob_ip)
+					OR snmp_enabled    IS DISTINCT FROM ($17 OR snmp_enabled)
+					OR gnmi_enabled    IS DISTINCT FROM ($18 OR gnmi_enabled)
+					OR collector_agent IS DISTINCT FROM $19
+					OR country         IS DISTINCT FROM COALESCE(NULLIF($20,''), country)
+					OR datacenter_city IS DISTINCT FROM COALESCE(NULLIF($21,''), datacenter_city)
+					OR datacenter      IS DISTINCT FROM COALESCE(NULLIF($22,''), datacenter)
+					OR room            IS DISTINCT FROM COALESCE(NULLIF($23,''), room)
+					OR rack_row        IS DISTINCT FROM COALESCE($24::SMALLINT, rack_row)
+					OR rack_num        IS DISTINCT FROM COALESCE($25::SMALLINT, rack_num)
+					OR rack_unit       IS DISTINCT FROM COALESCE($26::SMALLINT, rack_unit)
+					OR datacenter_id   IS DISTINCT FROM COALESCE(NULLIF($2,''), datacenter_id)
+					OR floor_id        IS DISTINCT FROM COALESCE(NULLIF($3,''), floor_id)
+					OR network_id      IS DISTINCT FROM COALESCE(NULLIF($4,''), network_id)
+					OR group_id        IS DISTINCT FROM COALESCE(NULLIF($5,''), group_id)
+				) THEN now() ELSE updated_at END,
 				datacenter_id   = COALESCE(NULLIF($2,''), datacenter_id),
 				floor_id        = COALESCE(NULLIF($3,''), floor_id),
 				network_id      = COALESCE(NULLIF($4,''), network_id),
@@ -251,7 +282,28 @@ func (db *DB) UpsertDevice(ctx context.Context, pkt *v1.TelemetryPacket) error {
 		ON CONFLICT (org_id, datacenter_id, floor_id, network_id, group_id, hostname)
 		DO UPDATE SET
 			last_seen_at    = now(),
-			updated_at      = now(),
+			updated_at      = CASE WHEN (
+				   devices.device_type     IS DISTINCT FROM EXCLUDED.device_type
+				OR devices.os_name         IS DISTINCT FROM COALESCE(NULLIF(EXCLUDED.os_name,''),         devices.os_name)
+				OR devices.os_version      IS DISTINCT FROM COALESCE(NULLIF(EXCLUDED.os_version,''),      devices.os_version)
+				OR devices.sys_description IS DISTINCT FROM COALESCE(NULLIF(EXCLUDED.sys_description,''), devices.sys_description)
+				OR devices.model_name      IS DISTINCT FROM COALESCE(NULLIF(EXCLUDED.model_name,''),      devices.model_name)
+				OR devices.vendor          IS DISTINCT FROM COALESCE(NULLIF(EXCLUDED.vendor,''),          devices.vendor)
+				OR devices.mgmt_ip         IS DISTINCT FROM COALESCE(EXCLUDED.mgmt_ip,     devices.mgmt_ip)
+				OR devices.prod_ip         IS DISTINCT FROM COALESCE(EXCLUDED.prod_ip,     devices.prod_ip)
+				OR devices.loopback_ip     IS DISTINCT FROM COALESCE(EXCLUDED.loopback_ip, devices.loopback_ip)
+				OR devices.oob_ip          IS DISTINCT FROM COALESCE(EXCLUDED.oob_ip,      devices.oob_ip)
+				OR devices.country         IS DISTINCT FROM COALESCE(EXCLUDED.country,         devices.country)
+				OR devices.datacenter_city IS DISTINCT FROM COALESCE(EXCLUDED.datacenter_city, devices.datacenter_city)
+				OR devices.datacenter      IS DISTINCT FROM COALESCE(EXCLUDED.datacenter,      devices.datacenter)
+				OR devices.room            IS DISTINCT FROM COALESCE(EXCLUDED.room,            devices.room)
+				OR devices.rack_row        IS DISTINCT FROM COALESCE(EXCLUDED.rack_row,  devices.rack_row)
+				OR devices.rack_num        IS DISTINCT FROM COALESCE(EXCLUDED.rack_num,  devices.rack_num)
+				OR devices.rack_unit       IS DISTINCT FROM COALESCE(EXCLUDED.rack_unit, devices.rack_unit)
+				OR devices.collector_agent IS DISTINCT FROM EXCLUDED.collector_agent
+				OR devices.snmp_enabled    IS DISTINCT FROM (EXCLUDED.snmp_enabled OR devices.snmp_enabled)
+				OR devices.gnmi_enabled    IS DISTINCT FROM (EXCLUDED.gnmi_enabled OR devices.gnmi_enabled)
+			) THEN now() ELSE devices.updated_at END,
 			os_name         = COALESCE(NULLIF(EXCLUDED.os_name, ''),         devices.os_name),
 			os_version      = COALESCE(NULLIF(EXCLUDED.os_version, ''),      devices.os_version),
 			sys_description = COALESCE(NULLIF(EXCLUDED.sys_description, ''), devices.sys_description),
@@ -882,7 +934,18 @@ func (db *DB) UpsertLinks(ctx context.Context, links []TopologyLink) error {
 				-- is_active is owned by the link-state machine (linkDown/linkUp traps,
 				-- LinkStateChange) — NEVER reset it here, or a periodic topology
 				-- re-emit would silently flip a broken link back to UP.
-				updated_at        = now()`,
+				--
+				-- updated_at is the forwarder's change cursor: bump it ONLY when a link
+				-- field actually changes, so EDR's periodic re-emit of the (static)
+				-- topology no longer re-ships every unchanged link to the aggregator.
+				updated_at        = CASE WHEN (
+					   topology_links.dst_port_name    IS DISTINCT FROM EXCLUDED.dst_port_name
+					OR topology_links.src_interface_id IS DISTINCT FROM COALESCE(EXCLUDED.src_interface_id, topology_links.src_interface_id)
+					OR topology_links.dst_interface_id IS DISTINCT FROM COALESCE(EXCLUDED.dst_interface_id, topology_links.dst_interface_id)
+					OR topology_links.link_speed_mbps  IS DISTINCT FROM COALESCE(EXCLUDED.link_speed_mbps,  topology_links.link_speed_mbps)
+					OR topology_links.link_type        IS DISTINCT FROM COALESCE(EXCLUDED.link_type,        topology_links.link_type)
+					OR topology_links.protocol         IS DISTINCT FROM EXCLUDED.protocol
+				) THEN now() ELSE topology_links.updated_at END`,
 			l.Layer, l.SrcDeviceID, l.SrcPortName, l.DstDeviceID, l.DstPortName,
 			nilIfEmpty(l.SrcInterfaceID), nilIfEmpty(l.DstInterfaceID),
 			l.LinkSpeedMbps, nilIfEmpty(l.LinkType),

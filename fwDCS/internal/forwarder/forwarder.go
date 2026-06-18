@@ -657,13 +657,30 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 		return firstErr
 	}
 
-	f.log.Info("aggregator forwarder push ok",
+	// Distinguish a real change from a routine metric/energy flush. After the
+	// updated_at fix, changedDevices/topoLinks/events are non-empty only when
+	// something genuinely changed; the device count in a push otherwise just
+	// reflects devices hydrated to carry their periodic metrics. Log real changes
+	// at Info (so the log is a clean changelog) and routine telemetry flushes at
+	// Debug (so steady state is quiet).
+	trigger := "tick"
+	if force {
+		trigger = "event"
+	}
+	fields := []zap.Field{
 		zap.String("network_id", netID),
-		zap.Bool("event_triggered", force),
+		zap.String("trigger", trigger),
 		zap.Int("scopes", len(payloads)),
-		zap.Int("devices", totDev),
+		zap.Int("changed_devices", len(changedDevices)),
+		zap.Int("forwarded_devices", totDev), // incl. devices hydrated to carry metrics
 		zap.Int("topology_links", totTopo),
-		zap.Int("events", totEv))
+		zap.Int("events", totEv),
+	}
+	if force || len(changedDevices) > 0 || totTopo > 0 || totEv > 0 {
+		f.log.Info("aggregator forwarder push ok", fields...)
+	} else {
+		f.log.Debug("aggregator forwarder push ok (telemetry only)", fields...)
+	}
 
 	// Per-event proof: one line per event we just shipped, so the DCS side has a
 	// verifiable record (id + name + scope + ts) that each event reached the

@@ -310,10 +310,30 @@ func run(cfgPath string, forceRediscover bool) error {
 				if topoIv <= 0 {
 					topoIv = 10 * time.Minute
 				}
-				for {
-					n := emitTopologyLinks(links, cfg.Identity, netIDFor, signer, pktCh, log)
-					log.Info("topology links emitted from JSON",
-						zap.Int("emitted", n), zap.Int("total", len(links)))
+				// The JSON link set is static for a run, so re-emitting all of it every
+				// interval is pure waste (DCS now ignores unchanged links). But we DO
+				// need a few early re-emits so links whose endpoint device registered
+				// late still resolve, plus a sparse re-assert to heal a DCS restart.
+				// warmupCycles: re-emit each interval at first (catch late registrations).
+				// reassertEvery: afterwards, re-emit only every Nth interval.
+				const warmupCycles = 3
+				const reassertEvery = 12
+				for cycle := 0; ; cycle++ {
+					emit := cycle < warmupCycles || cycle%reassertEvery == 0
+					if emit {
+						reason := "warmup"
+						switch {
+						case cycle == 0:
+							reason = "initial"
+						case cycle >= warmupCycles:
+							reason = "reassert"
+						}
+						n := emitTopologyLinks(links, cfg.Identity, netIDFor, signer, pktCh, log)
+						log.Info("topology links emitted from JSON",
+							zap.Int("emitted", n), zap.Int("total", len(links)), zap.String("reason", reason))
+					} else {
+						log.Debug("topology links unchanged — skip re-emit", zap.Int("total", len(links)))
+					}
 					select {
 					case <-ctx.Done():
 						return
