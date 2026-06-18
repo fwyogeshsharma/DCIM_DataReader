@@ -86,6 +86,15 @@ type AggregatorConfig struct {
 	IngestKey  string `yaml:"ingest_key"`  // X-Ingest-Key header value
 	IntervalMs int    `yaml:"interval_ms"` // push cadence (default 5000 ms)
 	BatchLimit int    `yaml:"batch_limit"` // max rows per cursor per push (default 1000)
+
+	// IdleIntervalMs caps how rarely a *drained* table is re-polled. After a
+	// table returns zero rows the forwarder backs off, skipping that table's
+	// query for a growing number of ticks until it is only checked once per
+	// IdleIntervalMs (default 60000 ms). The first non-empty poll snaps it back
+	// to the full IntervalMs cadence. This stops fixed tables (devices,
+	// topology) from being scanned every tick once fully forwarded, cutting
+	// idle CPU. Set <= IntervalMs to disable backoff (poll every tick).
+	IdleIntervalMs int `yaml:"idle_interval_ms"`
 	OrgID      string `yaml:"org_id"`
 	NetworkID  string `yaml:"network_id"`
 	GroupID    string `yaml:"group_id"`
@@ -147,6 +156,7 @@ func LoadDCS(path string) (*DCSConfig, error) {
 	cfg.Ingest.CacheTTLSeconds = 60
 	cfg.Aggregator.IntervalMs = 5000
 	cfg.Aggregator.BatchLimit = 1000
+	cfg.Aggregator.IdleIntervalMs = 60000
 	cfg.Topology.RecomputeIntervalMs = 30000
 	cfg.Topology.ClassifyRoles = true // default on; YAML can set false explicitly
 	// Retention defaults tuned for a small/demo deployment: keep raw telemetry
@@ -178,6 +188,9 @@ func LoadDCS(path string) (*DCSConfig, error) {
 	}
 	if cfg.Aggregator.BatchLimit <= 0 {
 		cfg.Aggregator.BatchLimit = 1000
+	}
+	if cfg.Aggregator.IdleIntervalMs <= 0 {
+		cfg.Aggregator.IdleIntervalMs = 60000
 	}
 	if cfg.Topology.RecomputeIntervalMs <= 0 {
 		cfg.Topology.RecomputeIntervalMs = 30000

@@ -193,6 +193,68 @@ type Forwarder struct {
 	cfg    config.AggregatorConfig
 	log    *zap.Logger
 	client *http.Client
+
+	// Per-table adaptive backoff. Once a table is fully forwarded its query
+	// returns zero rows every tick — pure wasted DB scans + CPU. We skip a
+	// drained table's query for a growing number of ticks (capped at
+	// maxIdleSkips) so fixed tables (devices, topology) settle to one check per
+	// idle_interval_ms instead of every tick. The first non-empty poll resets
+	// the table to the full per-tick cadence. push() runs single-threaded on
+	// the ticker goroutine and walks networks sequentially, so gates needs no
+	// lock.
+	gates        map[string]*pollGate
+	maxIdleSkips int
+}
+
+// pollGate tracks consecutive empty polls (misses) and how many upcoming ticks
+// to skip (skipLeft) for one (table, network) pair.
+type pollGate struct {
+	misses   int
+	skipLeft int
+}
+
+// shouldPoll reports whether this tick should query the given table for netID.
+// When a gate is backing off it consumes one skip and returns false.
+func (f *Forwarder) shouldPoll(table, netID string) bool {
+	if f.maxIdleSkips <= 0 {
+		return true // backoff disabled
+	}
+	key := table + "|" + netID
+	g := f.gates[key]
+	if g == nil {
+		g = &pollGate{}
+		f.gates[key] = g
+	}
+	if g.skipLeft > 0 {
+		g.skipLeft--
+		return false
+	}
+	return true
+}
+
+// recordPoll updates a table's backoff after a real query. A non-empty result
+// snaps it back to per-tick; an empty result grows the skip window up to
+// maxIdleSkips ticks.
+func (f *Forwarder) recordPoll(table, netID string, found bool) {
+	if f.maxIdleSkips <= 0 {
+		return
+	}
+	g := f.gates[table+"|"+netID]
+	if g == nil {
+		g = &pollGate{}
+		f.gates[table+"|"+netID] = g
+	}
+	if found {
+		g.misses = 0
+		g.skipLeft = 0
+		return
+	}
+	g.misses++
+	skips := g.misses
+	if skips > f.maxIdleSkips {
+		skips = f.maxIdleSkips
+	}
+	g.skipLeft = skips
 }
 
 // New constructs a Forwarder. Call Run in a goroutine to start it.
@@ -210,6 +272,20 @@ func New(db *store.DB, cfg config.AggregatorConfig, log *zap.Logger) *Forwarder 
 	tr.MaxConnsPerHost = 64 // cap total conns to one host → bounds socket use
 	tr.IdleConnTimeout = 90 * time.Second
 	tr.ForceAttemptHTTP2 = true
+
+	// Translate idle_interval_ms into a tick-skip cap: a drained table is
+	// re-checked at most once per idle window. e.g. 60000ms idle / 5000ms tick
+	// = skip up to 11 ticks → poll every 12th (~60s). Guard against a zero/short
+	// interval so we never divide by zero (interval is re-defaulted in Run).
+	interval := cfg.IntervalMs
+	if interval <= 0 {
+		interval = 5000
+	}
+	maxIdleSkips := 0
+	if cfg.IdleIntervalMs > interval {
+		maxIdleSkips = cfg.IdleIntervalMs/interval - 1
+	}
+
 	return &Forwarder{
 		db:  db,
 		cfg: cfg,
@@ -218,6 +294,8 @@ func New(db *store.DB, cfg config.AggregatorConfig, log *zap.Logger) *Forwarder 
 			Timeout:   30 * time.Second,
 			Transport: tr,
 		},
+		gates:        make(map[string]*pollGate),
+		maxIdleSkips: maxIdleSkips,
 	}
 }
 
@@ -287,47 +365,71 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string) error {
 	}
 	metricLimit := batchLimit * 50 // metrics volume >> device volume
 
-	// ── 1. Load cursors (per network) ────────────────────────────────────────
-	devCursor, _ := f.db.GetForwarderCursor(ctx, "devices", netID)
-	metricsCursor, _ := f.db.GetForwarderCursor(ctx, "metrics", netID)
-	energyCursor, _ := f.db.GetForwarderCursor(ctx, "energy", netID)
-	topoCursor, _ := f.db.GetForwarderCursor(ctx, "topology", netID)
-	eventsCursor, _ := f.db.GetForwarderCursor(ctx, "events", netID)
+	// ── 1+2. Query each table, gated by per-table adaptive backoff ────────────
+	// A drained table (zero rows) is skipped for a growing number of ticks
+	// (recordPoll), so fully-forwarded fixed tables (devices, topology) stop
+	// being scanned every tick. We only load a table's cursor when we are
+	// actually going to query it — skipping a table costs zero DB round-trips.
+	// A table not polled this tick stays nil, so it simply contributes nothing
+	// to the payload; its cursor is untouched and unsent rows wait for the next
+	// non-skipped tick.
+	var (
+		changedDevices []store.FwdDevice
+		recentMetrics  []store.FwdMetric
+		recentEnergy   []store.FwdEnergy
+		topoLinks      []store.FwdTopologyLink
+		events         []store.FwdEvent
+		err            error
+	)
 
-	// ── 2. Query data ─────────────────────────────────────────────────────────
-	changedDevices, err := f.db.DevicesUpdatedSince(ctx,
-		f.cfg.OrgID, netID, f.cfg.GroupID,
-		devCursor, batchLimit)
-	if err != nil {
-		return fmt.Errorf("devices query: %w", err)
+	if f.shouldPoll("devices", netID) {
+		devCursor, _ := f.db.GetForwarderCursor(ctx, "devices", netID)
+		changedDevices, err = f.db.DevicesUpdatedSince(ctx,
+			f.cfg.OrgID, netID, f.cfg.GroupID, devCursor, batchLimit)
+		if err != nil {
+			return fmt.Errorf("devices query: %w", err)
+		}
+		f.recordPoll("devices", netID, len(changedDevices) > 0)
 	}
 
-	recentMetrics, err := f.db.MetricsSince(ctx,
-		f.cfg.OrgID, netID, f.cfg.GroupID,
-		metricsCursor, metricLimit)
-	if err != nil {
-		return fmt.Errorf("metrics query: %w", err)
+	if f.shouldPoll("metrics", netID) {
+		metricsCursor, _ := f.db.GetForwarderCursor(ctx, "metrics", netID)
+		recentMetrics, err = f.db.MetricsSince(ctx,
+			f.cfg.OrgID, netID, f.cfg.GroupID, metricsCursor, metricLimit)
+		if err != nil {
+			return fmt.Errorf("metrics query: %w", err)
+		}
+		f.recordPoll("metrics", netID, len(recentMetrics) > 0)
 	}
 
-	recentEnergy, err := f.db.EnergySince(ctx,
-		f.cfg.OrgID, netID, f.cfg.GroupID,
-		energyCursor, metricLimit)
-	if err != nil {
-		return fmt.Errorf("energy query: %w", err)
+	if f.shouldPoll("energy", netID) {
+		energyCursor, _ := f.db.GetForwarderCursor(ctx, "energy", netID)
+		recentEnergy, err = f.db.EnergySince(ctx,
+			f.cfg.OrgID, netID, f.cfg.GroupID, energyCursor, metricLimit)
+		if err != nil {
+			return fmt.Errorf("energy query: %w", err)
+		}
+		f.recordPoll("energy", netID, len(recentEnergy) > 0)
 	}
 
-	topoLinks, err := f.db.TopologyLinksSince(ctx,
-		f.cfg.OrgID, netID, f.cfg.GroupID,
-		topoCursor, batchLimit)
-	if err != nil {
-		return fmt.Errorf("topology query: %w", err)
+	if f.shouldPoll("topology", netID) {
+		topoCursor, _ := f.db.GetForwarderCursor(ctx, "topology", netID)
+		topoLinks, err = f.db.TopologyLinksSince(ctx,
+			f.cfg.OrgID, netID, f.cfg.GroupID, topoCursor, batchLimit)
+		if err != nil {
+			return fmt.Errorf("topology query: %w", err)
+		}
+		f.recordPoll("topology", netID, len(topoLinks) > 0)
 	}
 
-	events, err := f.db.EventsSince(ctx,
-		f.cfg.OrgID, netID, f.cfg.GroupID,
-		eventsCursor, batchLimit)
-	if err != nil {
-		return fmt.Errorf("events query: %w", err)
+	if f.shouldPoll("events", netID) {
+		eventsCursor, _ := f.db.GetForwarderCursor(ctx, "events", netID)
+		events, err = f.db.EventsSince(ctx,
+			f.cfg.OrgID, netID, f.cfg.GroupID, eventsCursor, batchLimit)
+		if err != nil {
+			return fmt.Errorf("events query: %w", err)
+		}
+		f.recordPoll("events", netID, len(events) > 0)
 	}
 
 	// ── 3. Group metrics by device_id; hydrate extra devices ─────────────────
