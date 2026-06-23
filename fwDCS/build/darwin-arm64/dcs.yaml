@@ -3,6 +3,7 @@ grpc:
 
 rest:
   addr: ":8080"
+  command_key: "fw-control-7b1c9e2a4d"   # EDR sends this as X-Command-Key to pull/ack device commands
 
 postgres:
   dsn: "postgresql://fwdcim:fwdcim@127.0.0.1:5438/fwdcim?sslmode=disable"

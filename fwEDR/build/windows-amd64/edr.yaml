@@ -103,13 +103,35 @@ bacnet:
 # health (walk_server_health is off above). Power on/off events still arrive via traps.
 redfish:
   enabled:          true
-  port:             443
+  port:             8443
   username:         "admin"
   password:         "password"
   poll_interval_ms: 30000
   timeout_ms:       5000
   max_concurrent:   4
   tls_insecure:     false   # simulator serves plain HTTP; set true for HTTPS BMCs
+
+# Downstream control plane — apply UI edits down to devices. EDR pulls pending
+# commands from the DCS admin REST API and writes them via SNMP SET (identity/
+# asset/location/threshold fields) or Redfish (power). Read-only telemetry above
+# is unaffected. Off by default; enabled here for the simulator.
+command_apply:
+  enabled:          true
+  dcs_base_url:     "http://localhost:8080"   # DCS rest.addr (NOT :9090 gRPC)
+  command_key:      "fw-control-7b1c9e2a4d"   # must match dcs.yaml rest.command_key
+  poll_interval_ms: 30000
+  snmp_set_agent:   "127.0.0.1"               # sim mgmt agent host; "" = device IP (real devices)
+  snmp_set_port:    1161                       # sim SET agent; 161 for real devices
+  snmp_set_community: ""                       # "" = use device IP as community (sim convention)
+
+# Threshold sync — fetch per-device alert thresholds (99999.3.x) up into DCS
+# device_thresholds via SNMP GET on the management plane (1161). Slow cadence.
+threshold_sync:
+  enabled:          true
+  agent:            "127.0.0.1"               # sim mgmt agent host; "" = device IP
+  port:             1161
+  community:        ""                         # "" = use device IP as community
+  poll_interval_ms: 300000                     # 5 min — thresholds rarely change
 
 log:
   level:  "info"
