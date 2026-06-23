@@ -104,10 +104,10 @@ type AggregatorConfig struct {
 	// ~EventDebounceMs rather than seconds. The debounce collapses a burst (e.g.
 	// a link-flap storm) into ONE forced push that bypasses idle backoff, which
 	// also bounds forced pushes to at most one per window. <= 0 → 300 ms default.
-	EventDebounceMs int `yaml:"event_debounce_ms"`
-	OrgID      string `yaml:"org_id"`
-	NetworkID  string `yaml:"network_id"`
-	GroupID    string `yaml:"group_id"`
+	EventDebounceMs int    `yaml:"event_debounce_ms"`
+	OrgID           string `yaml:"org_id"`
+	NetworkID       string `yaml:"network_id"`
+	GroupID         string `yaml:"group_id"`
 
 	// Fallback scope keys used when a device/event row carries an empty
 	// datacenter_id or floor_id. The Aggregator rejects payloads with empty
@@ -127,6 +127,9 @@ type GRPCServerConfig struct {
 
 type RESTServerConfig struct {
 	Addr string `yaml:"addr"` // e.g. ":8080"
+	// CommandKey guards the downstream-control endpoints (/admin/commands*) that
+	// EDR polls. EDR must send it as X-Command-Key. Empty = no auth (dev only).
+	CommandKey string `yaml:"command_key"`
 }
 
 type PostgresConfig struct {

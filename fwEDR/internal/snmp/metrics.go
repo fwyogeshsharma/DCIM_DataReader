@@ -864,6 +864,7 @@ func (c *Collector) newMetric(name, tag string, value float64, meta map[string]s
 }
 
 func (c *Collector) hostMeta() map[string]string {
+	a := c.target.Asset()
 	m := map[string]string{
 		// Network identity
 		"hostname":    c.target.SourceID(),
@@ -874,26 +875,27 @@ func (c *Collector) hostMeta() map[string]string {
 		// Device identity
 		"device_type": c.target.DeviceType,
 		"vendor":      c.target.Vendor,
-		"model_name":  c.target.ModelName,
-		// Physical location (populated from topology JSON; empty in discovery mode)
-		"country":         c.target.Country,
-		"datacenter":      c.target.DatacenterName,
-		"datacenter_city": c.target.DatacenterCity,
-		"room":            c.target.Room,
+		"model_name":  a.ModelName,
+		// Physical location (seeded from topology JSON; updated in place after a
+		// UI edit is applied so the change reflects on the next push)
+		"country":         a.Country,
+		"datacenter":      a.DatacenterName,
+		"datacenter_city": a.DatacenterCity,
+		"room":            a.Room,
 		// Collector provenance
 		"collector_agent":    "EDR",
 		"collector_protocol": "SNMP",
 		"snmp_enabled":       "true",
 		"gnmi_enabled":       strconv.FormatBool(c.target.Has(target.CapGNMI)),
 	}
-	if c.target.RackRow > 0 {
-		m["rack_row"] = strconv.Itoa(c.target.RackRow)
+	if a.RackRow > 0 {
+		m["rack_row"] = strconv.Itoa(a.RackRow)
 	}
-	if c.target.RackNum > 0 {
-		m["rack_num"] = strconv.Itoa(c.target.RackNum)
+	if a.RackNum > 0 {
+		m["rack_num"] = strconv.Itoa(a.RackNum)
 	}
-	if c.target.RackUnit > 0 {
-		m["rack_unit"] = strconv.Itoa(c.target.RackUnit)
+	if a.RackUnit > 0 {
+		m["rack_unit"] = strconv.Itoa(a.RackUnit)
 	}
 	for k, v := range c.target.Labels {
 		m[k] = v

@@ -2,6 +2,8 @@
 package target
 
 import (
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/faberwork/fwedr/pkg/config"
@@ -157,4 +159,72 @@ func (t *Target) SetHostname(name string) {
 	t.hostMu.Lock()
 	t.Hostname = name
 	t.hostMu.Unlock()
+}
+
+// AssetSnapshot is a consistent (locked) read of the mutable location/asset
+// fields. Builders use it so a concurrent PatchAsset never tears a read.
+type AssetSnapshot struct {
+	ModelName      string
+	Country        string
+	DatacenterName string
+	DatacenterCity string
+	Room           string
+	RackRow        int
+	RackNum        int
+	RackUnit       int
+}
+
+// Asset returns a locked snapshot of the asset/location fields.
+func (t *Target) Asset() AssetSnapshot {
+	t.hostMu.RLock()
+	defer t.hostMu.RUnlock()
+	return AssetSnapshot{
+		ModelName:      t.ModelName,
+		Country:        t.Country,
+		DatacenterName: t.DatacenterName,
+		DatacenterCity: t.DatacenterCity,
+		Room:           t.Room,
+		RackRow:        t.RackRow,
+		RackNum:        t.RackNum,
+		RackUnit:       t.RackUnit,
+	}
+}
+
+// PatchAsset updates one mutable asset/location field after a UI edit was
+// applied to the device, so the next telemetry push reflects the new value.
+// (These fields are seeded from the topology JSON; EDR doesn't re-read them from
+// the device, so we update our own copy to the value we just wrote.) Returns
+// true if the field is a known asset field. Thread-safe.
+func (t *Target) PatchAsset(field, value string) bool {
+	t.hostMu.Lock()
+	defer t.hostMu.Unlock()
+	switch strings.ToLower(strings.TrimSpace(field)) {
+	case "country":
+		t.Country = value
+	case "datacenter":
+		t.DatacenterName = value
+	case "datacenter_city", "city":
+		t.DatacenterCity = value
+	case "room":
+		t.Room = value
+	case "floor":
+		t.Floor = value
+	case "model", "model_name":
+		t.ModelName = value
+	case "rack_row":
+		if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			t.RackRow = n
+		}
+	case "rack_num":
+		if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			t.RackNum = n
+		}
+	case "rack_unit":
+		if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			t.RackUnit = n
+		}
+	default:
+		return false
+	}
+	return true
 }

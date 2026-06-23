@@ -10,18 +10,55 @@ import (
 
 // EDRConfig is the full configuration for the External Data Reader.
 type EDRConfig struct {
-	Identity     IdentityConfig  `yaml:"identity"`
-	DCS          DCSClientConfig `yaml:"dcs"`
-	Queue        QueueConfig     `yaml:"queue"`
-	Publisher    PublisherConfig `yaml:"publisher"`
-	Discovery    DiscoveryConfig `yaml:"discovery"`
-	TopologyFile string          `yaml:"topology_file"` // path to simulator topology JSON
-	SNMP         SNMPConfig      `yaml:"snmp"`
-	GNMI         GNMIConfig      `yaml:"gnmi"`
-	BACnet       BACnetConfig    `yaml:"bacnet"`
-	Redfish      RedfishConfig   `yaml:"redfish"`
-	Targets      []TargetConfig  `yaml:"targets"`
-	Log          LogConfig       `yaml:"log"`
+	Identity      IdentityConfig      `yaml:"identity"`
+	DCS           DCSClientConfig     `yaml:"dcs"`
+	Queue         QueueConfig         `yaml:"queue"`
+	Publisher     PublisherConfig     `yaml:"publisher"`
+	Discovery     DiscoveryConfig     `yaml:"discovery"`
+	TopologyFile  string              `yaml:"topology_file"` // path to simulator topology JSON
+	SNMP          SNMPConfig          `yaml:"snmp"`
+	GNMI          GNMIConfig          `yaml:"gnmi"`
+	BACnet        BACnetConfig        `yaml:"bacnet"`
+	Redfish       RedfishConfig       `yaml:"redfish"`
+	CommandApply  CommandApplyConfig  `yaml:"command_apply"`
+	ThresholdSync ThresholdSyncConfig `yaml:"threshold_sync"`
+	Targets       []TargetConfig      `yaml:"targets"`
+	Log           LogConfig           `yaml:"log"`
+}
+
+// ThresholdSyncConfig drives the per-device alert-threshold fetch. EDR GETs the
+// threshold OIDs (enterprise 1.3.6.1.4.1.99999.3.x) on the SNMP management plane
+// (UDP 1161 in the simulator) and emits them as kind="threshold" packets that
+// DCS stores in device_thresholds. Read-only; disabled by default.
+type ThresholdSyncConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	PollIntervalMs int    `yaml:"poll_interval_ms"` // default 300000 (5 min — thresholds rarely change)
+	Agent          string `yaml:"agent"`            // host the mgmt agent listens on; "" = use the target IP
+	Port           int    `yaml:"port"`             // default 1161
+	Community      string `yaml:"community"`        // "" = use the device IP as community (simulator convention)
+	TimeoutMs      int    `yaml:"timeout_ms"`       // default 2000
+	Retries        int    `yaml:"retries"`          // default 1
+}
+
+// CommandApplyConfig drives the downstream control plane: EDR pulls pending
+// device edits from the DCS admin REST API and applies them to the device via
+// SNMP SET (identity/asset/location fields) or Redfish (power). Disabled by
+// default — purely additive to the existing read-only polling.
+type CommandApplyConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	DCSBaseURL     string `yaml:"dcs_base_url"`     // e.g. http://dcs-host:8080 (the admin REST addr, NOT the gRPC endpoint)
+	CommandKey     string `yaml:"command_key"`      // sent as X-Command-Key; must match DCS rest.command_key
+	PollIntervalMs int    `yaml:"poll_interval_ms"` // how often to pull (default 30000)
+	BatchLimit     int    `yaml:"batch_limit"`      // max commands per pull (default 100)
+
+	// SNMP SET plane. In the simulator the SET agent listens on UDP 1161 on the
+	// agent host with community = the device's mgmt IP. In production point these
+	// at the real devices (port 161, real community).
+	SNMPSetAgent     string `yaml:"snmp_set_agent"`     // host the SET agent listens on; "" = use the device IP directly
+	SNMPSetPort      int    `yaml:"snmp_set_port"`      // default 1161
+	SNMPSetCommunity string `yaml:"snmp_set_community"` // "" = use the device IP as community (simulator convention)
+	SNMPTimeoutMs    int    `yaml:"snmp_timeout_ms"`    // default 2000
+	SNMPRetries      int    `yaml:"snmp_retries"`       // default 1
 }
 
 // ─── sub-structs ────────────────────────────────────────────────────────────
@@ -358,6 +395,35 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	cfg.Redfish.MaxConcurrent = 4
 	if err := loadYAML(path, cfg); err != nil {
 		return nil, err
+	}
+	// Command-apply defaults (downstream control plane; disabled unless enabled).
+	if cfg.CommandApply.PollIntervalMs <= 0 {
+		cfg.CommandApply.PollIntervalMs = 30000
+	}
+	if cfg.CommandApply.BatchLimit <= 0 {
+		cfg.CommandApply.BatchLimit = 100
+	}
+	if cfg.CommandApply.SNMPSetPort <= 0 {
+		cfg.CommandApply.SNMPSetPort = 1161
+	}
+	if cfg.CommandApply.SNMPTimeoutMs <= 0 {
+		cfg.CommandApply.SNMPTimeoutMs = 2000
+	}
+	if cfg.CommandApply.SNMPRetries <= 0 {
+		cfg.CommandApply.SNMPRetries = 1
+	}
+	// Threshold-sync defaults (read-only mgmt-plane fetch; disabled unless enabled).
+	if cfg.ThresholdSync.PollIntervalMs <= 0 {
+		cfg.ThresholdSync.PollIntervalMs = 300000
+	}
+	if cfg.ThresholdSync.Port <= 0 {
+		cfg.ThresholdSync.Port = 1161
+	}
+	if cfg.ThresholdSync.TimeoutMs <= 0 {
+		cfg.ThresholdSync.TimeoutMs = 2000
+	}
+	if cfg.ThresholdSync.Retries <= 0 {
+		cfg.ThresholdSync.Retries = 1
 	}
 	if cfg.SNMP.MaxConcurrent <= 0 {
 		cfg.SNMP.MaxConcurrent = 50

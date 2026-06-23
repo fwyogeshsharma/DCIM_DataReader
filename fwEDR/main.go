@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/faberwork/fwedr/internal/bacnet"
+	"github.com/faberwork/fwedr/internal/command"
 	"github.com/faberwork/fwedr/internal/discovery"
 	"github.com/faberwork/fwedr/internal/poller"
 	"github.com/faberwork/fwedr/internal/publisher"
@@ -24,6 +25,7 @@ import (
 	"github.com/faberwork/fwedr/internal/shardsim"
 	"github.com/faberwork/fwedr/internal/snmp"
 	"github.com/faberwork/fwedr/internal/target"
+	"github.com/faberwork/fwedr/internal/threshold"
 	"github.com/faberwork/fwedr/internal/topology"
 	"github.com/faberwork/fwedr/pkg/config"
 	"github.com/faberwork/fwedr/pkg/identity"
@@ -390,6 +392,26 @@ func run(cfgPath string, forceRediscover bool) error {
 		rf := redfish.NewManager(targets, cfg.Redfish, cfg.Identity, signer, log)
 		if rf.Count() > 0 {
 			go rf.Run(ctx, pktCh)
+		}
+	}
+
+	// Downstream control plane — pull UI edits from DCS and apply them to devices
+	// via SNMP SET / Redfish. Disabled unless command_apply.enabled is set.
+	if cfg.CommandApply.Enabled {
+		if cfg.CommandApply.DCSBaseURL == "" {
+			log.Warn("command_apply enabled but dcs_base_url is empty — skipping")
+		} else {
+			cr := command.New(cfg.CommandApply, cfg.Redfish, targets, log)
+			go cr.Run(ctx)
+		}
+	}
+
+	// Threshold sync — pull per-device alert thresholds from the SNMP mgmt plane
+	// (1161) into DCS device_thresholds. Disabled unless threshold_sync.enabled.
+	if cfg.ThresholdSync.Enabled {
+		tp := threshold.New(targets, cfg.ThresholdSync, cfg.Identity, signer, log)
+		if tp.Count() > 0 {
+			go tp.Run(ctx, pktCh)
 		}
 	}
 

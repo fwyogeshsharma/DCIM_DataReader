@@ -78,9 +78,11 @@ type aggDevice struct {
 	RackNum        *int              `json:"rack_num,omitempty"`
 	RackUnit       *int              `json:"rack_unit,omitempty"`
 	PowerDrawW     *int              `json:"power_draw_w,omitempty"`
+	PowerState     *int              `json:"power_state,omitempty"` // 1=On, 2=Off (migration 009)
 	DeviceRole     string            `json:"device_role,omitempty"`
 	RoleConfidence *float64          `json:"role_confidence,omitempty"`
 	RoleSource     string            `json:"role_source,omitempty"`
+	RoleOverridden bool              `json:"role_overridden"`
 	Interfaces     []aggInterface    `json:"interfaces,omitempty"`
 	Metrics        []aggMetric       `json:"metrics,omitempty"`
 	EnergyMetrics  []aggEnergyMetric `json:"energy_metrics,omitempty"`
@@ -403,6 +405,10 @@ func (f *Forwarder) push(ctx context.Context, force bool) error {
 		if err := f.pushNetwork(ctx, netID, force); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		// Downstream control plane: pull any UI edits for this network and queue
+		// them as device commands. Best-effort and self-contained — never affects
+		// the telemetry push result above.
+		_ = f.pullUICommands(ctx, netID)
 	}
 	return firstErr
 }
@@ -822,9 +828,11 @@ func (f *Forwarder) buildPayloads(
 			RackNum:        d.RackNum,
 			RackUnit:       d.RackUnit,
 			PowerDrawW:     d.PowerDrawW,
+			PowerState:     d.PowerState,
 			DeviceRole:     d.DeviceRole,
 			RoleConfidence: d.RoleConfidence,
 			RoleSource:     d.RoleSource,
+			RoleOverridden: d.RoleOverridden,
 			Interfaces:     make([]aggInterface, 0),
 			Metrics:        make([]aggMetric, 0),
 			EnergyMetrics:  make([]aggEnergyMetric, 0),

@@ -35,6 +35,10 @@ snmp:
   community:           "public"
   version:             2
   poll_interval_ms:    60000
+  fast_interval_ms:     60000   # liveness Get cadence
+  medium_interval_ms:   180000  # interface state walks — slower = less CPU
+  slow_interval_ms:     600000  # heavy counter/HR walks (mostly off here)
+  topology_interval_ms: 900000  # LLDP refresh — rarely changes
   timeout_ms:          5000
   retries:             0
   trap_addr:           "127.0.0.1:162"
@@ -83,13 +87,31 @@ bacnet:
 # IP. One light pull per interval — the server analog of gNMI for sw/routers.
 redfish:
   enabled:          true
-  port:             8443
+  port:             443
   username:         "admin"
   password:         "password"
   poll_interval_ms: 60000   # BMC GET cadence; higher = less CPU (was 30000)
   timeout_ms:       5000
   max_concurrent:   4
   tls_insecure:     false   # simulator serves plain HTTP; set true for HTTPS BMCs
+
+# Downstream control plane — apply UI edits down to devices via SNMP SET / Redfish.
+command_apply:
+  enabled:          true
+  dcs_base_url:     "http://localhost:8081"   # DCS rest.addr in prod (NOT :9090 gRPC)
+  command_key:      "fw-control-7b1c9e2a4d"   # must match dcs.prod.yaml rest.command_key
+  poll_interval_ms: 30000
+  snmp_set_agent:   "127.0.0.1"               # sim on-box; "" = device IP for real devices
+  snmp_set_port:    1161
+  snmp_set_community: ""
+
+# Threshold sync — fetch per-device thresholds up into DCS device_thresholds.
+threshold_sync:
+  enabled:          true
+  agent:            "127.0.0.1"
+  port:             1161
+  community:        ""
+  poll_interval_ms: 300000
 
 log:
   level:  "info"

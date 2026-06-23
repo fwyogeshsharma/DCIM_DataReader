@@ -48,9 +48,11 @@ type FwdDevice struct {
 	RackNum        *int
 	RackUnit       *int
 	PowerDrawW     *int
+	PowerState     *int     // 1=On, 2=Off — migration 009 (nil when unknown)
 	DeviceRole     string   // fabric role (core/spine/leaf/...) — migration 003
 	RoleConfidence *float64 // 0.0–1.0, nil when never classified
 	RoleSource     string   // inferred|suggested|unclassified|override
+	RoleOverridden bool     // admin-set role; classifier skips these — migration 003
 	UpdatedAt      time.Time
 }
 
@@ -67,8 +69,8 @@ const fwdDeviceCols = `
 	is_reachable,
 	COALESCE(country,''), COALESCE(datacenter_city,''),
 	COALESCE(datacenter,''), COALESCE(room,''),
-	rack_row, rack_num, rack_unit, power_draw_w,
-	COALESCE(device_role,''), role_confidence, COALESCE(role_source,''),
+	rack_row, rack_num, rack_unit, power_draw_w, power_state,
+	COALESCE(device_role,''), role_confidence, COALESCE(role_source,''), role_overridden,
 	updated_at`
 
 func scanFwdDevice(rows pgx.Rows) (FwdDevice, error) {
@@ -80,8 +82,8 @@ func scanFwdDevice(rows pgx.Rows) (FwdDevice, error) {
 		&d.SNMPEnabled, &d.GNMIEnabled, &d.SNMPPort, &d.SNMPVersion, &d.GNMIPort, &d.CollectorAgent,
 		&d.IsReachable,
 		&d.Country, &d.DatacenterCity, &d.Datacenter, &d.Room,
-		&d.RackRow, &d.RackNum, &d.RackUnit, &d.PowerDrawW,
-		&d.DeviceRole, &d.RoleConfidence, &d.RoleSource,
+		&d.RackRow, &d.RackNum, &d.RackUnit, &d.PowerDrawW, &d.PowerState,
+		&d.DeviceRole, &d.RoleConfidence, &d.RoleSource, &d.RoleOverridden,
 		&d.UpdatedAt)
 	return d, err
 }

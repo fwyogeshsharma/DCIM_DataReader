@@ -170,7 +170,10 @@ func (m *Manager) pollOne(ctx context.Context, b *binding, out chan<- *v1.Teleme
 	if strings.EqualFold(sys.PowerState, "Off") {
 		powerState = 2.0
 	}
-	pkts = append(pkts, m.metric(b, "bmc.chassis_power_state", "", powerState))
+	// Power is a fixed state, not telemetry — emit it as device_state so DCS
+	// stores it on the device row (persistent) instead of the metrics table
+	// (which expires under retention).
+	pkts = append(pkts, m.deviceState(b, "power_state", powerState))
 	o := sys.Oem.Simulator
 	pkts = appendIf(pkts, m.metricP(b, "server.cpu_percent", "", o.CPUUtilizationPercent))
 	pkts = appendIf(pkts, m.metricP(b, "server.memory_used_percent", "", o.MemoryUtilizationPercent))
@@ -239,17 +242,18 @@ func (m *Manager) pollOne(ctx context.Context, b *binding, out chan<- *v1.Teleme
 // ─── packet helpers (signed exactly like snmp.Collector.newMetric) ───────────
 
 func (m *Manager) meta(b *binding) map[string]string {
+	a := b.t.Asset()
 	return map[string]string{
 		"hostname":           b.t.SourceID(),
 		"mgmt_ip":            b.t.MgmtIP,
 		"prod_ip":            b.t.ProdIP,
 		"device_type":        b.t.DeviceType,
 		"vendor":             b.t.Vendor,
-		"model_name":         b.t.ModelName,
-		"country":            b.t.Country,
-		"datacenter":         b.t.DatacenterName,
-		"datacenter_city":    b.t.DatacenterCity,
-		"room":               b.t.Room,
+		"model_name":         a.ModelName,
+		"country":            a.Country,
+		"datacenter":         a.DatacenterName,
+		"datacenter_city":    a.DatacenterCity,
+		"room":               a.Room,
 		"collector_agent":    "EDR",
 		"collector_protocol": "Redfish",
 	}
@@ -257,6 +261,15 @@ func (m *Manager) meta(b *binding) map[string]string {
 
 func (m *Manager) metric(b *binding, name, tag string, value float64) *v1.TelemetryPacket {
 	return m.metricMeta(b, name, tag, value, m.meta(b))
+}
+
+// deviceState builds a Kind="device_state" packet (e.g. power_state). The
+// signature covers id/src/ts/name/tag/value/nonce — not Kind — so overriding
+// Kind after the build is safe.
+func (m *Manager) deviceState(b *binding, name string, value float64) *v1.TelemetryPacket {
+	p := m.metricMeta(b, name, "", value, m.meta(b))
+	p.Kind = "device_state"
+	return p
 }
 
 // metricP builds a metric from a nullable reading, returning nil when absent so

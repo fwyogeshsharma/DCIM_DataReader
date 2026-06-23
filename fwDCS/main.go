@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	dcsgrpc "github.com/faberwork/fwdcs/internal/api/grpc"
+	"github.com/faberwork/fwdcs/internal/api/rest"
 	"github.com/faberwork/fwdcs/internal/forwarder"
 	"github.com/faberwork/fwdcs/internal/ingest"
 	"github.com/faberwork/fwdcs/internal/store"
@@ -136,6 +137,10 @@ func run(cfgPath string) error {
 				"flushed_interfaces": ifaces,
 			})
 		})
+
+		// Downstream control plane: EDR pulls pending device commands here and
+		// acks their outcome. Guarded by cfg.REST.CommandKey (X-Command-Key).
+		rest.NewCommandHandlers(db, cfg.REST.CommandKey, log).Register(mux)
 		httpSrv = &http.Server{
 			Addr:              cfg.REST.Addr,
 			Handler:           mux,

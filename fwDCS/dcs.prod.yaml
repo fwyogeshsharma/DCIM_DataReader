@@ -5,6 +5,7 @@ grpc:
 
 rest:
   addr: ":8081"
+  command_key: "fw-control-7b1c9e2a4d"   # EDR sends this as X-Command-Key to pull/ack device commands
 
 postgres:
   dsn: "postgresql://fwdcim:fwdcim@127.0.0.1:5438/fwdcim?sslmode=disable"
@@ -27,14 +28,14 @@ retention:
   enabled: true
   metrics:
     chunk_interval:   "5m"
-    raw_retention:    "20m"
-    compress_after:   ""
-    rollup_retention: "24h"
+    raw_retention:    "15m"    # was 20m — less raw on disk
+    compress_after:   "1h"     # was "" — compress old chunks → less disk
+    rollup_retention: "6h"     # was 24h — trend history; lower = less disk
   energy:
     chunk_interval:   "5m"
-    raw_retention:    "20m"
-    compress_after:   ""
-    rollup_retention: "168h"
+    raw_retention:    "15m"
+    compress_after:   "1h"
+    rollup_retention: "24h"    # was 168h
 
 # Push to fwdcim cloud. Mirrors local — enable + key if the demo forwards upstream.
 aggregator:
@@ -42,6 +43,7 @@ aggregator:
   endpoint:    "https://fwdcim.faberwork.com/api/v1/ingest"
   ingest_key:  "74613fe24e4da087f46d584c6558870a3bed6b993a6416ced4df17f9a0f1e824"
   interval_ms: 30000   # push cadence; higher = less CPU/marshal work (was 5000)
+  idle_interval_ms: 120000   # drained tables re-checked rarely → less idle CPU
   batch_limit: 1000
   org_id:      "faber"
   network_id:  "net-prod"
@@ -49,5 +51,5 @@ aggregator:
 
 topology:
   root:                  "192.168.0.7"   # DC1-ER1 seed/edge router; "" = auto
-  recompute_interval_ms: 120000   # BFS over all devices; higher = less CPU (was 30000)
+  recompute_interval_ms: 300000   # BFS over all devices; higher = less CPU (was 30000)
   classify_roles:        true

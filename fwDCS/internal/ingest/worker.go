@@ -240,6 +240,15 @@ func (p *Pipeline) process(ctx context.Context, pkt *v1.TelemetryPacket) (store.
 	case "interface_address":
 		p.writeInterfaceAddress(ctx, pkt)
 		return store.MetricRow{}, false
+	case "device_state":
+		// Chassis power state (and future fixed device states). Stored on the
+		// device row, NOT in metrics — a fixed state that must survive retention.
+		p.writeDeviceState(ctx, pkt)
+		return store.MetricRow{}, false
+	case "threshold":
+		// Per-device alert threshold fetched from the SNMP management plane.
+		p.writeThreshold(ctx, pkt)
+		return store.MetricRow{}, false
 	case "trap", "alarm", "event":
 		// Traps in sim mode have SourceId set to the device IP (from the trap
 		// community string). lookupOrRegister tries hostname lookup first;
@@ -366,6 +375,55 @@ func (p *Pipeline) writeInterfaceAddress(ctx context.Context, pkt *v1.TelemetryP
 			zap.Int("ifindex", idx),
 			zap.String("address", addr),
 			zap.Error(err))
+	}
+}
+
+// resolveDeviceID finds an existing device for a non-metric packet (device_state,
+// threshold). These never register a device — they only annotate one already
+// known from the metric path. Tries source/hostname first, then mgmt_ip-style IP
+// candidates (matching the trap resolver).
+func (p *Pipeline) resolveDeviceID(ctx context.Context, pkt *v1.TelemetryPacket) string {
+	if id := p.lookupOrRegister(ctx, pkt); id != "" {
+		return id
+	}
+	candidates := []string{pkt.SourceId, pkt.Meta["mgmt_ip"], pkt.Meta["device_ip"], pkt.Meta["source_ip"]}
+	for _, ip := range candidates {
+		if ip == "" {
+			continue
+		}
+		if id, _, ok := p.db.DeviceByIP(ctx,
+			pkt.OrgId, pkt.DatacenterId, pkt.FloorId,
+			pkt.NetworkId, pkt.GroupId, ip); ok {
+			return id
+		}
+	}
+	return ""
+}
+
+// writeDeviceState persists a fixed device state (currently power_state) on the
+// device row. Skips silently if the device isn't known yet — EDR re-emits.
+func (p *Pipeline) writeDeviceState(ctx context.Context, pkt *v1.TelemetryPacket) {
+	deviceID := p.resolveDeviceID(ctx, pkt)
+	if deviceID == "" {
+		return
+	}
+	if pkt.Name == "power_state" {
+		if err := p.db.SetDevicePowerState(ctx, deviceID, int(pkt.Value)); err != nil {
+			p.log.Debug("power_state write failed", zap.String("device_id", deviceID), zap.Error(err))
+		}
+	}
+}
+
+// writeThreshold upserts one per-device alert threshold. rule = packet name,
+// value = packet value (integer). Skips if the device isn't known yet.
+func (p *Pipeline) writeThreshold(ctx context.Context, pkt *v1.TelemetryPacket) {
+	deviceID := p.resolveDeviceID(ctx, pkt)
+	if deviceID == "" {
+		return
+	}
+	if err := p.db.UpsertThreshold(ctx, deviceID, pkt.Name, int(pkt.Value)); err != nil {
+		p.log.Debug("threshold write failed",
+			zap.String("device_id", deviceID), zap.String("rule", pkt.Name), zap.Error(err))
 	}
 }
 

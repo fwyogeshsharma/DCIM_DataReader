@@ -373,16 +373,17 @@ func energyScope(name string) string {
 
 func (m *Manager) newMetric(b *binding, name, tag string, val float64, ts int64) *v1.TelemetryPacket {
 	t := b.t
+	a := t.Asset()
 	mta := map[string]string{
 		"hostname":           t.SourceID(),
 		"mgmt_ip":            t.MgmtIP,
 		"device_type":        t.DeviceType,
 		"vendor":             t.Vendor,
-		"model_name":         t.ModelName,
-		"country":            t.Country,
-		"datacenter":         t.DatacenterName,
-		"datacenter_city":    t.DatacenterCity,
-		"room":               t.Room,
+		"model_name":         a.ModelName,
+		"country":            a.Country,
+		"datacenter":         a.DatacenterName,
+		"datacenter_city":    a.DatacenterCity,
+		"room":               a.Room,
 		"energy_scope":       b.scope, // it|cooling|facility — for PUE/DCiE
 		"collector_agent":    "EDR",
 		"collector_protocol": "BACNET",
@@ -426,17 +427,18 @@ func (m *Manager) newAlarmEvent(b *binding, name string, active bool, ts int64) 
 	if active {
 		severity, state, val = "critical", "active", 1.0
 	}
+	a := t.Asset()
 	mta := map[string]string{
 		"hostname":           t.SourceID(),
 		"mgmt_ip":            t.MgmtIP,
 		"source_ip":          t.MgmtIP,
 		"device_type":        t.DeviceType,
 		"vendor":             t.Vendor,
-		"model_name":         t.ModelName,
-		"country":            t.Country,
-		"datacenter":         t.DatacenterName,
-		"datacenter_city":    t.DatacenterCity,
-		"room":               t.Room,
+		"model_name":         a.ModelName,
+		"country":            a.Country,
+		"datacenter":         a.DatacenterName,
+		"datacenter_city":    a.DatacenterCity,
+		"room":               a.Room,
 		"alarm_state":        state,
 		"source":             "BACNET",
 		"collector_agent":    "EDR",
