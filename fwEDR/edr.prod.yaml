@@ -87,7 +87,7 @@ bacnet:
 # IP. One light pull per interval — the server analog of gNMI for sw/routers.
 redfish:
   enabled:          true
-  port:             443
+  port:             8443
   username:         "admin"
   password:         "password"
   poll_interval_ms: 60000   # BMC GET cadence; higher = less CPU (was 30000)

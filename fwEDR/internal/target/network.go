@@ -17,45 +17,54 @@ func countryCode(country string) string {
 	}
 }
 
-// citySlug normalizes a datacenter city into a url-ish token: lowercased, runs of
-// non-alphanumerics collapsed to a single dash, trimmed (e.g. "New York" →
-// "new-york").
-func citySlug(city string) string {
+// cityTitle normalizes a datacenter city to Title case with single-dash word
+// separators (e.g. "new york" → "New-York", "Chicago" → "Chicago").
+func cityTitle(city string) string {
 	var b strings.Builder
+	atWordStart := true
 	prevDash := false
 	for _, r := range strings.ToLower(strings.TrimSpace(city)) {
 		switch {
 		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
-			b.WriteRune(r)
+			if atWordStart && r >= 'a' && r <= 'z' {
+				b.WriteRune(r - ('a' - 'A'))
+			} else {
+				b.WriteRune(r)
+			}
+			atWordStart = false
 			prevDash = false
 		default:
 			if !prevDash && b.Len() > 0 {
 				b.WriteByte('-')
 				prevDash = true
 			}
+			atWordStart = true
 		}
 	}
 	return strings.TrimRight(b.String(), "-")
 }
 
-// NetworkIDForLocation builds a device's logical network id from its country and
-// datacenter city, so each datacenter is its own network — net-<country>-<city>
-// (e.g. net-usa-dallas). Falls back to net-<country> when the city is unknown,
-// and to the caller's configured global id (identity.network_id) when the country
-// itself is unknown/empty.
-func NetworkIDForLocation(country, city, fallback string) string {
-	cc := countryCode(country)
-	if cc == "" {
+// NetworkIDForLocation builds a device's logical network id from its datacenter,
+// country and city, so each datacenter is its own network —
+// <DATACENTER>-<COUNTRY>-<City> (e.g. DC1-USA-Chicago): datacenter uppercased,
+// country as its uppercased short code, city Title-cased. Falls back to
+// <DATACENTER>-<COUNTRY> when the city is unknown, and to the caller's configured
+// global id (identity.network_id) when the datacenter or country is unknown/empty.
+func NetworkIDForLocation(datacenter, country, city, fallback string) string {
+	dc := strings.ToUpper(strings.TrimSpace(datacenter))
+	cc := strings.ToUpper(countryCode(country))
+	if dc == "" || cc == "" {
 		return fallback
 	}
-	if cs := citySlug(city); cs != "" {
-		return "net-" + cc + "-" + cs
+	if ct := cityTitle(city); ct != "" {
+		return dc + "-" + cc + "-" + ct
 	}
-	return "net-" + cc
+	return dc + "-" + cc
 }
 
-// NetworkID returns this target's network id derived from its country + datacenter
-// city, falling back to the given global id when the country is empty/unknown.
+// NetworkID returns this target's network id derived from its datacenter +
+// country + city, falling back to the given global id when the datacenter or
+// country is empty/unknown.
 func (t *Target) NetworkID(fallback string) string {
-	return NetworkIDForLocation(t.Country, t.DatacenterCity, fallback)
+	return NetworkIDForLocation(t.DatacenterName, t.Country, t.DatacenterCity, fallback)
 }
