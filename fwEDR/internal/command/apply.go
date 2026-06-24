@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -86,6 +87,26 @@ var snmpFieldMap = map[string]oidSpec{
 	"sensorlowairflow":          {"1.3.6.1.4.1.99999.3.20.0", true},
 	"sensorairflownormallow":    {"1.3.6.1.4.1.99999.3.21.1.0", true},
 	"sensorairflownormalhigh":   {"1.3.6.1.4.1.99999.3.21.2.0", true},
+
+	// Aggregator UI threshold names (THRESHOLD_DEFAULTS in agents.ts) differ from
+	// the canonical keys above — alias them to the same OIDs so UI edits apply.
+	"sensortemphigh":         {"1.3.6.1.4.1.99999.3.10.0", true},
+	"sensortempcritical":     {"1.3.6.1.4.1.99999.3.11.0", true},
+	"sensorhumidityhigh":     {"1.3.6.1.4.1.99999.3.13.0", true},
+	"sensorhumiditycritical": {"1.3.6.1.4.1.99999.3.14.0", true},
+	"sensorhumiditylow":      {"1.3.6.1.4.1.99999.3.15.0", true},
+	"sensordewpointhigh":     {"1.3.6.1.4.1.99999.3.17.0", true},
+	"sensorairflowhigh":      {"1.3.6.1.4.1.99999.3.19.0", true}, // ×10: UI must send integer ×10 (3.5 m/s → 35)
+	"sensorairflowlow":       {"1.3.6.1.4.1.99999.3.20.0", true}, // ×10
+}
+
+// airflowX10OIDs are written ×10 (m/s). A decimal value from the UI is scaled to
+// the integer the SET agent expects; an already-integer value is passed through.
+var airflowX10OIDs = map[string]bool{
+	"1.3.6.1.4.1.99999.3.19.0":   true, // SensorHighAirflow
+	"1.3.6.1.4.1.99999.3.20.0":   true, // SensorLowAirflow
+	"1.3.6.1.4.1.99999.3.21.1.0": true, // SensorAirflowNormal low
+	"1.3.6.1.4.1.99999.3.21.2.0": true, // SensorAirflowNormal high
 }
 
 // powerFields are routed to Redfish instead of SNMP.
@@ -183,9 +204,27 @@ func (a *Applier) applySNMPSet(ctx context.Context, deviceIP string, spec oidSpe
 
 	var pdu gosnmp.SnmpPDU
 	if spec.isInt {
-		n, err := strconv.Atoi(strings.TrimSpace(value))
-		if err != nil {
-			return fmt.Errorf("field expects integer, got %q: %w", value, err)
+		v := strings.TrimSpace(value)
+		var n int
+		if airflowX10OIDs[spec.oid] {
+			// Airflow OIDs are written ×10 (m/s). The UI sends a decimal (e.g.
+			// 3.5 m/s) — scale it to the integer the agent expects (35). An
+			// already-integer value is assumed pre-scaled and passed through.
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return fmt.Errorf("field expects number, got %q: %w", value, err)
+			}
+			if f == math.Trunc(f) {
+				n = int(f)
+			} else {
+				n = int(math.Round(f * 10))
+			}
+		} else {
+			var err error
+			n, err = strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("field expects integer, got %q: %w", value, err)
+			}
 		}
 		pdu = gosnmp.SnmpPDU{Name: spec.oid, Type: gosnmp.Integer, Value: n}
 	} else {
