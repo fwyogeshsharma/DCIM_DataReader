@@ -45,6 +45,7 @@ var snmpFieldMap = map[string]oidSpec{
 	"sys_contact":  {"1.3.6.1.2.1.1.4.0", false},
 	"contact":      {"1.3.6.1.2.1.1.4.0", false},
 	"name":         {"1.3.6.1.2.1.1.5.0", false},
+	"sysname":      {"1.3.6.1.2.1.1.5.0", false}, // aggregator sends camelCase "sysName" → lowercased here
 	"hostname":     {"1.3.6.1.2.1.1.5.0", false},
 	"sys_location": {"1.3.6.1.2.1.1.6.0", false},
 	"location":     {"1.3.6.1.2.1.1.6.0", false},
