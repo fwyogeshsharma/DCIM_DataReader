@@ -87,6 +87,48 @@ var oidToRule = func() map[string]string {
 	return m
 }()
 
+// thresholdRulesByType lists which threshold rules apply to each device type,
+// mirroring core/trap_definitions.py APPLICABLE_TRAPS in the simulator.
+//
+// The simulator's SET agent (UDP 1161) is a single GLOBAL rule store: it answers
+// every threshold OID for ANY device IP, with no device-type check. Without this
+// filter EDR would sync CPU/memory thresholds onto devices that have no such
+// metric (e.g. a chiller), producing junk device_thresholds rows. Device types
+// absent here (chiller, pump, cooling_tower, valve, crah, cdu, rpp,
+// energy_monitor, pdu, floor_pdu) have no applicable rules in the 99999.3.x set
+// and are skipped entirely.
+var thresholdRulesByType = map[string][]string{
+	"router":        {"HighCPU", "HighCPUSustained", "CPUNormal", "HighTemperature", "RackFailureMin"},
+	"switch":        {"HighCPU", "HighCPUSustained", "CPUNormal", "HighTemperature", "RackFailureMin"},
+	"oob_switch":    {"HighCPU", "HighCPUSustained", "CPUNormal", "HighTemperature", "RackFailureMin"},
+	"firewall":      {"HighCPU", "HighCPUSustained", "CPUNormal", "HighTemperature", "RackFailureMin"},
+	"load_balancer": {"HighCPU", "HighCPUSustained", "CPUNormal", "HighMemory", "HighTemperature", "RackFailureMin"},
+	"server":        {"HighCPU", "HighCPUSustained", "CPUNormal", "HighMemory", "HighTemperature", "RackFailureMin"},
+	"sensor": {
+		"SensorAmbientTempHigh", "SensorAmbientTempCritical", "SensorAmbientTempNormal",
+		"SensorHighHumidity", "SensorCriticalHumidity", "SensorLowHumidity",
+		"SensorHumidityNormalLow", "SensorHumidityNormalHigh",
+		"SensorHighDewPoint", "SensorDewPointNormal",
+		"SensorHighAirflow", "SensorLowAirflow",
+		"SensorAirflowNormalLow", "SensorAirflowNormalHigh",
+	},
+	"ups":       {"HighTemperature"},
+	"generator": {"HighTemperature"},
+}
+
+// allowedRulesByType is the set form of thresholdRulesByType, built once.
+var allowedRulesByType = func() map[string]map[string]bool {
+	m := make(map[string]map[string]bool, len(thresholdRulesByType))
+	for dt, rules := range thresholdRulesByType {
+		set := make(map[string]bool, len(rules))
+		for _, r := range rules {
+			set[r] = true
+		}
+		m[dt] = set
+	}
+	return m
+}()
+
 // Poller GETs threshold OIDs from each target's mgmt plane on a fixed interval.
 type Poller struct {
 	cfg      config.ThresholdSyncConfig
@@ -184,30 +226,38 @@ func (p *Poller) pollOne(ctx context.Context, t *target.Target, out chan<- *v1.T
 	}
 	defer g.Conn.Close()
 
-	oids := make([]string, len(thresholdOIDs))
-	for i, t := range thresholdOIDs {
-		oids[i] = t.oid
-	}
-	res, err := g.Get(oids)
-	if err != nil {
-		p.log.Debug("threshold-sync: get failed", zap.String("host", host), zap.Error(err))
-		return
-	}
-
-	for _, vb := range res.Variables {
-		if vb.Type == gosnmp.NoSuchObject || vb.Type == gosnmp.NoSuchInstance || vb.Value == nil {
-			continue
+	// Only sync thresholds that apply to this device's type — the simulator's SET
+	// agent answers every OID for any IP, so an unfiltered GET would write junk
+	// rows (e.g. HighCPU on a chiller). Unlisted device types → no thresholds.
+	allowed := allowedRulesByType[strings.ToLower(strings.TrimSpace(t.DeviceType))]
+	if len(allowed) > 0 {
+		oids := make([]string, 0, len(thresholdOIDs))
+		for _, to := range thresholdOIDs {
+			if allowed[to.rule] {
+				oids = append(oids, to.oid)
+			}
 		}
-		// gosnmp returns OIDs with a leading dot (".1.3.6..."); map keys have none.
-		rule := oidToRule[strings.TrimPrefix(vb.Name, ".")]
-		if rule == "" {
-			continue
-		}
-		val := gosnmp.ToBigInt(vb.Value).Int64()
-		select {
-		case out <- p.packet(t, rule, float64(val)):
-		case <-ctx.Done():
+		res, err := g.Get(oids)
+		if err != nil {
+			p.log.Debug("threshold-sync: get failed", zap.String("host", host), zap.Error(err))
 			return
+		}
+
+		for _, vb := range res.Variables {
+			if vb.Type == gosnmp.NoSuchObject || vb.Type == gosnmp.NoSuchInstance || vb.Value == nil {
+				continue
+			}
+			// gosnmp returns OIDs with a leading dot (".1.3.6..."); map keys have none.
+			rule := oidToRule[strings.TrimPrefix(vb.Name, ".")]
+			if rule == "" || !allowed[rule] {
+				continue
+			}
+			val := gosnmp.ToBigInt(vb.Value).Int64()
+			select {
+			case out <- p.packet(t, rule, float64(val)):
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 
