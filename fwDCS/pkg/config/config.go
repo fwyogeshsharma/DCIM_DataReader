@@ -177,8 +177,8 @@ func LoadDCS(path string) (*DCSConfig, error) {
 	// only ~20 min on tiny 5-min chunks so disk stays minimal; bump these in
 	// dcs.yaml for production. yaml.v3 leaves unspecified keys at these values.
 	cfg.Retention.Enabled = true
-	cfg.Retention.Metrics = RetentionPolicy{ChunkInterval: "5m", RawRetention: "20m", RollupRetention: "24h"}
-	cfg.Retention.Energy = RetentionPolicy{ChunkInterval: "5m", RawRetention: "20m", RollupRetention: "168h"}
+	cfg.Retention.Metrics = RetentionPolicy{ChunkInterval: "5m", RawRetention: "30m", RollupRetention: "24h"}
+	cfg.Retention.Energy = RetentionPolicy{ChunkInterval: "5m", RawRetention: "30m", RollupRetention: "168h"}
 	if err := loadYAML(path, cfg); err != nil {
 		return nil, err
 	}

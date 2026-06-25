@@ -28,12 +28,12 @@ retention:
   enabled: true
   metrics:
     chunk_interval:   "5m"
-    raw_retention:    "15m"    # was 20m — less raw on disk
+    raw_retention:    "30m"    # was 15m — must exceed metrics_rollup_5m start_offset (20m)
     compress_after:   "1h"     # was "" — compress old chunks → less disk
     rollup_retention: "6h"     # was 24h — trend history; lower = less disk
   energy:
     chunk_interval:   "5m"
-    raw_retention:    "15m"
+    raw_retention:    "30m"
     compress_after:   "1h"
     rollup_retention: "24h"    # was 168h
 

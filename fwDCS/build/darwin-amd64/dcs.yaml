@@ -34,12 +34,12 @@ retention:
   enabled: true
   metrics:
     chunk_interval:   "5m"     # future chunk size
-    raw_retention:    "20m"    # drop raw rows older than this
+    raw_retention:    "30m"    # drop raw rows older than this (>20m: covers metrics_rollup_5m start_offset)
     compress_after:   ""       # "" = off (not worth it at 20m); e.g. "2d" in prod
     rollup_retention: "24h"    # keep 5m rollup this long for trend charts
   energy:
     chunk_interval:   "5m"
-    raw_retention:    "20m"
+    raw_retention:    "30m"
     compress_after:   ""
     rollup_retention: "168h"   # 7d of 5m energy rollup
 
