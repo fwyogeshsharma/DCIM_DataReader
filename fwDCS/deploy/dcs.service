@@ -1,0 +1,34 @@
+[Unit]
+Description=Faberwork DCS (datacenter collector/forwarder)
+# DCS needs the network and its TimescaleDB. If the DB isn't ready yet, DCS
+# exits at boot (ApplyRetention is fatal) and systemd restarts it (Restart=always)
+# until the DB accepts connections — so a hard ordering dep is not required.
+# If Postgres runs natively, add it explicitly:  After=postgresql.service
+# If Postgres runs in Docker, add:                After=docker.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# __INSTALL_DIR__ = the fwDCS dir on the VM (holds dcs_prod.sh, build/, dcs.prod.yaml).
+# Reuse the existing prod launcher so binary-pick + GOMEMLIMIT + config stay in one
+# place; don't duplicate them here.
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/dcs_prod.sh
+User=root
+
+# ── Auto-restart on crash OR clean exit ──────────────────────────────────────
+Restart=always
+RestartSec=3
+# Don't hammer-loop forever if wedged: max 5 restarts / 60s, then stop and
+# surface it (check: systemctl status dcs / journalctl -u dcs).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# ── Lightweight guards ───────────────────────────────────────────────────────
+# RAM is already bounded by GOMEMLIMIT=384MiB inside dcs_prod.sh. To also cap CPU:
+# Nice=10                 # lower CPU priority than interactive work
+# CPUQuota=80%            # never exceed ~0.8 core (leave headroom on a 2-core VM)
+
+[Install]
+WantedBy=multi-user.target

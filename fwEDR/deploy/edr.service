@@ -1,0 +1,30 @@
+[Unit]
+Description=Faberwork EDR (external device reader / collector)
+# EDR pushes to DCS's ingest (:9090) and collects from the devices/simulator.
+# edr_prod.sh notes "start AFTER dcs is up", so order behind dcs (and the sim);
+# if DCS is briefly down EDR retries on its poll loop, and Restart=always covers
+# a hard crash at boot.
+After=network-online.target dcs.service dcim.service
+Wants=network-online.target dcs.service dcim.service
+
+[Service]
+Type=simple
+# __INSTALL_DIR__ = the fwEDR dir on the VM (holds edr_prod.sh, build/, edr.prod.yaml).
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/edr_prod.sh
+User=root
+
+# ── Auto-restart on crash OR clean exit ──────────────────────────────────────
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# ── Lightweight guards ───────────────────────────────────────────────────────
+# RAM is already bounded by GOMEMLIMIT=192MiB inside edr_prod.sh. EDR is mostly
+# I/O-wait on SNMP/Redfish, so a low CPU cap is safe:
+# Nice=10
+# CPUQuota=60%
+
+[Install]
+WantedBy=multi-user.target
