@@ -18,6 +18,8 @@ publisher:
   batch_size:        512
   flush_interval_ms: 200
   max_in_flight:     8
+  dcs_down_after:        3      # consecutive BatchPush failures -> pause collection (poller stops)
+  dcs_probe_interval_ms: 5000   # while paused, empty-push probe DCS this often; resume on success
 
 # Simulator topology JSON — absolute path on the VM (native run, no container).
 topology_file: "/home/fabercomp_gmail_com/DCIM/Datacenter_Network_Simulator/topologies/dual_dc_enterprise.json"

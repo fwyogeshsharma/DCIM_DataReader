@@ -224,6 +224,12 @@ type PublisherConfig struct {
 	BatchSize       int `yaml:"batch_size"`        // max packets per BatchPush RPC (default 256)
 	FlushIntervalMs int `yaml:"flush_interval_ms"` // max time to wait before forcing partial flush (default 200)
 	MaxInFlight     int `yaml:"max_in_flight"`     // parallel BatchPush RPCs (default 2)
+	// DCSDownAfter is how many consecutive BatchPush failures flip EDR into the
+	// paused state (the poller stops collecting so the queue can't grow). Default 3.
+	DCSDownAfter int `yaml:"dcs_down_after"`
+	// DCSProbeIntervalMs is how often, while paused, the publisher sends an empty
+	// BatchPush to test whether DCS is back. On success it resumes. Default 5000.
+	DCSProbeIntervalMs int `yaml:"dcs_probe_interval_ms"`
 }
 
 type SNMPV3 struct {

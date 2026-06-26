@@ -20,6 +20,8 @@ publisher:
   batch_size:        512
   flush_interval_ms: 200
   max_in_flight:     8
+  dcs_down_after:        3      # consecutive BatchPush failures -> pause collection (poller stops)
+  dcs_probe_interval_ms: 5000   # while paused, empty-push probe DCS this often; resume on success
 
 # Simulator topology file — EDR reads device IPs, datacenter, country, city,
 # rack, room etc. from this JSON. Required to populate location columns in DB.

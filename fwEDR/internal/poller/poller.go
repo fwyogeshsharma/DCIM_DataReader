@@ -24,6 +24,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/faberwork/fwedr/internal/gnmi"
+	"github.com/faberwork/fwedr/internal/health"
 	"github.com/faberwork/fwedr/internal/snmp"
 	"github.com/faberwork/fwedr/internal/target"
 	"github.com/faberwork/fwedr/pkg/config"
@@ -80,6 +81,7 @@ type Poller struct {
 	throttle *logThrottle // rate-limits repeated connect/gnmi warnings per target
 
 	health *healthMonitor // global pause/resume based on heavy-breaker ratio
+	gate   *health.Gate   // DCS-down gate: pause ALL collection while DCS unreachable
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc // tracks running target goroutines by SourceID
@@ -94,6 +96,7 @@ func New(
 	identity config.IdentityConfig,
 	signer *packet.Signer,
 	out chan<- *v1.TelemetryPacket,
+	gate *health.Gate,
 	log *zap.Logger,
 ) *Poller {
 	maxConc := snmpCfg.MaxConcurrent
@@ -158,6 +161,7 @@ func New(
 		identity:  identity,
 		signer:    signer,
 		out:       out,
+		gate:      gate,
 		log:       log,
 		socketCap: effCap,
 		heavySem:  make(chan struct{}, heavyCap),
@@ -542,6 +546,12 @@ func (p *Poller) closeConns() {
 // succeeded and its packets were emitted. The boolean lets walkAll know whether
 // the FAST liveness tier answered so the one-shot walker can stop retrying.
 func (p *Poller) pollSNMP(ctx context.Context, t *target.Target, tier snmp.Tier) bool {
+	// DCS down: pause ALL collection (including the FAST heartbeat) so the local
+	// queue can't grow without bound while nothing can be shipped. Resumes
+	// automatically once the publisher's probe sees DCS again.
+	if p.gate != nil && p.gate.DCSDown() {
+		return false
+	}
 	// Global pause applies to heavy walks only. The FAST heartbeat must keep
 	// flowing during a site-wide pause, otherwise the very mechanism meant to
 	// protect a wedged responder blanks every device "offline" on the UI.

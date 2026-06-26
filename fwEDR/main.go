@@ -18,6 +18,7 @@ import (
 	"github.com/faberwork/fwedr/internal/bacnet"
 	"github.com/faberwork/fwedr/internal/command"
 	"github.com/faberwork/fwedr/internal/discovery"
+	"github.com/faberwork/fwedr/internal/health"
 	"github.com/faberwork/fwedr/internal/poller"
 	"github.com/faberwork/fwedr/internal/publisher"
 	"github.com/faberwork/fwedr/internal/queue"
@@ -119,8 +120,13 @@ func run(cfgPath string, forceRediscover bool) error {
 	// Packet fan-in channel sized for high-burst polling cycles.
 	pktCh := make(chan *v1.TelemetryPacket, 16384)
 
+	// Shared DCS-down gate: the publisher flips it when DCS is unreachable, the
+	// poller reads it to pause/resume collection (so the queue can't grow without
+	// bound during a DCS outage).
+	gate := &health.Gate{}
+
 	// Publisher (drains queue → DCS gRPC batches)
-	pub := publisher.New(q, cfg.DCS, cfg.Publisher, log)
+	pub := publisher.New(q, cfg.DCS, cfg.Publisher, gate, log)
 	go pub.Run(ctx)
 
 	// Batched enqueue goroutine: accumulates packets in memory and flushes to
@@ -367,7 +373,7 @@ func run(cfgPath string, forceRediscover bool) error {
 
 	// Poller
 	pollerDone := make(chan struct{})
-	p := poller.New(targets, cfg.SNMP, cfg.GNMI, cfg.Identity, signer, pktCh, log)
+	p := poller.New(targets, cfg.SNMP, cfg.GNMI, cfg.Identity, signer, pktCh, gate, log)
 	go func() {
 		p.Run(ctx)
 		close(pollerDone)

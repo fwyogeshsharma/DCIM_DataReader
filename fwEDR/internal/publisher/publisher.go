@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/faberwork/fwedr/internal/health"
 	"github.com/faberwork/fwedr/internal/queue"
 	"github.com/faberwork/fwedr/pkg/config"
 	v1 "github.com/faberwork/fwedr/proto/v1"
@@ -28,6 +29,8 @@ const (
 	defaultBatchSize       = 512
 	defaultFlushIntervalMs = 200
 	defaultMaxInFlight     = 8
+	defaultDCSDownAfter    = 3
+	defaultDCSProbeMs      = 5000
 )
 
 // Publisher drains the queue and pushes packets to DCS in batches.
@@ -39,10 +42,20 @@ type Publisher struct {
 	client   v1.IngestServiceClient
 	conn     *grpc.ClientConn
 	inFlight chan struct{}
+
+	// DCS-down detection. gate is shared with the poller: while DCSDown() is
+	// true the poller stops collecting. healthMu guards failStreak and the
+	// gate transitions (sendBatch runs from up to MaxInFlight goroutines).
+	gate       *health.Gate
+	downAfter  int
+	probeEvery time.Duration
+	healthMu   sync.Mutex
+	failStreak int
 }
 
-// New creates a Publisher. Call Run to start draining.
-func New(q *queue.Queue, cfg config.DCSClientConfig, pubCfg config.PublisherConfig, log *zap.Logger) *Publisher {
+// New creates a Publisher. Call Run to start draining. gate may be nil (then the
+// DCS-down pause is disabled and the publisher just buffers as before).
+func New(q *queue.Queue, cfg config.DCSClientConfig, pubCfg config.PublisherConfig, gate *health.Gate, log *zap.Logger) *Publisher {
 	if pubCfg.BatchSize <= 0 {
 		pubCfg.BatchSize = defaultBatchSize
 	}
@@ -52,12 +65,58 @@ func New(q *queue.Queue, cfg config.DCSClientConfig, pubCfg config.PublisherConf
 	if pubCfg.MaxInFlight <= 0 {
 		pubCfg.MaxInFlight = defaultMaxInFlight
 	}
+	if pubCfg.DCSDownAfter <= 0 {
+		pubCfg.DCSDownAfter = defaultDCSDownAfter
+	}
+	if pubCfg.DCSProbeIntervalMs <= 0 {
+		pubCfg.DCSProbeIntervalMs = defaultDCSProbeMs
+	}
 	return &Publisher{
-		q:        q,
-		cfg:      cfg,
-		pubCfg:   pubCfg,
-		log:      log,
-		inFlight: make(chan struct{}, pubCfg.MaxInFlight),
+		q:          q,
+		cfg:        cfg,
+		pubCfg:     pubCfg,
+		log:        log,
+		inFlight:   make(chan struct{}, pubCfg.MaxInFlight),
+		gate:       gate,
+		downAfter:  pubCfg.DCSDownAfter,
+		probeEvery: time.Duration(pubCfg.DCSProbeIntervalMs) * time.Millisecond,
+	}
+}
+
+// recordResult updates the DCS-down gate from a push/probe outcome and logs the
+// pause/resume transitions exactly once. Safe to call concurrently.
+func (p *Publisher) recordResult(ok bool) {
+	if p.gate == nil {
+		return
+	}
+	p.healthMu.Lock()
+	defer p.healthMu.Unlock()
+	if ok {
+		p.failStreak = 0
+		if p.gate.DCSDown() {
+			p.gate.SetDCSDown(false)
+			p.log.Info("publisher: DCS reachable again — resuming collection")
+		}
+		return
+	}
+	p.failStreak++
+	if p.failStreak >= p.downAfter && !p.gate.DCSDown() {
+		p.gate.SetDCSDown(true)
+		p.log.Warn("publisher: DCS unreachable — pausing collection",
+			zap.Int("consecutive_failures", p.failStreak),
+			zap.String("endpoint", p.cfg.Endpoint))
+	}
+}
+
+// probeDCS sends an empty BatchPush to test whether DCS is reachable while
+// paused, and feeds the result back into the gate.
+func (p *Publisher) probeDCS(ctx context.Context) {
+	rpcCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err := p.client.BatchPush(rpcCtx, &v1.BatchRequest{Packets: nil})
+	p.recordResult(err == nil)
+	if err != nil {
+		p.log.Debug("publisher: DCS probe failed", zap.Error(err))
 	}
 }
 
@@ -147,6 +206,19 @@ func (p *Publisher) drain(ctx context.Context) {
 			return
 		}
 
+		// DCS down: don't hammer the dead endpoint with the backlog in a tight
+		// loop. Park, probe every probeEvery, and resume draining (which flushes
+		// the buffered backlog) the moment the probe succeeds.
+		if p.gate != nil && p.gate.DCSDown() {
+			select {
+			case <-time.After(p.probeEvery):
+			case <-ctx.Done():
+				return
+			}
+			p.probeDCS(ctx)
+			continue
+		}
+
 		batch, err := p.q.PopBatch(p.pubCfg.BatchSize)
 		if errors.Is(err, queue.ErrEmpty) {
 			// Idle: wait on ticker or ctx.
@@ -194,12 +266,14 @@ func (p *Publisher) sendBatch(ctx context.Context, pkts []*v1.TelemetryPacket) {
 	resp, err := p.client.BatchPush(rpcCtx, req)
 	if err != nil {
 		// Requeue everything — connection or server error.
+		p.recordResult(false)
 		_ = p.q.PushBatch(pkts)
 		p.log.Warn("publisher: BatchPush failed — requeued",
 			zap.Int("packets", len(pkts)),
 			zap.Error(err))
 		return
 	}
+	p.recordResult(true)
 	p.log.Debug("publisher: batch shipped",
 		zap.Int("packets", len(pkts)),
 		zap.Uint32("accepted", resp.Accepted),
