@@ -1,6 +1,18 @@
-# Usage Guide — DCS & EDR
+# Usage Guide — DCS (Data Center Store) & EDR (External Data Reader)
 
-Day-to-day operation. For first-time setup see [INSTALLATION.md](INSTALLATION.md).
+Day-to-day operation of **DCS (Data Center Store)** and **EDR (External Data Reader)**.
+For first-time setup see [INSTALLATION.md](INSTALLATION.md).
+
+---
+
+## Contents
+
+- [Start / stop](#start--stop)
+- [Logs](#logs)
+- [How forwarding to the Aggregator behaves](#how-forwarding-to-the-aggregator-behaves)
+- [Proof that events were forwarded](#proof-that-events-were-forwarded)
+- [Common operations](#common-operations)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -36,6 +48,11 @@ docker-compose up -d            # docker-compose.yml
 
 Stop in reverse: Ctrl-C EDR, then DCS, then bring the data stores down with the
 matching file (`docker-compose down` locally, `docker-compose -f docker-compose.data.yml down` in prod).
+
+> **On a server, run them as systemd services instead** — they auto-start on boot
+> and respawn on crash, so you don't babysit the scripts. One-time setup in
+> [INSTALLATION.md §7](INSTALLATION.md#7-run-as-a-service-systemd). After that:
+> `sudo systemctl start|stop|restart dcs edr`.
 
 Health checks:
 

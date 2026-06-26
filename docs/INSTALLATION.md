@@ -1,11 +1,26 @@
-# Installation Guide — DCS & EDR
+# Installation Guide — DCS (Data Center Store) & EDR (External Data Reader)
 
-How to get **DCS** (ingest hub) and **EDR** (device collector) running.
+How to get **DCS (Data Center Store)** (ingest hub) and **EDR (External Data Reader)**
+(device collector) running.
 
 - **DCS** stores telemetry in PostgreSQL/TimescaleDB + Redis, and forwards to the cloud Aggregator.
 - **EDR** polls devices (SNMP/gNMI/BACnet/Redfish) and streams to DCS. EDR only talks to DCS.
 
 See [USAGE.md](USAGE.md) for day-to-day operation and [ARCHITECTURE.md](ARCHITECTURE.md) for how it works.
+
+---
+
+## Contents
+
+1. [Prerequisites](#1-prerequisites)
+2. [Data stores (Docker)](#2-data-stores-docker)
+3. [Get the binaries](#3-get-the-binaries)
+4. [Two ways to run](#4-two-ways-to-run)
+5. [Run locally (development)](#5-run-locally-development)
+6. [Run on production (server / VM)](#6-run-on-production-server--vm)
+7. [Run as a service (systemd)](#7-run-as-a-service-systemd)
+8. [Verify](#8-verify)
+9. [Ports](#9-ports)
 
 ---
 
@@ -186,7 +201,78 @@ your setup:
 
 ---
 
-## 7. Verify
+## 7. Run as a service (systemd)
+
+The run scripts (Section 6) stop when your SSH session closes and do **not** come
+back after a crash or reboot. On a Linux server, run DCS and EDR as **systemd
+services** instead: they start on boot (`enable`) and respawn on crash
+(`Restart=always`). Each unit simply calls the same `*_prod.sh` launcher, so the
+binary, `GOMEMLIMIT`, and prod config are unchanged.
+
+Unit files ship in the repo: `fwDCS/deploy/dcs.service`, `fwEDR/deploy/edr.service`.
+
+**1. Install (run once).** Point the variables at the repo dirs on the server:
+
+```bash
+DCS_DIR=/path/to/fwDCS          # holds dcs_prod.sh, build/, dcs.prod.yaml
+EDR_DIR=/path/to/fwEDR          # holds edr_prod.sh, build/, edr.prod.yaml
+
+chmod +x "$DCS_DIR/dcs_prod.sh" "$EDR_DIR/edr_prod.sh"
+
+# Fill the __INSTALL_DIR__ placeholder and install the units:
+sed "s#__INSTALL_DIR__#$DCS_DIR#g" "$DCS_DIR/deploy/dcs.service" | sudo tee /etc/systemd/system/dcs.service
+sed "s#__INSTALL_DIR__#$EDR_DIR#g" "$EDR_DIR/deploy/edr.service" | sudo tee /etc/systemd/system/edr.service
+```
+
+**2. Stop any manual copies** so you don't run two:
+
+```bash
+pkill -f dcs_prod.sh; pkill -f edr_prod.sh; pkill -x dcs; pkill -x edr
+```
+
+**3. Enable + start** (`enable` = auto-start on boot, `--now` = also start now):
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now dcs.service     # start DCS first
+sudo systemctl enable --now edr.service     # EDR follows (ordered After=dcs in the unit)
+```
+
+**4. Check and tail logs:**
+
+```bash
+systemctl status dcs edr                    # expect: active (running), enabled
+journalctl -u dcs -f                        # live DCS log (Ctrl-C to stop)
+journalctl -u edr -f
+```
+
+**5. Prove auto-restart:**
+
+```bash
+sudo systemctl kill -s SIGKILL dcs          # ~3s later: running again
+sudo reboot                                 # after boot: both already running
+```
+
+Day-to-day after install:
+
+| Action | Command |
+|---|---|
+| Start / stop | `sudo systemctl start dcs` / `stop dcs` |
+| Restart after a new binary | `sudo systemctl restart dcs` |
+| Status / logs | `systemctl status dcs` · `journalctl -u dcs -e` |
+
+> **Ordering & recovery:** EDR's unit is `After=dcs.service`. If DCS is briefly
+> down, EDR pauses collection and resumes automatically (see
+> [ARCHITECTURE.md](ARCHITECTURE.md#resilience--outages-dont-lose-data)) — no need
+> to restart it by hand.
+>
+> **Resource caps (optional):** `Nice` / `CPUQuota` / `MemoryMax` lines are present
+> but commented in each unit. Uncomment, then `sudo systemctl daemon-reload && sudo
+> systemctl restart dcs edr`.
+
+---
+
+## 8. Verify
 
 ```bash
 curl -s http://localhost:8080/healthz   # DCS alive  -> {"status":"ok"}
@@ -200,14 +286,14 @@ the DCS log (see [USAGE.md](USAGE.md)).
 
 ---
 
-## 8. Ports
+## 9. Ports
 
 | Port | Proto | Who | Purpose |
 |---|---|---|---|
 | 9090 | TCP | DCS | gRPC ingest (EDR → DCS) |
 | 8080 | TCP | DCS | Admin REST (health/ready) |
 | 5438 | TCP | Postgres | Database |
-| 6379 | TCP | Redis | Cache / dedup |
+| 6379 | TCP | Redis | Fast lookups / skip repeat events |
 | 161 | UDP | Devices | SNMP polling |
 | 162 | UDP | EDR | SNMP trap listener |
 | 50051 / 57400 | TCP | gNMI | Telemetry (proxy / direct) |

@@ -87,6 +87,16 @@ type AggregatorConfig struct {
 	IntervalMs int    `yaml:"interval_ms"` // push cadence (default 5000 ms)
 	BatchLimit int    `yaml:"batch_limit"` // max rows per cursor per push (default 1000)
 
+	// MetricMultiplier scales BatchLimit for the high-volume metrics and energy
+	// cursors only (metrics volume >> device/topology volume). The effective
+	// per-push metric ceiling is BatchLimit*MetricMultiplier. Default 50 (so the
+	// old hardcoded 50k at BatchLimit=1000 is preserved exactly). LOWER this in
+	// production (e.g. 10 → 10k) to cap the transient heap a single push
+	// materializes+serializes, which is the main driver of the forwarder's memory
+	// burst against GOMEMLIMIT. Smaller batches just take more ticks to drain a
+	// backlog — the ts-ordered cursor never loses or double-sends rows. <= 0 → 50.
+	MetricMultiplier int `yaml:"metric_multiplier"`
+
 	// IdleIntervalMs caps how rarely a *drained* table is re-polled. After a
 	// table returns zero rows the forwarder backs off, skipping that table's
 	// query for a growing number of ticks until it is only checked once per
@@ -202,6 +212,9 @@ func LoadDCS(path string) (*DCSConfig, error) {
 	}
 	if cfg.Aggregator.BatchLimit <= 0 {
 		cfg.Aggregator.BatchLimit = 1000
+	}
+	if cfg.Aggregator.MetricMultiplier <= 0 {
+		cfg.Aggregator.MetricMultiplier = 50
 	}
 	if cfg.Aggregator.IdleIntervalMs <= 0 {
 		cfg.Aggregator.IdleIntervalMs = 60000

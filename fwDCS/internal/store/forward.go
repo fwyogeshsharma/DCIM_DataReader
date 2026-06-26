@@ -378,6 +378,48 @@ func (db *DB) MetricsSince(ctx context.Context,
 	return out, rows.Err()
 }
 
+// MetricsAt returns ALL metric samples at exactly ts for the tenant — used by
+// the forwarder only when a single timestamp holds more rows than the paged
+// limit (so the page can't be trimmed to a clean ts boundary without losing
+// rows). A timestamp is the smallest cursor unit, so its whole group must ship
+// together. No LIMIT: the group is one instant's data and is forwarded atomically.
+func (db *DB) MetricsAt(ctx context.Context,
+	orgID, netID, grpID string, ts time.Time) ([]FwdMetric, error) {
+
+	rows, err := db.pool.Query(ctx, `
+		SELECT m.device_id, COALESCE(m.interface_id::text, ''),
+		       m.metric_name, m.value, m.tag,
+		       COALESCE(m.attributes::text, '{}'),
+		       m.collector_agent, m.collector_protocol,
+		       COALESCE(i.interface_name, ''),
+		       m.ts
+		FROM metrics m
+		JOIN devices d ON d.id = m.device_id
+		LEFT JOIN interfaces i ON i.id = m.interface_id
+		WHERE d.org_id=$1
+		  AND d.network_id=$2 AND d.group_id=$3
+		  AND m.ts = $4
+		ORDER BY m.ts ASC`,
+		orgID, netID, grpID, ts,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FwdMetric
+	for rows.Next() {
+		var m FwdMetric
+		if err := rows.Scan(&m.DeviceID, &m.InterfaceID,
+			&m.MetricName, &m.Value, &m.Tag,
+			&m.Attributes, &m.CollectorAgent, &m.CollectorProtocol,
+			&m.InterfaceName, &m.TS); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // FwdEnergy is one BACnet energy reading forwarded to the Aggregator. circuit/
 // phase are first-class so the Aggregator stores them in its own columns.
 type FwdEnergy struct {
@@ -411,6 +453,40 @@ func (db *DB) EnergySince(ctx context.Context,
 		ORDER BY e.ts ASC
 		LIMIT $5`,
 		orgID, netID, grpID, since, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FwdEnergy
+	for rows.Next() {
+		var e FwdEnergy
+		if err := rows.Scan(&e.DeviceID, &e.MetricName, &e.Value, &e.Tag,
+			&e.Circuit, &e.Phase, &e.Scope, &e.Attributes,
+			&e.CollectorAgent, &e.CollectorProtocol, &e.TS); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// EnergyAt returns ALL energy_metrics rows at exactly ts for the tenant — the
+// energy analogue of MetricsAt, used only for an oversized single-ts group.
+func (db *DB) EnergyAt(ctx context.Context,
+	orgID, netID, grpID string, ts time.Time) ([]FwdEnergy, error) {
+
+	rows, err := db.pool.Query(ctx, `
+		SELECT e.device_id, e.metric_name, e.value, e.tag, e.circuit, e.phase,
+		       COALESCE(e.scope, ''),
+		       COALESCE(e.attributes::text, '{}'),
+		       e.collector_agent, e.collector_protocol, e.ts
+		FROM energy_metrics e
+		JOIN devices d ON d.id = e.device_id
+		WHERE d.org_id=$1 AND d.network_id=$2 AND d.group_id=$3
+		  AND e.ts = $4
+		ORDER BY e.ts ASC`,
+		orgID, netID, grpID, ts,
 	)
 	if err != nil {
 		return nil, err

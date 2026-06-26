@@ -420,7 +420,11 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 	if batchLimit <= 0 {
 		batchLimit = 1000
 	}
-	metricLimit := batchLimit * 50 // metrics volume >> device volume
+	mult := f.cfg.MetricMultiplier
+	if mult <= 0 {
+		mult = 50
+	}
+	metricLimit := batchLimit * mult // metrics volume >> device volume
 
 	// ── 1+2. Query each table, gated by per-table adaptive backoff ────────────
 	// A drained table (zero rows) is skipped for a growing number of ticks
@@ -461,6 +465,22 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 			return fmt.Errorf("metrics query: %w", err)
 		}
 		f.recordPoll("metrics", netID, len(recentMetrics) > 0)
+		// When the query was truncated by metricLimit, drop trailing rows sharing
+		// the last timestamp so the cursor (advanced to the last row's ts, then
+		// queried as `ts > cursor`) never lands mid-same-ts and skips the rest.
+		// The trimmed rows are re-read next tick. If the whole page is one ts that
+		// overflows the limit, fetch the complete group for that ts instead.
+		trimmed, single := trimToTSBoundary(recentMetrics, len(recentMetrics) == metricLimit,
+			func(m store.FwdMetric) time.Time { return m.TS })
+		if single {
+			recentMetrics, err = f.db.MetricsAt(ctx, f.cfg.OrgID, netID, f.cfg.GroupID,
+				recentMetrics[len(recentMetrics)-1].TS)
+			if err != nil {
+				return fmt.Errorf("metrics full-group query: %w", err)
+			}
+		} else {
+			recentMetrics = trimmed
+		}
 	}
 
 	if force || f.shouldPoll("energy", netID) {
@@ -471,6 +491,17 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 			return fmt.Errorf("energy query: %w", err)
 		}
 		f.recordPoll("energy", netID, len(recentEnergy) > 0)
+		trimmed, single := trimToTSBoundary(recentEnergy, len(recentEnergy) == metricLimit,
+			func(e store.FwdEnergy) time.Time { return e.TS })
+		if single {
+			recentEnergy, err = f.db.EnergyAt(ctx, f.cfg.OrgID, netID, f.cfg.GroupID,
+				recentEnergy[len(recentEnergy)-1].TS)
+			if err != nil {
+				return fmt.Errorf("energy full-group query: %w", err)
+			}
+		} else {
+			recentEnergy = trimmed
+		}
 	}
 
 	if force || f.shouldPoll("topology", netID) {
@@ -726,6 +757,34 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 	}
 
 	return nil
+}
+
+// trimToTSBoundary drops trailing rows that share the last row's timestamp, but
+// ONLY when the result set was truncated by the query LIMIT (truncated=true).
+// The metrics/energy cursor advances to the last forwarded row's ts and the next
+// page queries `ts > cursor`; if a LIMIT cut a same-ts group in half, those
+// leftover same-ts rows would be silently skipped. Trimming to a clean ts
+// boundary guarantees they are re-read on the next page — no loss, no duplicates.
+//
+// singleGroup is true when EVERY row in a truncated page shares one timestamp:
+// trimming would empty the page and stall progress, AND that ts has more rows
+// than the page limit. The caller must then fetch the COMPLETE group for that ts
+// (MetricsAt/EnergyAt) and advance past it — a timestamp is the smallest cursor
+// unit, so its group ships atomically. When not truncated the page is already
+// complete and is returned unchanged with singleGroup=false.
+func trimToTSBoundary[T any](rows []T, truncated bool, ts func(T) time.Time) (out []T, singleGroup bool) {
+	if !truncated || len(rows) == 0 {
+		return rows, false
+	}
+	last := ts(rows[len(rows)-1])
+	cut := len(rows)
+	for cut > 0 && ts(rows[cut-1]).Equal(last) {
+		cut--
+	}
+	if cut == 0 {
+		return rows, true // whole page is one oversized ts group
+	}
+	return rows[:cut], false
 }
 
 // scopeKey identifies one (datacenter_id, floor_id) Aggregator payload scope.
@@ -1051,21 +1110,38 @@ func (f *Forwarder) chunkPayload(p *aggPayload) []*aggPayload {
 		chunks = append(chunks, cur)
 	}
 
-	// Trailing topology + events, split into byte-bounded chunks of their own and
-	// sent last so link endpoints are already committed.
-	for _, tl := range p.TopologyLinks {
-		if len(chunks) == 0 || lastTailFull(chunks, jsonLen(tl), true) {
-			chunks = append(chunks, base())
+	// Trailing topology + events ride in their own chunk(s) emitted AFTER all
+	// device chunks (so link endpoints are already committed). Track the active
+	// tail chunk's serialized size with a RUNNING counter instead of re-summing
+	// the whole chunk on every append — the previous lastTailFull() re-marshaled
+	// every item already in the tail per appended item, which was O(n²) in tail
+	// length and pegged a core under large link/event batches. Chunk boundaries
+	// here are byte-identical to that logic (same 512 envelope, same maxPostBytes
+	// threshold, same "force a fresh chunk off a device chunk" and "an oversized
+	// item ships alone" semantics).
+	const tailEnvelope = 512
+	var tail *aggPayload // nil until the first trailing item opens a fresh chunk
+	tailBytes := 0
+	openTail := func(addBytes int) {
+		// Open a new tail chunk when there is none yet (every chunk built above is
+		// a device chunk, which must not carry trailing items), or when the active
+		// tail already has content and one more item would exceed the budget. A
+		// single oversized item still ships alone in an otherwise-empty tail.
+		hasContent := tail != nil && (len(tail.TopologyLinks) > 0 || len(tail.Events) > 0)
+		if tail == nil || (hasContent && tailBytes+addBytes > maxPostBytes) {
+			tail = base()
+			tailBytes = tailEnvelope
+			chunks = append(chunks, tail)
 		}
-		c := chunks[len(chunks)-1]
-		c.TopologyLinks = append(c.TopologyLinks, tl)
+		tailBytes += addBytes
+	}
+	for _, tl := range p.TopologyLinks {
+		openTail(jsonLen(tl))
+		tail.TopologyLinks = append(tail.TopologyLinks, tl)
 	}
 	for _, ev := range p.Events {
-		if len(chunks) == 0 || lastTailFull(chunks, jsonLen(ev), false) {
-			chunks = append(chunks, base())
-		}
-		c := chunks[len(chunks)-1]
-		c.Events = append(c.Events, ev)
+		openTail(jsonLen(ev))
+		tail.Events = append(tail.Events, ev)
 	}
 
 	return chunks
@@ -1125,26 +1201,6 @@ func jsonLen(v any) int {
 		return 0
 	}
 	return len(b)
-}
-
-// lastTailFull reports whether the trailing chunk can't take addBytes more of a
-// topology link (isLink) or event without exceeding the byte budget, OR isn't a
-// pure tail chunk (still holds devices — links/events must not piggyback on a
-// device chunk, which is POSTed before endpoints commit).
-func lastTailFull(chunks []*aggPayload, addBytes int, isLink bool) bool {
-	c := chunks[len(chunks)-1]
-	if len(c.Devices) > 0 {
-		return true // last chunk is a device chunk — force a fresh tail chunk
-	}
-	cur := 512 // envelope
-	for _, l := range c.TopologyLinks {
-		cur += jsonLen(l)
-	}
-	for _, e := range c.Events {
-		cur += jsonLen(e)
-	}
-	hasContent := len(c.TopologyLinks) > 0 || len(c.Events) > 0
-	return hasContent && cur+addBytes > maxPostBytes
 }
 
 // postWithRetry POSTs the payload to the Aggregator endpoint. Retries on

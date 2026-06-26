@@ -166,11 +166,17 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 			}
 		}
 	case TierServerHealth:
-		// Light server CPU/RAM tier: UCD-SNMP scalars ONLY (cpu user/system/idle,
-		// mem total/avail/cached/buffer) — a handful of Gets, no HOST-RESOURCES
-		// walks. Lets us collect server CPU/RAM without enabling the heavy SLOW
-		// tier. Best-effort, non-fatal; no-op for non-server device types.
+		// Server CPU/RAM/storage tier, independent of the heavy SLOW tier. Collects
+		// UCD-SNMP scalars (cpu user/system/idle, mem total/avail/cached/buffer) PLUS
+		// HOST-RESOURCES (per-core CPU + per-mount storage size/used/available) — the
+		// only SNMP source for server.storage_*. Heavier than a few Gets (storage is
+		// a small table walk), so schedule it on a slow cadence (rewalk_interval_ms,
+		// e.g. daily) rather than the FAST heartbeat. Best-effort, non-fatal; no-op
+		// for non-server device types.
 		if c.target.DeviceType == "server" {
+			if p, err := c.collectServerHR(); err == nil {
+				pkts = append(pkts, p...)
+			}
 			if p, err := c.collectUCD(); err == nil {
 				pkts = append(pkts, p...)
 			}
@@ -517,7 +523,11 @@ func (c *Collector) collectUPS() ([]*v1.TelemetryPacket, error) {
 	for _, p := range pkt.Variables {
 		col := strings.TrimPrefix(p.Name, ".")
 		if name, ok := nameMap[col]; ok {
-			pkts = append(pkts, c.newMetric(name, "", ToFloat64(p), c.hostMeta()))
+			v := ToFloat64(p)
+			if col == OIDUpsBatteryVoltage {
+				v /= 10 // simulator encodes battery voltage ×10 (2200 → 220.0 V)
+			}
+			pkts = append(pkts, c.newMetric(name, "", v, c.hostMeta()))
 		}
 	}
 
@@ -535,7 +545,7 @@ func (c *Collector) collectUPS() ([]*v1.TelemetryPacket, error) {
 	outCurrPDUs, _ := c.client.Walk(OIDUpsOutputCurrent)
 	for _, p := range outCurrPDUs {
 		pkts = append(pkts, c.newMetric("environment.ups_output_current_a",
-			LastOIDComponent(p.Name), ToFloat64(p), c.hostMeta()))
+			LastOIDComponent(p.Name), ToFloat64(p)/10, c.hostMeta())) // simulator encodes ×10 A
 	}
 	outLoadPDUs, _ := c.client.Walk(OIDUpsOutputLoad)
 	for _, p := range outLoadPDUs {

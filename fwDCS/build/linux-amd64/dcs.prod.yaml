@@ -4,7 +4,8 @@ grpc:
   addr: ":9090"
 
 rest:
-  addr: ":8080"
+  addr: ":8081"
+  command_key: "fw-control-7b1c9e2a4d"   # EDR sends this as X-Command-Key to pull/ack device commands
 
 postgres:
   dsn: "postgresql://fwdcim:fwdcim@127.0.0.1:5438/fwdcim?sslmode=disable"
@@ -19,7 +20,7 @@ tls:
 
 log:
   level:  "info"
-  format: "console"
+  format: "json"
 
 # Demo retention — tiny disk footprint. Reconciled every boot; edit + restart
 # dcs to retune. Bump raw_retention if you want more history during the demo.
@@ -27,29 +28,31 @@ retention:
   enabled: true
   metrics:
     chunk_interval:   "5m"
-    raw_retention:    "20m"
-    compress_after:   ""
-    rollup_retention: "24h"
+    raw_retention:    "30m"    # was 15m — must exceed metrics_rollup_5m start_offset (20m)
+    compress_after:   "1h"     # was "" — compress old chunks → less disk
+    rollup_retention: "6h"     # was 24h — trend history; lower = less disk
   energy:
     chunk_interval:   "5m"
-    raw_retention:    "20m"
-    compress_after:   ""
-    rollup_retention: "168h"
+    raw_retention:    "30m"
+    compress_after:   "1h"
+    rollup_retention: "24h"    # was 168h
 
 # Push to fwdcim cloud. Mirrors local — enable + key if the demo forwards upstream.
 aggregator:
   enabled:     true
   endpoint:    "https://fwdcim.faberwork.com/api/v1/ingest"
   ingest_key:  "74613fe24e4da087f46d584c6558870a3bed6b993a6416ced4df17f9a0f1e824"
-  interval_ms:       5000    # hot-table poll cadence (tables with new rows)
-  idle_interval_ms:  60000   # drained-table re-check cadence; backs off empty scans to cut idle CPU
-  event_debounce_ms: 300     # any event (trap/alarm/link/rename) forces an immediate push after this coalesce window
-  batch_limit:       1000
+  interval_ms: 30000   # push cadence; higher = less CPU/marshal work (was 5000)
+  idle_interval_ms: 120000   # drained tables re-checked rarely → less idle CPU
+  batch_limit: 1000
+  metric_multiplier: 10   # metric/energy ceiling = batch_limit*10 = 10k/push (was hardcoded 50 = 50k).
+                          # Caps the transient heap each push materializes+serializes → smaller GC
+                          # bursts vs GOMEMLIMIT. Backlogs just drain over more ticks (no data loss).
   org_id:      "faber"
   network_id:  "net-prod"
   group_id:    "grp-core"
 
 topology:
   root:                  "192.168.0.7"   # DC1-ER1 seed/edge router; "" = auto
-  recompute_interval_ms: 30000
+  recompute_interval_ms: 300000   # BFS over all devices; higher = less CPU (was 30000)
   classify_roles:        true

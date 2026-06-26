@@ -48,18 +48,22 @@ const (
 	OIDUcdSsCpuSystem = "1.3.6.1.4.1.2021.11.10.0"
 	OIDUcdSsCpuIdle   = "1.3.6.1.4.1.2021.11.11.0"
 
-	// UCD-SNMP-MIB — Memory
+	// UCD-SNMP-MIB — Memory. The simulator serves memCached at .4.11.0 and
+	// memBuffer at .4.12.0 (snmprec_generator._server_entries), NOT the standard
+	// net-snmp .15/.14 columns — reading .14/.15 returned a string label / nothing,
+	// so both metrics always landed as 0.
 	OIDUcdMemTotalReal = "1.3.6.1.4.1.2021.4.5.0"
 	OIDUcdMemAvailReal = "1.3.6.1.4.1.2021.4.6.0"
-	OIDUcdMemCached    = "1.3.6.1.4.1.2021.4.14.0"
-	OIDUcdMemBuffer    = "1.3.6.1.4.1.2021.4.15.0"
+	OIDUcdMemCached    = "1.3.6.1.4.1.2021.4.11.0"
+	OIDUcdMemBuffer    = "1.3.6.1.4.1.2021.4.12.0"
 
 	// UPS-MIB (RFC 1628)
-	// Battery group layout matches the simulator's _ups_entries: status .1, minutes
-	// remaining .4, charge% .5, voltage .6, temperature .8 (.2/.3/.7 unused). The
+	// Battery group layout matches the simulator's _ups_entries: status .3 (the
+	// LIVE column the sim patches; .1 is a frozen "2"=normal alias), minutes
+	// remaining .4, charge% .5, voltage .6, temperature .8 (.2/.7 unused). The
 	// minutes/charge/voltage columns previously read .3/.4/.5 — off by one — so
 	// ups_charge_percent actually returned the minutes value, etc.
-	OIDUpsBatteryStatus            = "1.3.6.1.2.1.33.1.2.1.0"
+	OIDUpsBatteryStatus            = "1.3.6.1.2.1.33.1.2.3.0"
 	OIDUpsSecondsOnBattery         = "1.3.6.1.2.1.33.1.2.2.0"
 	OIDUpsEstimatedMinutesRemain   = "1.3.6.1.2.1.33.1.2.4.0"
 	OIDUpsEstimatedChargeRemaining = "1.3.6.1.2.1.33.1.2.5.0"
@@ -73,8 +77,10 @@ const (
 	OIDUpsInputVoltage       = "1.3.6.1.2.1.33.1.3.3.1.3"
 	OIDUpsOutputTable        = "1.3.6.1.2.1.33.1.4.4"
 	OIDUpsOutputVoltage      = "1.3.6.1.2.1.33.1.4.4.1.2"
-	OIDUpsOutputCurrent      = "1.3.6.1.2.1.33.1.4.4.1.3"
-	OIDUpsOutputLoad         = "1.3.6.1.2.1.33.1.4.4.1.5"
+	OIDUpsOutputCurrent      = "1.3.6.1.2.1.33.1.4.4.1.3" // simulator encodes ×10 A
+	// Output percent load: the simulator patches the LIVE value at .4.4.1.6.1;
+	// .4.4.1.5.1 is a frozen "0" alias, so reading .5 always returned 0.
+	OIDUpsOutputLoad = "1.3.6.1.2.1.33.1.4.4.1.6"
 
 	// Raritan PX2 / DPX2 sensor table. Column layout (RARITAN-PX2-MIB,
 	// externalSensorTable .3.1.N): .2=index, .3=type, .4=value, .5=state.

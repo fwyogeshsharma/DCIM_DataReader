@@ -25,10 +25,17 @@ RestartSec=3
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
-# ── Lightweight guards ───────────────────────────────────────────────────────
-# RAM is already bounded by GOMEMLIMIT=384MiB inside dcs_prod.sh. To also cap CPU:
-# Nice=10                 # lower CPU priority than interactive work
-# CPUQuota=80%            # never exceed ~0.8 core (leave headroom on a 2-core VM)
+# ── Resource guards ──────────────────────────────────────────────────────────
+# Hard cgroup ceiling so a forwarder burst can never take the whole VM down: the
+# kernel caps THIS service instead of OOM-killing a random VM process. Set ABOVE
+# GOMEMLIMIT (384MiB in dcs_prod.sh) so the Go runtime GCs hard and reclaims
+# before the cgroup limit is hit; MemoryHigh applies reclaim pressure first, then
+# MemoryMax is the hard stop. On a true OOM systemd restarts (Restart=always).
+MemoryHigh=448M
+MemoryMax=512M
+# Cap CPU so a GC-thrash spike can't starve the rest of a small (2-core) VM.
+CPUQuota=80%
+Nice=10
 
 [Install]
 WantedBy=multi-user.target

@@ -45,6 +45,9 @@ aggregator:
   interval_ms: 30000   # push cadence; higher = less CPU/marshal work (was 5000)
   idle_interval_ms: 120000   # drained tables re-checked rarely → less idle CPU
   batch_limit: 1000
+  metric_multiplier: 10   # metric/energy ceiling = batch_limit*10 = 10k/push (was hardcoded 50 = 50k).
+                          # Caps the transient heap each push materializes+serializes → smaller GC
+                          # bursts vs GOMEMLIMIT. Backlogs just drain over more ticks (no data loss).
   org_id:      "faber"
   network_id:  "net-prod"
   group_id:    "grp-core"

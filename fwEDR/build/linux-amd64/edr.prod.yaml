@@ -18,6 +18,10 @@ publisher:
   batch_size:        512
   flush_interval_ms: 200
   max_in_flight:     8
+  dcs_down_after:        3      # consecutive BatchPush failures -> pause collection (poller stops)
+  dcs_probe_interval_ms: 5000   # while paused, empty-push probe DCS this often; resume on success
+  enqueue_retry_attempts: 10   # fan-in retries a full local queue 10*20ms=~200ms (was 50=~1s) so the
+  enqueue_retry_ms:       20   # sole channel drainer stays responsive; criticals still admitted via eviction
 
 # Simulator topology JSON — absolute path on the VM (native run, no container).
 topology_file: "/home/fabercomp_gmail_com/DCIM/Datacenter_Network_Simulator/topologies/dual_dc_enterprise.json"
@@ -34,19 +38,26 @@ discovery:
 snmp:
   community:           "public"
   version:             2
-  poll_interval_ms:    30000
+  poll_interval_ms:    60000
+  fast_interval_ms:     60000   # liveness Get cadence
+  medium_interval_ms:   180000  # interface state walks — slower = less CPU
+  slow_interval_ms:     600000  # heavy counter/HR walks (mostly off here)
+  topology_interval_ms: 900000  # LLDP refresh — rarely changes
   timeout_ms:          5000
   retries:             0
   trap_addr:           "127.0.0.1:162"
+  trap_workers:        64     # bounded decode pool: a trap storm can't spawn unbounded goroutines
+                              # (the OOM vector). 0 = legacy goroutine-per-datagram.
   mgmt_port:           1161   # simulator live-name agent (host networking → reaches sim)
-  liveness_interval_ms: 15000
+  liveness_interval_ms: 30000     # FAST sysName+uptime heartbeat (rename/last_seen)
+  rewalk_interval_ms:   86400000  # heavy full re-walk once/day (server storage, counters); runs alongside liveness
   max_concurrent:      3
   rate_limit_per_sec:  30
   walk_medium:         true
   walk_topology:       false
   walk_slow:           false
   walk_sensors:        true
-  walk_server_health:  true
+  walk_server_health:  true    # server CPU/RAM (UCD) + HOST-RESOURCES storage/per-core CPU; runs on the daily rewalk
   breaker_threshold:   3
   breaker_cooldown_ms: 30000
   metrics_log_interval_ms: 0
@@ -61,7 +72,7 @@ gnmi:
   proxy_addr:       "127.0.0.1:50051"
   fallback_port:    57400
   proxy_probe_interval_ms: 5000
-  poll_interval_ms: 30000
+  poll_interval_ms: 60000   # gNMI SAMPLE interval; higher = less stream/CPU (was 30000)
   tls:
     insecure: true
   username: ""
@@ -70,7 +81,7 @@ gnmi:
 bacnet:
   enabled:          true
   port:             47808
-  poll_interval_ms: 30000
+  poll_interval_ms: 60000   # ReadPropertyMultiple cadence; higher = less CPU (was 30000)
   timeout_ms:       2000
   retries:          1
   read_circuits:    true
@@ -78,6 +89,37 @@ bacnet:
   use_cov:          true
   cov_lifetime_sec: 300
 
+# Servers expose OS usage (CPU/mem/disk/net via the Oem extension) AND BMC
+# hardware health (temps/fans/PSU/power/chassis state) over Redfish on the mgmt
+# IP. One light pull per interval — the server analog of gNMI for sw/routers.
+redfish:
+  enabled:          true
+  port:             8443
+  username:         "admin"
+  password:         "password"
+  poll_interval_ms: 60000   # BMC GET cadence; higher = less CPU (was 30000)
+  timeout_ms:       5000
+  max_concurrent:   4
+  tls_insecure:     false   # simulator serves plain HTTP; set true for HTTPS BMCs
+
+# Downstream control plane — apply UI edits down to devices via SNMP SET / Redfish.
+command_apply:
+  enabled:          true
+  dcs_base_url:     "http://localhost:8081"   # DCS rest.addr in prod (NOT :9090 gRPC)
+  command_key:      "fw-control-7b1c9e2a4d"   # must match dcs.prod.yaml rest.command_key
+  poll_interval_ms: 30000
+  snmp_set_agent:   "127.0.0.1"               # sim on-box; "" = device IP for real devices
+  snmp_set_port:    1161
+  snmp_set_community: ""
+
+# Threshold sync — fetch per-device thresholds up into DCS device_thresholds.
+threshold_sync:
+  enabled:          true
+  agent:            "127.0.0.1"
+  port:             1161
+  community:        ""
+  poll_interval_ms: 300000
+
 log:
   level:  "info"
-  format: "console"
+  format: "json"

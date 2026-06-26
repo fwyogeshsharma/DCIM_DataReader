@@ -305,27 +305,8 @@ func (p *Poller) runTarget(ctx context.Context, t *target.Target, firstWalkDone 
 	case <-time.After(time.Duration(rand.Int63n(int64(spread)))):
 	}
 
-	rewalk := time.Duration(p.snmpCfg.RewalkIntervalMs) * time.Millisecond
-	if rewalk > 0 {
-		// Periodic full re-walk mode: walk now, then on the configured interval.
-		p.walkAll(ctx, t)
-		firstWalkDone()
-		ticker := time.NewTicker(rewalk)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				p.walkAll(ctx, t)
-			}
-		}
-	}
-
-	// One-shot mode (default): walk until the device answers once, then stop and
-	// let traps drive events. Retrying the initial walk means a device that was
-	// unreachable at startup still gets inventoried when it comes up — without any
-	// steady-state polling afterward.
+	// Walk until the device answers once (a device that was down at startup still
+	// gets inventoried when it comes up), then settle into steady state.
 	retry := time.Duration(p.snmpCfg.WalkRetryIntervalMs) * time.Millisecond
 	if retry <= 0 {
 		retry = 30 * time.Second
@@ -338,43 +319,58 @@ func (p *Poller) runTarget(ctx context.Context, t *target.Target, firstWalkDone 
 			walkedOnce = true
 		}
 		if ok {
-			// Lightweight liveness heartbeat: after the one-shot walk, keep doing a
-			// single FAST (sysName+uptime) GET on an interval so a source-side rename
-			// propagates to the DB without a full re-walk. Much cheaper than rewalk —
-			// one OID-set, no interface/counter/sensor walks. Keeps the session open
-			// (the heartbeat reuses it). Only when rewalk isn't already running.
-			if hb := time.Duration(p.snmpCfg.LivenessIntervalMs) * time.Millisecond; hb > 0 {
-				p.log.Debug("initial SNMP walk complete — entering FAST liveness heartbeat",
-					zap.String("target", t.SourceID()), zap.Duration("interval", hb))
-				ticker := time.NewTicker(hb)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						p.closeConn(t)
-						return
-					case <-ticker.C:
-						p.pollSNMP(ctx, t, snmp.TierFast) // 1 GET: sysName+uptime → rename + last_seen
-					}
-				}
-			}
-			// One-shot done: release this device's SNMP session. Traps don't use
-			// it, and ~hundreds of idle UDP sockets lingering is what exhausts
-			// Windows socket buffers (WSAENOBUFS) — keeping only in-flight walks
-			// holding sockets avoids that. A re-walk (rewalk mode) keeps its
-			// session; this path is one-shot only.
-			p.closeConn(t)
-			// Debug, not Info: this fires once per device (hundreds of lines on a
-			// serial walk). Watch the single "topology links emitted from JSON" line
-			// for readiness instead.
-			p.log.Debug("initial SNMP walk complete — switching to trap-driven monitoring",
-				zap.String("target", t.SourceID()))
-			return
+			break
 		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(retry):
+		}
+	}
+
+	// Steady state. Two INDEPENDENT cadences run together:
+	//   • FAST liveness heartbeat (liveness_interval_ms) — a single sysName+uptime
+	//     GET so a source-side rename / last_seen propagates quickly and cheaply.
+	//   • Periodic full re-walk (rewalk_interval_ms) — the heavy inventory + server
+	//     storage/counter walk. A full walk is expensive, so this is meant to run
+	//     rarely (e.g. once a day); decoupling it from the heartbeat means a daily
+	//     heavy walk doesn't cost fast rename propagation (previously rewalk mode
+	//     REPLACED the heartbeat).
+	// With neither set this is pure one-shot: release the session (hundreds of idle
+	// UDP sockets are what exhaust Windows socket buffers / WSAENOBUFS) and rely on
+	// traps for ongoing events.
+	hb := time.Duration(p.snmpCfg.LivenessIntervalMs) * time.Millisecond
+	rewalk := time.Duration(p.snmpCfg.RewalkIntervalMs) * time.Millisecond
+	if hb <= 0 && rewalk <= 0 {
+		p.closeConn(t)
+		p.log.Debug("initial SNMP walk complete — switching to trap-driven monitoring",
+			zap.String("target", t.SourceID()))
+		return
+	}
+
+	var hbC, rewalkC <-chan time.Time
+	if hb > 0 {
+		tk := time.NewTicker(hb)
+		defer tk.Stop()
+		hbC = tk.C
+	}
+	if rewalk > 0 {
+		tk := time.NewTicker(rewalk)
+		defer tk.Stop()
+		rewalkC = tk.C
+	}
+	p.log.Debug("initial SNMP walk complete — steady state",
+		zap.String("target", t.SourceID()),
+		zap.Duration("liveness", hb), zap.Duration("rewalk", rewalk))
+	for {
+		select {
+		case <-ctx.Done():
+			p.closeConn(t)
+			return
+		case <-hbC:
+			p.pollSNMP(ctx, t, snmp.TierFast) // 1 GET: sysName+uptime → rename + last_seen
+		case <-rewalkC:
+			p.walkAll(ctx, t) // heavy: full tiered inventory + server storage refresh
 		}
 	}
 }

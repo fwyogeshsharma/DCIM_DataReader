@@ -142,6 +142,16 @@ func run(cfgPath string, forceRediscover bool) error {
 		if flushInterval <= 0 {
 			flushInterval = 200 * time.Millisecond
 		}
+		// Bound how long this (sole) fan-in goroutine blocks retrying a full local
+		// queue: while it blocks, pktCh isn't drained and every producer stalls.
+		retryAttempts := cfg.Publisher.EnqueueRetryAttempts
+		if retryAttempts <= 0 {
+			retryAttempts = 50
+		}
+		retryDelay := time.Duration(cfg.Publisher.EnqueueRetryMs) * time.Millisecond
+		if retryDelay <= 0 {
+			retryDelay = 20 * time.Millisecond
+		}
 		buf := make([]*v1.TelemetryPacket, 0, batchSize)
 		ticker := time.NewTicker(flushInterval)
 		defer ticker.Stop()
@@ -156,11 +166,11 @@ func run(cfgPath string, forceRediscover bool) error {
 			// drops. Capped (~1s) so a genuinely-down DCS can't block the fan-in
 			// goroutine forever; only then do we drop and move on.
 			var err error
-			for attempt := 0; attempt < 50; attempt++ {
+			for attempt := 0; attempt < retryAttempts; attempt++ {
 				if err = pub.EnqueueBatch(buf); err == nil {
 					break
 				}
-				time.Sleep(20 * time.Millisecond)
+				time.Sleep(retryDelay)
 			}
 			if err != nil {
 				log.Warn("enqueue batch failed after backpressure — dropping",
@@ -361,7 +371,7 @@ func run(cfgPath string, forceRediscover bool) error {
 			cfg.Identity.FloorID,
 			netIDFor,
 			cfg.Identity.GroupID, cfg.Identity.ReaderID,
-			trapSigner, pktCh, log,
+			trapSigner, pktCh, cfg.SNMP.TrapWorkers, log,
 		)
 		go func() {
 			if err := trapReceiver.Listen(); err != nil {

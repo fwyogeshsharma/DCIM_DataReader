@@ -20,11 +20,16 @@ RestartSec=3
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
-# ── Lightweight guards ───────────────────────────────────────────────────────
-# RAM is already bounded by GOMEMLIMIT=192MiB inside edr_prod.sh. EDR is mostly
-# I/O-wait on SNMP/Redfish, so a low CPU cap is safe:
-# Nice=10
-# CPUQuota=60%
+# ── Resource guards ──────────────────────────────────────────────────────────
+# Hard cgroup ceiling so a trap-storm goroutine pileup can never OOM the VM: the
+# kernel caps THIS service. Set ABOVE GOMEMLIMIT (192MiB in edr_prod.sh) so the
+# Go runtime reclaims before the hard stop. The bbolt queue is on disk and
+# survives a restart, so an OOM restart loses only in-flight (un-queued) packets.
+MemoryHigh=224M
+MemoryMax=256M
+# EDR is mostly I/O-wait on SNMP/Redfish, so a low CPU cap is safe.
+CPUQuota=60%
+Nice=10
 
 [Install]
 WantedBy=multi-user.target

@@ -63,7 +63,14 @@ type TrapReceiver struct {
 	readerID string
 	signer   *packet.Signer
 	out      chan<- *v1.TelemetryPacket
+	workers  int // > 0: bounded decode pool; 0: legacy goroutine-per-datagram
 	log      *zap.Logger
+}
+
+// trapJob is one received datagram queued for decoding by the worker pool.
+type trapJob struct {
+	raw   []byte
+	srcIP string
 }
 
 // NewTrapReceiver creates a TrapReceiver. out receives decoded trap packets.
@@ -77,6 +84,7 @@ func NewTrapReceiver(
 	grpID, readerID string,
 	signer *packet.Signer,
 	out chan<- *v1.TelemetryPacket,
+	workers int,
 	log *zap.Logger,
 ) *TrapReceiver {
 	return &TrapReceiver{
@@ -89,6 +97,7 @@ func NewTrapReceiver(
 		readerID: readerID,
 		signer:   signer,
 		out:      out,
+		workers:  workers,
 		log:      log,
 	}
 }
@@ -113,7 +122,26 @@ func (r *TrapReceiver) Listen() error {
 		return err
 	}
 	defer conn.Close()
-	r.log.Info("snmp trap receiver listening", zap.String("addr", listenAddr), zap.String("network", network))
+	r.log.Info("snmp trap receiver listening",
+		zap.String("addr", listenAddr), zap.String("network", network), zap.Int("workers", r.workers))
+
+	// Bounded decode pool: with workers > 0 a fixed set of goroutines drains a
+	// job channel, so a trap storm can't spawn unbounded goroutines. When the
+	// pool is saturated the blocking send below stops reading the socket, pushing
+	// backpressure to the kernel UDP buffer rather than the heap. workers == 0
+	// preserves the legacy unbounded goroutine-per-datagram path.
+	var jobs chan trapJob
+	if r.workers > 0 {
+		jobs = make(chan trapJob, r.workers*8)
+		defer close(jobs)
+		for i := 0; i < r.workers; i++ {
+			go func() {
+				for j := range jobs {
+					r.handle(j.raw, j.srcIP)
+				}
+			}()
+		}
+	}
 
 	buf := make([]byte, 65535)
 	for {
@@ -124,7 +152,11 @@ func (r *TrapReceiver) Listen() error {
 		raw := make([]byte, n)
 		copy(raw, buf[:n])
 		r.log.Debug("trap datagram received", zap.String("src", src.String()), zap.Int("bytes", n))
-		go r.handle(raw, src.IP.String())
+		if jobs != nil {
+			jobs <- trapJob{raw: raw, srcIP: src.IP.String()} // blocks when pool saturated → socket backpressure
+		} else {
+			go r.handle(raw, src.IP.String())
+		}
 	}
 }
 

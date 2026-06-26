@@ -70,12 +70,17 @@ var plantObjects = map[string][]objMeta{
 		{ObjAnalogInput, 4, "cooling.tcs_flow_lps", "", 1},
 		{ObjAnalogInput, 5, "cooling.facility_chw_valve_pct", "", 1},
 		{ObjAnalogInput, 6, "cooling.facility_chw_flow_lps", "", 1},
-		{ObjAnalogInput, 7, "cooling.heat_load_kw", "", 1},
-		{ObjAnalogInput, 8, "cooling.pump_power_kw", "", 1},
-		{ObjAnalogInput, 9, "cooling.pump_speed_pct", "", 1},
-		{ObjAnalogInput, 10, "cooling.approach_temp_c", "", 1},
-		{ObjAnalogInput, 11, "cooling.filter_dp_kpa", "", 1},
-		{ObjAnalogInput, 12, "cooling.run_hours_h", "", 1},
+		// Sim CDU has 13 AIs: TCS_Loop_Pressure sits at AI:7 (bacnet_plant_generator
+		// CDU spec). Omitting it shifted every following point down one instance, so
+		// heat_load…filter_dp read their neighbour's value and run_hours (AI:13) was
+		// never read. Map AI:7 explicitly to keep 8..13 aligned with the sim.
+		{ObjAnalogInput, 7, "cooling.tcs_loop_pressure_kpa", "", 1},
+		{ObjAnalogInput, 8, "cooling.heat_load_kw", "", 1},
+		{ObjAnalogInput, 9, "cooling.pump_power_kw", "", 1},
+		{ObjAnalogInput, 10, "cooling.pump_speed_pct", "", 1},
+		{ObjAnalogInput, 11, "cooling.approach_temp_c", "", 1},
+		{ObjAnalogInput, 12, "cooling.filter_dp_kpa", "", 1},
+		{ObjAnalogInput, 13, "cooling.run_hours_h", "", 1},
 		{ObjBinaryInput, 1, "cooling.cdu_running", "", 1},
 		{ObjBinaryInput, 2, "cooling.alarm_leak", "", 1},
 		{ObjBinaryInput, 3, "cooling.alarm_high_supply_temp", "", 1},

@@ -8,7 +8,6 @@ package queue
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -235,11 +234,15 @@ func (q *Queue) Close() error { return q.db.Close() }
 func evictOldestNonCritical(b *bolt.Bucket) (int64, error) {
 	c := b.Cursor()
 	for k, v := c.First(); k != nil; k, v = c.Next() {
-		var m struct {
-			Severity string `json:"severity"`
-		}
-		_ = json.Unmarshal(v, &m)
-		if m.Severity != "critical" && m.Severity != "major" {
+		// Entries are proto-encoded (see PushBatch). The previous json.Unmarshal
+		// always failed on proto bytes, leaving Severity == "" so EVERY entry
+		// looked non-critical — meaning criticals/majors were evicted too. Decode
+		// with proto (matching PopBatch) to honor the real severity. A decode
+		// failure leaves Severity == "" → treated as evictable, the safe default
+		// for a corrupt entry.
+		pkt := &v1.TelemetryPacket{}
+		_ = proto.Unmarshal(v, pkt)
+		if pkt.Severity != "critical" && pkt.Severity != "major" {
 			n := int64(len(v))
 			if err := b.Delete(k); err != nil {
 				return 0, err

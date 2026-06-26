@@ -20,6 +20,8 @@ publisher:
   max_in_flight:     8
   dcs_down_after:        3      # consecutive BatchPush failures -> pause collection (poller stops)
   dcs_probe_interval_ms: 5000   # while paused, empty-push probe DCS this often; resume on success
+  enqueue_retry_attempts: 10   # fan-in retries a full local queue 10*20ms=~200ms (was 50=~1s) so the
+  enqueue_retry_ms:       20   # sole channel drainer stays responsive; criticals still admitted via eviction
 
 # Simulator topology JSON — absolute path on the VM (native run, no container).
 topology_file: "/home/fabercomp_gmail_com/DCIM/Datacenter_Network_Simulator/topologies/dual_dc_enterprise.json"
@@ -44,15 +46,18 @@ snmp:
   timeout_ms:          5000
   retries:             0
   trap_addr:           "127.0.0.1:162"
+  trap_workers:        64     # bounded decode pool: a trap storm can't spawn unbounded goroutines
+                              # (the OOM vector). 0 = legacy goroutine-per-datagram.
   mgmt_port:           1161   # simulator live-name agent (host networking → reaches sim)
-  liveness_interval_ms: 30000
+  liveness_interval_ms: 30000     # FAST sysName+uptime heartbeat (rename/last_seen)
+  rewalk_interval_ms:   86400000  # heavy full re-walk once/day (server storage, counters); runs alongside liveness
   max_concurrent:      3
   rate_limit_per_sec:  30
   walk_medium:         true
   walk_topology:       false
   walk_slow:           false
   walk_sensors:        true
-  walk_server_health:  false   # servers are polled via Redfish (see redfish: block), not SNMP
+  walk_server_health:  true    # server CPU/RAM (UCD) + HOST-RESOURCES storage/per-core CPU; runs on the daily rewalk
   breaker_threshold:   3
   breaker_cooldown_ms: 30000
   metrics_log_interval_ms: 0

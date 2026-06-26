@@ -120,6 +120,16 @@ type SNMPConfig struct {
 	SlowIntervalMs     int    `yaml:"slow_interval_ms"`     // default 300000
 	TopologyIntervalMs int    `yaml:"topology_interval_ms"` // default 600000 — LLDP refresh tier
 	TrapAddr           string `yaml:"trap_addr"`
+	// TrapWorkers bounds the number of goroutines that decode incoming SNMP trap
+	// datagrams concurrently. 0 (default) keeps the legacy behavior: one unbounded
+	// goroutine per datagram — fine in steady state but a trap storm (rack/power
+	// failure firing hundreds of traps at once, often while DCS is down and the
+	// fan-in channel is full) spawns unbounded goroutines that each hold a decoded
+	// packet blocked on a full channel → OOM. Set > 0 (e.g. 64) to run a fixed
+	// worker pool: datagrams queue to the workers and, when saturated, the receiver
+	// applies socket backpressure (kernel UDP buffer) instead of growing the heap.
+	// Traps are never dropped by the pool — only bounded.
+	TrapWorkers        int    `yaml:"trap_workers"`
 	Timeout            int    `yaml:"timeout_ms"`
 	Retries            int    `yaml:"retries"`
 	// MaxConcurrent is the GLOBAL cap on concurrent SNMP UDP sockets across ALL
@@ -230,6 +240,17 @@ type PublisherConfig struct {
 	// DCSProbeIntervalMs is how often, while paused, the publisher sends an empty
 	// BatchPush to test whether DCS is back. On success it resumes. Default 5000.
 	DCSProbeIntervalMs int `yaml:"dcs_probe_interval_ms"`
+
+	// EnqueueRetryAttempts / EnqueueRetryMs bound how long the single fan-in
+	// goroutine retries a full local queue before dropping a non-critical batch.
+	// The fan-in goroutine is the ONLY drainer of the in-memory packet channel, so
+	// while it blocks here the channel backs up and every producer (traps, gNMI,
+	// pollers) stalls. Defaults 50 × 20ms = ~1s reproduce today's behavior; lower
+	// them in production (e.g. 10 × 20ms = ~200ms) so the drainer stays responsive.
+	// Criticals/majors are not lost by a short budget — the bbolt queue evicts a
+	// non-critical to admit them even when full. <= 0 → defaults.
+	EnqueueRetryAttempts int `yaml:"enqueue_retry_attempts"`
+	EnqueueRetryMs       int `yaml:"enqueue_retry_ms"`
 }
 
 type SNMPV3 struct {
