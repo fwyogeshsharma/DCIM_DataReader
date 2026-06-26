@@ -378,11 +378,17 @@ func (db *DB) MetricsSince(ctx context.Context,
 	return out, rows.Err()
 }
 
-// MetricsAt returns ALL metric samples at exactly ts for the tenant — used by
-// the forwarder only when a single timestamp holds more rows than the paged
-// limit (so the page can't be trimmed to a clean ts boundary without losing
-// rows). A timestamp is the smallest cursor unit, so its whole group must ship
-// together. No LIMIT: the group is one instant's data and is forwarded atomically.
+// MetricGroupCap bounds the single-timestamp full-group fetch (MetricsAt/EnergyAt).
+// A timestamp is the smallest cursor unit, so when one ts holds more rows than the
+// paged limit its whole group is fetched at once — but that fetch must stay bounded
+// or a pathological burst (e.g. a fleet-wide walk stamping thousands of rows at one
+// ts) could load an unbounded slice into RAM and push the process past GOMEMLIMIT /
+// the cgroup MemoryMax (→ OOM-kill / crash loop). 100k rows (~tens of MB through the
+// payload build) is far above any real single-ts group; if a ts genuinely exceeds
+// it the forwarder logs and advances past the ts (the only rows ever dropped are
+// the absurd overflow of a single instant).
+const MetricGroupCap = 100000
+
 func (db *DB) MetricsAt(ctx context.Context,
 	orgID, netID, grpID string, ts time.Time) ([]FwdMetric, error) {
 
@@ -399,8 +405,9 @@ func (db *DB) MetricsAt(ctx context.Context,
 		WHERE d.org_id=$1
 		  AND d.network_id=$2 AND d.group_id=$3
 		  AND m.ts = $4
-		ORDER BY m.ts ASC`,
-		orgID, netID, grpID, ts,
+		ORDER BY m.ts ASC
+		LIMIT $5`,
+		orgID, netID, grpID, ts, MetricGroupCap,
 	)
 	if err != nil {
 		return nil, err
@@ -485,8 +492,9 @@ func (db *DB) EnergyAt(ctx context.Context,
 		JOIN devices d ON d.id = e.device_id
 		WHERE d.org_id=$1 AND d.network_id=$2 AND d.group_id=$3
 		  AND e.ts = $4
-		ORDER BY e.ts ASC`,
-		orgID, netID, grpID, ts,
+		ORDER BY e.ts ASC
+		LIMIT $5`,
+		orgID, netID, grpID, ts, MetricGroupCap,
 	)
 	if err != nil {
 		return nil, err
