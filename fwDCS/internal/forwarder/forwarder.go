@@ -682,7 +682,11 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 		zap.Int("topology_links", totTopo),
 		zap.Int("events", totEv),
 	}
-	if force || len(changedDevices) > 0 || totTopo > 0 || totEv > 0 {
+	// Topology links are re-sent every tick (so totTopo is ~always > 0) and a
+	// forced flush can carry nothing new — neither is a real change. Log Info
+	// only on an actual device change or a forwarded event; everything else is
+	// routine telemetry → Debug, so steady state stays quiet.
+	if len(changedDevices) > 0 || totEv > 0 {
 		f.log.Info("aggregator forwarder push ok", fields...)
 	} else {
 		f.log.Debug("aggregator forwarder push ok (telemetry only)", fields...)

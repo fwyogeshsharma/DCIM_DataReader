@@ -35,8 +35,10 @@ func (db *DB) ApplyRetention(ctx context.Context, cfg config.RetentionConfig) er
 		return nil
 	}
 	targets := []retentionTarget{
-		{cfg.Metrics, "metrics", "metrics_5m", "device_id, metric_name, tag"},
-		{cfg.Energy, "energy_metrics", "energy_metrics_5m", "device_id, metric_name, circuit, phase"},
+		// rollup = the tiered 5m continuous aggregate from 010 (the legacy
+		// metrics_5m / energy_metrics_5m were dropped in 011).
+		{cfg.Metrics, "metrics", "metrics_rollup_5m", "device_id, metric_name, tag"},
+		{cfg.Energy, "energy_metrics", "energy_rollup_5m", "device_id, metric_name, circuit, phase"},
 	}
 	for _, t := range targets {
 		if err := db.applyRetention(ctx, t); err != nil {

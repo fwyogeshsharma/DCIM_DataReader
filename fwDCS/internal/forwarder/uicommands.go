@@ -178,14 +178,22 @@ func (f *Forwarder) pullUICommands(ctx context.Context, netID string) error {
 		return nil
 	}
 
-	// Visibility: log every pull outcome (even zero) so the down-feed is observable.
-	f.log.Info("ui command pull ok",
+	// Log Info only when the pull actually moved something — edits came down, or
+	// command-acks / thresholds went up. An empty steady-state pull (the common
+	// case) goes to Debug so it doesn't flood the log.
+	fields := []zap.Field{
 		zap.String("network_id", netID),
 		zap.String("since", since),
 		zap.Int("ui_changes", len(pr.UIChanges)),
 		zap.String("cursor", pr.UIChangesCursor),
 		zap.Int("cmd_status_sent", len(cmdStatus)),
-		zap.Int("threshold_sent", len(thrChanges)))
+		zap.Int("threshold_sent", len(thrChanges)),
+	}
+	if len(pr.UIChanges) > 0 || len(cmdStatus) > 0 || len(thrChanges) > 0 {
+		f.log.Info("ui command pull ok", fields...)
+	} else {
+		f.log.Debug("ui command pull ok", fields...)
+	}
 
 	// The up-feeds were delivered with a 2xx — advance their cursors now,
 	// independent of whether any edits came back down this cycle.

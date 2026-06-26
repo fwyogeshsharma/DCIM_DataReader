@@ -58,7 +58,7 @@ WITH NO DATA;
 SELECT add_continuous_aggregate_policy('metrics_rollup_5m',
     start_offset      => INTERVAL '20 minutes',
     end_offset        => INTERVAL '1 minute',
-    schedule_interval => INTERVAL '1 minute',
+    schedule_interval => INTERVAL '5 minutes',
     if_not_exists     => TRUE);
 
 SELECT add_retention_policy('metrics_rollup_5m', INTERVAL '7 days', if_not_exists => TRUE);
@@ -139,7 +139,7 @@ WITH NO DATA;
 SELECT add_continuous_aggregate_policy('energy_rollup_5m',
     start_offset      => INTERVAL '20 minutes',
     end_offset        => INTERVAL '1 minute',
-    schedule_interval => INTERVAL '1 minute',
+    schedule_interval => INTERVAL '5 minutes',
     if_not_exists     => TRUE);
 
 SELECT add_retention_policy('energy_rollup_5m', INTERVAL '7 days', if_not_exists => TRUE);
