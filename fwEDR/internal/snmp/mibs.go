@@ -35,13 +35,17 @@ const (
 	OIDHrProcessorTable = "1.3.6.1.2.1.25.3.3"
 	OIDHrProcessorLoad  = "1.3.6.1.2.1.25.3.3.1.2"
 
-	// HOST-RESOURCES-MIB — hrStorageTable
-	OIDHrStorageTable      = "1.3.6.1.2.1.25.2.3"
-	OIDHrStorageType       = "1.3.6.1.2.1.25.2.3.1.2"
-	OIDHrStorageDescr      = "1.3.6.1.2.1.25.2.3.1.3"
-	OIDHrStorageAllocUnits = "1.3.6.1.2.1.25.2.3.1.4"
-	OIDHrStorageSize       = "1.3.6.1.2.1.25.2.3.1.5"
-	OIDHrStorageUsed       = "1.3.6.1.2.1.25.2.3.1.6"
+	// HOST-RESOURCES-MIB — hrStorageTable. The simulator serves the storage table
+	// under .25.2.2.1.x (snmprec_generator HR_STORAGE=".25.2", appended ".2.1.x"),
+	// NOT the standard hrStorageTable base .25.2.3.1.x — so walking .25.2.3 returned
+	// nothing and server.storage_* never landed. Row index 1 = Physical Memory,
+	// index 2 = "/" filesystem. hrProcessorLoad (.25.3.3.1.2) IS standard.
+	OIDHrStorageTable      = "1.3.6.1.2.1.25.2.2"
+	OIDHrStorageType       = "1.3.6.1.2.1.25.2.2.1.2"
+	OIDHrStorageDescr      = "1.3.6.1.2.1.25.2.2.1.3"
+	OIDHrStorageAllocUnits = "1.3.6.1.2.1.25.2.2.1.4"
+	OIDHrStorageSize       = "1.3.6.1.2.1.25.2.2.1.5"
+	OIDHrStorageUsed       = "1.3.6.1.2.1.25.2.2.1.6"
 
 	// UCD-SNMP-MIB — CPU
 	OIDUcdSsCpuUser   = "1.3.6.1.4.1.2021.11.9.0"
