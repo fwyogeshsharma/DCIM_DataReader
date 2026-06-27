@@ -157,6 +157,13 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 			if p, err := c.collectServerTemp(); err == nil {
 				pkts = append(pkts, p...)
 			}
+			// HOST-RESOURCES storage (server.storage_*) — the only SNMP source for
+			// per-mount disk size/used. The SLOW tier that normally carries it is
+			// disabled in prod, so collect it here (this tier runs under
+			// walk_sensors) instead of requiring walk_slow / walk_server_health.
+			if p, err := c.collectServerHR(); err == nil {
+				pkts = append(pkts, p...)
+			}
 		case "ups":
 			if p, err := c.collectUPSTemp(); err == nil {
 				pkts = append(pkts, p...)
