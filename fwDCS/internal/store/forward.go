@@ -20,6 +20,7 @@ type FwdDevice struct {
 	ID             string
 	DatacenterID   string // payload scoping key
 	FloorID        string // payload scoping key
+	NetworkID      string // payload scoping key — a link endpoint may live in another network
 	Hostname       string
 	DeviceType     string
 	Vendor         string
@@ -59,7 +60,7 @@ type FwdDevice struct {
 // fwdDeviceCols is the shared SELECT list for all device queries so every code
 // path returns an identically-shaped row (scanned by scanFwdDevice).
 const fwdDeviceCols = `
-	id, datacenter_id, floor_id, hostname, device_type,
+	id, datacenter_id, floor_id, network_id, hostname, device_type,
 	COALESCE(vendor,''), COALESCE(model_name,''), COALESCE(os_name,''),
 	COALESCE(os_version,''), COALESCE(sys_oid,''), COALESCE(sys_description,''),
 	COALESCE(sys_location,''),
@@ -75,7 +76,7 @@ const fwdDeviceCols = `
 
 func scanFwdDevice(rows pgx.Rows) (FwdDevice, error) {
 	var d FwdDevice
-	err := rows.Scan(&d.ID, &d.DatacenterID, &d.FloorID, &d.Hostname, &d.DeviceType,
+	err := rows.Scan(&d.ID, &d.DatacenterID, &d.FloorID, &d.NetworkID, &d.Hostname, &d.DeviceType,
 		&d.Vendor, &d.ModelName, &d.OSName, &d.OSVersion, &d.SysOID, &d.SysDescr,
 		&d.SysLocation,
 		&d.MgmtIP, &d.ProdIP, &d.LoopbackIP, &d.OOBIP,

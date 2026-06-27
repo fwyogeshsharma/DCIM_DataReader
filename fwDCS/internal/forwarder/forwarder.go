@@ -536,32 +536,33 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 	}
 
 	// ── 3b. Hydrate topology-link endpoint devices ───────────────────────────
-	// The Aggregator drops any topology link whose src/dst hostname is not also
-	// present as a device in the SAME payload. At steady state the device delta
-	// is empty while topology links keep flowing, so without this the links are
-	// silently rejected (the "topology in DCS but 0 at Aggregator" symptom).
-	// Pull every link endpoint device (idempotent upsert at the Aggregator) so
-	// each same-scope link travels with both its devices.
+	// The Aggregator resolves a link's endpoints by hostname, so each endpoint
+	// device must exist there. At steady state the device delta is empty while
+	// topology links keep flowing, so without this the links can't resolve (the
+	// "topology in DCS but 0 at Aggregator" symptom). Hydrate every endpoint by
+	// DEVICE ID (not hostname+network) so a DST that lives in ANOTHER network —
+	// power-feed (PDU→server), management (switch→OOB), cooling (BACnet plant) —
+	// is fetched too and shipped under its OWN (network,dc,floor) scope, instead
+	// of being dropped because it isn't in this push's network. Idempotent upsert
+	// at the Aggregator.
 	seen := make(map[string]bool, len(allDevices))
 	for _, d := range allDevices {
 		seen[d.ID] = true
 	}
 	if len(topoLinks) > 0 {
-		hostSet := make(map[string]struct{}, len(topoLinks)*2)
+		idSet := make(map[string]bool, len(topoLinks)*2)
+		var endpointIDs []string
+		addEndpoint := func(id string) {
+			if id != "" && !seen[id] && !idSet[id] {
+				idSet[id] = true
+				endpointIDs = append(endpointIDs, id)
+			}
+		}
 		for _, tl := range topoLinks {
-			if tl.SrcHostname != "" {
-				hostSet[tl.SrcHostname] = struct{}{}
-			}
-			if tl.DstHostname != "" {
-				hostSet[tl.DstHostname] = struct{}{}
-			}
+			addEndpoint(tl.SrcDeviceID)
+			addEndpoint(tl.DstDeviceID)
 		}
-		hostnames := make([]string, 0, len(hostSet))
-		for h := range hostSet {
-			hostnames = append(hostnames, h)
-		}
-		linkDevices, err := f.db.DevicesByHostnames(ctx,
-			f.cfg.OrgID, netID, f.cfg.GroupID, hostnames)
+		linkDevices, err := f.db.DevicesByIDs(ctx, endpointIDs)
 		if err != nil {
 			return fmt.Errorf("link-endpoint devices query: %w", err)
 		}
@@ -728,8 +729,12 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 	return nil
 }
 
-// scopeKey identifies one (datacenter_id, floor_id) Aggregator payload scope.
-type scopeKey struct{ dc, floor string }
+// scopeKey identifies one (network_id, datacenter_id, floor_id) Aggregator
+// payload scope. network_id is part of the key because a hydrated link endpoint
+// may live in a different network than the push's primary network_id, and the
+// Aggregator upserts devices by org+datacenter+floor+network+group+hostname —
+// so each device must ship under its OWN network or it lands on the wrong row.
+type scopeKey struct{ net, dc, floor string }
 
 // scopeFallback is the last-resort value for an empty datacenter_id/floor_id
 // when no default is configured. The Aggregator requires both keys non-empty,
@@ -775,21 +780,15 @@ func (f *Forwarder) buildPayloads(
 ) []*aggPayload {
 
 	groups := make(map[scopeKey]*aggPayload)
-	// hostname → scope, so topology links can be placed only when both endpoints
-	// resolve to the same (dc,floor) payload.
-	hostScope := make(map[string]scopeKey, len(devices))
-	for _, d := range devices {
-		hostScope[d.Hostname] = scopeKey{f.dcOrDefault(d.DatacenterID), f.floorOrDefault(d.FloorID)}
-	}
-	getGroup := func(dc, floor string) *aggPayload {
-		k := scopeKey{dc, floor}
+	getGroup := func(net, dc, floor string) *aggPayload {
+		k := scopeKey{net, dc, floor}
 		p := groups[k]
 		if p == nil {
 			p = &aggPayload{
 				OrgID:         f.cfg.OrgID,
 				DatacenterID:  dc,
 				FloorID:       floor,
-				NetworkID:     netID,
+				NetworkID:     net,
 				GroupID:       f.cfg.GroupID,
 				Devices:       make([]aggDevice, 0),
 				TopologyLinks: make([]aggTopoLink, 0),
@@ -798,6 +797,12 @@ func (f *Forwarder) buildPayloads(
 			groups[k] = p
 		}
 		return p
+	}
+	netOrDefault := func(net string) string {
+		if net != "" {
+			return net
+		}
+		return netID
 	}
 
 	// Devices (with nested interfaces, addresses, metrics) → scope by dc/floor.
@@ -903,31 +908,22 @@ func (f *Forwarder) buildPayloads(
 			}
 			ad.EnergyMetrics = append(ad.EnergyMetrics, ae)
 		}
-		g := getGroup(f.dcOrDefault(d.DatacenterID), f.floorOrDefault(d.FloorID))
+		g := getGroup(netOrDefault(d.NetworkID), f.dcOrDefault(d.DatacenterID), f.floorOrDefault(d.FloorID))
 		g.Devices = append(g.Devices, ad)
 	}
 
-	// Topology links → homed on the SRC endpoint's (dc,floor) scope payload. The
-	// Aggregator resolves a link's far endpoint by hostname across the tenant, so
-	// the dst no longer has to be in the SAME (dc,floor) payload — cross-scope
-	// links (management device↔OOB on another floor, cooling plant on a separate
-	// scope) now forward instead of being dropped. We still skip a link only when
-	// an endpoint device isn't known in this tenant at all (the Aggregator would
-	// drop that one too). Both endpoints are hydrated and forwarded this push, so
-	// the dst is upserted and resolvable.
-	skippedNoEndpoint := 0
+	// Topology links → EVERY link is forwarded, homed on its SRC endpoint's
+	// (network,dc,floor) scope taken from the link row (the src is always in this
+	// push's network — TopologyLinksSince filters on sd.network_id — so its scope
+	// is valid). The Aggregator resolves the far endpoint by hostname across the
+	// tenant; the dst device need not ride in THIS payload because it is hydrated
+	// by id (step 3b) and shipped under its own network's scope this same push.
+	// This is what lets cross-network links — power-feed (PDU→server), management
+	// (switch→OOB), cooling (BACnet plant) — forward instead of being dropped for
+	// having a dst in another network. getGroup creates the scope if the src had
+	// no device delta this tick, so a links-only scope still ships.
 	for _, tl := range topoLinks {
-		srcScope, okS := hostScope[tl.SrcHostname]
-		_, okD := hostScope[tl.DstHostname]
-		if !okS || !okD {
-			skippedNoEndpoint++
-			continue
-		}
-		g := groups[srcScope] // exists: src device was added to it above
-		if g == nil {
-			skippedNoEndpoint++
-			continue
-		}
+		g := getGroup(netID, f.dcOrDefault(tl.SrcDatacenterID), f.floorOrDefault(tl.SrcFloorID))
 		g.TopologyLinks = append(g.TopologyLinks, aggTopoLink{
 			ID:             tl.ID,
 			Layer:          tl.Layer,
@@ -945,10 +941,6 @@ func (f *Forwarder) buildPayloads(
 			Relation:       tl.Relation,
 			IsActive:       tl.IsActive,
 		})
-	}
-	if skippedNoEndpoint > 0 {
-		f.log.Debug("forwarder: skipped topology links whose endpoint device is unknown in this tenant",
-			zap.Int("skipped", skippedNoEndpoint))
 	}
 
 	// Events → scope by device's dc/floor. Empty dc/floor (e.g. device_id NULL
@@ -975,7 +967,7 @@ func (f *Forwarder) buildPayloads(
 		if ev.Payload != "" && ev.Payload != "{}" {
 			ae.Payload = json.RawMessage(ev.Payload)
 		}
-		g := getGroup(f.dcOrDefault(ev.DatacenterID), f.floorOrDefault(ev.FloorID))
+		g := getGroup(netID, f.dcOrDefault(ev.DatacenterID), f.floorOrDefault(ev.FloorID))
 		g.Events = append(g.Events, ae)
 	}
 
