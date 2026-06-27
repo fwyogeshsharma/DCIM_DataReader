@@ -26,13 +26,16 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 # ── Resource guards ──────────────────────────────────────────────────────────
-# Hard cgroup ceiling so a forwarder burst can never take the whole VM down: the
-# kernel caps THIS service instead of OOM-killing a random VM process. Set ABOVE
-# GOMEMLIMIT (384MiB in dcs_prod.sh) so the Go runtime GCs hard and reclaims
-# before the cgroup limit is hit; MemoryHigh applies reclaim pressure first, then
-# MemoryMax is the hard stop. On a true OOM systemd restarts (Restart=always).
-MemoryHigh=448M
-MemoryMax=512M
+# Hard cgroup ceiling so a runaway can never take the whole VM down: the kernel
+# caps THIS service instead of OOM-killing a random VM process. MUST sit WELL
+# above GOMEMLIMIT (384MiB in dcs_prod.sh) — GOMEMLIMIT bounds the Go HEAP, but
+# RSS = heap + goroutine stacks + runtime/off-heap overhead (~100-150MB more), so
+# a cap near GOMEMLIMIT (the old 512M) OOM-kills DCS under normal load → restart
+# loop → migrations stall + ingest stops. ~2x GOMEMLIMIT leaves ample headroom
+# for normal operation while still catching a genuine runaway. GOMEMLIMIT remains
+# the real governor; this is only a backstop. On a true OOM systemd restarts.
+MemoryHigh=640M
+MemoryMax=768M
 # Cap CPU so a GC-thrash spike can't starve the rest of a small (2-core) VM.
 CPUQuota=80%
 Nice=10
