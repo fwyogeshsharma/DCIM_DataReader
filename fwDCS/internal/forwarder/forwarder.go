@@ -455,6 +455,10 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 			return fmt.Errorf("devices query: %w", err)
 		}
 		f.recordPoll("devices", netID, len(changedDevices) > 0)
+		if d, single := trimToTSBoundary(changedDevices, len(changedDevices) == batchLimit,
+			func(dv store.FwdDevice) time.Time { return dv.UpdatedAt }); !single {
+			changedDevices = d
+		}
 	}
 
 	if force || f.shouldPoll("metrics", netID) {
@@ -512,6 +516,16 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 			return fmt.Errorf("topology query: %w", err)
 		}
 		f.recordPoll("topology", netID, len(topoLinks) > 0)
+		// Same-updated_at boundary trim (as for metrics): a network with more links
+		// than batchLimit (e.g. a large fabric) truncates the page; without trimming
+		// the trailing same-updated_at links, the cursor advances past their
+		// timestamp and they are skipped forever — the "1900 links but only N
+		// forwarded" symptom. A single updated_at holding >batchLimit links is not a
+		// realistic topology shape, so on that signal keep the page as-is.
+		if t, single := trimToTSBoundary(topoLinks, len(topoLinks) == batchLimit,
+			func(l store.FwdTopologyLink) time.Time { return l.UpdatedAt }); !single {
+			topoLinks = t
+		}
 	}
 
 	if force || f.shouldPoll("events", netID) {
@@ -522,6 +536,10 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 			return fmt.Errorf("events query: %w", err)
 		}
 		f.recordPoll("events", netID, len(events) > 0)
+		if e, single := trimToTSBoundary(events, len(events) == batchLimit,
+			func(ev store.FwdEvent) time.Time { return ev.TS }); !single {
+			events = e
+		}
 	}
 
 	// ── 3. Group metrics by device_id; hydrate extra devices ─────────────────
