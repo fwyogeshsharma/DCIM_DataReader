@@ -984,21 +984,26 @@ func (f *Forwarder) buildPayloads(
 		g.Devices = append(g.Devices, ad)
 	}
 
-	// Topology links → only when BOTH endpoints resolve to the SAME scope and
-	// are present in this payload. The Aggregator requires both hostnames in one
-	// (dc,floor) payload and drops links otherwise, so cross-scope links
-	// (endpoints on different floors) cannot be represented and are skipped.
-	skippedCrossScope := 0
+	// Topology links → homed on the SRC endpoint's (dc,floor) scope payload. The
+	// Aggregator's ingest resolves a link's far endpoint by hostname across the
+	// whole tenant (resolveEndpoint), so the dst no longer has to live in the same
+	// (dc,floor) payload — cross-scope links (management device↔OOB on another
+	// floor, cooling plant on a separate scope) now forward instead of being
+	// dropped. We still skip a link only when an endpoint device does not exist in
+	// the tenant at all (the Aggregator would drop that one too). Both endpoint
+	// devices are hydrated and forwarded in their own scope payloads this push, so
+	// the dst is upserted and resolvable.
+	skippedNoEndpoint := 0
 	for _, tl := range topoLinks {
 		srcScope, okS := hostScope[tl.SrcHostname]
-		dstScope, okD := hostScope[tl.DstHostname]
-		if !okS || !okD || srcScope != dstScope {
-			skippedCrossScope++
+		_, okD := hostScope[tl.DstHostname]
+		if !okS || !okD {
+			skippedNoEndpoint++
 			continue
 		}
 		g := groups[srcScope] // exists: src device was added to it above
 		if g == nil {
-			skippedCrossScope++
+			skippedNoEndpoint++
 			continue
 		}
 		g.TopologyLinks = append(g.TopologyLinks, aggTopoLink{
@@ -1019,9 +1024,9 @@ func (f *Forwarder) buildPayloads(
 			IsActive:       tl.IsActive,
 		})
 	}
-	if skippedCrossScope > 0 {
-		f.log.Debug("forwarder: skipped cross-scope topology links (endpoints in different dc/floor)",
-			zap.Int("skipped", skippedCrossScope))
+	if skippedNoEndpoint > 0 {
+		f.log.Debug("forwarder: skipped topology links whose endpoint device is unknown in this tenant",
+			zap.Int("skipped", skippedNoEndpoint))
 	}
 
 	// Events → scope by device's dc/floor. Empty dc/floor (e.g. device_id NULL
