@@ -342,10 +342,21 @@ func (f *Forwarder) Run(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Full topology re-sync: re-forward EVERY link periodically so a stable link
+	// (whose updated_at never moves, so the delta cursor never re-sends it)
+	// reconverges at the Aggregator after any loss — notably the Aggregator
+	// dropping topology_links on every deploy. Run once at startup too, so a
+	// just-redeployed Aggregator repopulates immediately instead of waiting a tick.
+	resyncTicker := time.NewTicker(topologyResyncInterval)
+	defer resyncTicker.Stop()
+	f.resyncTopology(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-resyncTicker.C:
+			f.resyncTopology(ctx)
 		case <-ticker.C:
 			// Regular cadence: gated by per-table idle backoff.
 			if err := f.push(ctx, false); err != nil {
@@ -726,6 +737,112 @@ func (f *Forwarder) pushNetwork(ctx context.Context, netID string, force bool) e
 		_ = f.db.SetForwarderCursor(ctx, "events", netID, events[len(events)-1].TS)
 	}
 
+	return nil
+}
+
+// topologyResyncInterval is how often the forwarder re-forwards the COMPLETE
+// topology (all links, paged by id, chunked) regardless of the delta cursor.
+// The per-tick path only ships links whose updated_at moved, so once the cursor
+// passes a stable link it is never re-sent — and the Aggregator drops its
+// topology_links table on every deploy. This periodic full snapshot is what
+// reconverges ALL links after any such loss. Cheap: topology is small and the
+// Aggregator upserts idempotently.
+const topologyResyncInterval = 2 * time.Minute
+
+// resyncTopology re-forwards every topology link for every network as a full
+// snapshot (no cursor, no cursor advance). Idempotent at the Aggregator.
+func (f *Forwarder) resyncTopology(ctx context.Context) {
+	nets, err := f.db.DistinctNetworks(ctx, f.cfg.OrgID)
+	if err != nil {
+		f.log.Warn("topology resync: distinct networks", zap.Error(err))
+		return
+	}
+	if len(nets) == 0 {
+		nets = []string{f.cfg.NetworkID}
+	}
+	for _, netID := range nets {
+		if err := f.resyncTopologyNetwork(ctx, netID); err != nil {
+			f.log.Warn("topology resync failed", zap.String("network_id", netID), zap.Error(err))
+		}
+	}
+}
+
+// resyncTopologyNetwork pages ALL links for one network by id (unique keyset →
+// no tie-skip), hydrates both endpoint devices (by id, cross-network safe) so
+// the Aggregator can resolve each link's hostnames, builds per-scope payloads,
+// and POSTs them in byte-bounded chunks. Does NOT touch the topology cursor.
+func (f *Forwarder) resyncTopologyNetwork(ctx context.Context, netID string) error {
+	batchLimit := f.cfg.BatchLimit
+	if batchLimit <= 0 {
+		batchLimit = 1000
+	}
+	afterID := ""
+	total := 0
+	for {
+		links, err := f.db.TopologyLinksAll(ctx, f.cfg.OrgID, netID, f.cfg.GroupID, afterID, batchLimit)
+		if err != nil {
+			return fmt.Errorf("topology resync query: %w", err)
+		}
+		if len(links) == 0 {
+			break
+		}
+
+		// Hydrate both endpoint devices by id (a dst may live in another network).
+		seen := make(map[string]bool, len(links)*2)
+		var ids []string
+		for _, tl := range links {
+			for _, id := range []string{tl.SrcDeviceID, tl.DstDeviceID} {
+				if id != "" && !seen[id] {
+					seen[id] = true
+					ids = append(ids, id)
+				}
+			}
+		}
+		devices, err := f.db.DevicesByIDs(ctx, ids)
+		if err != nil {
+			return fmt.Errorf("topology resync devices: %w", err)
+		}
+		deviceIDs := make([]string, 0, len(devices))
+		for _, d := range devices {
+			deviceIDs = append(deviceIDs, d.ID)
+		}
+		ifaces, err := f.db.InterfacesByDeviceIDs(ctx, deviceIDs)
+		if err != nil {
+			return fmt.Errorf("topology resync interfaces: %w", err)
+		}
+		ifacesByDevice := make(map[string][]store.FwdInterface, len(devices))
+		ifaceIDs := make([]string, 0, len(ifaces))
+		for _, i := range ifaces {
+			ifacesByDevice[i.DeviceID] = append(ifacesByDevice[i.DeviceID], i)
+			ifaceIDs = append(ifaceIDs, i.ID)
+		}
+		addrs, err := f.db.AddressesByInterfaceIDs(ctx, ifaceIDs)
+		if err != nil {
+			return fmt.Errorf("topology resync addresses: %w", err)
+		}
+		addrsByIface := make(map[string][]store.FwdAddress, len(ifaceIDs))
+		for _, a := range addrs {
+			addrsByIface[a.InterfaceID] = append(addrsByIface[a.InterfaceID], a)
+		}
+
+		payloads := f.buildPayloads(netID, devices, ifacesByDevice, addrsByIface, nil, nil, links, nil)
+		for _, p := range payloads {
+			for _, chunk := range f.chunkPayload(p) {
+				if _, err := f.postWithRetry(ctx, chunk); err != nil {
+					return fmt.Errorf("topology resync post: %w", err)
+				}
+			}
+		}
+
+		total += len(links)
+		afterID = links[len(links)-1].ID
+		if len(links) < batchLimit {
+			break
+		}
+	}
+	if total > 0 {
+		f.log.Info("topology resync ok", zap.String("network_id", netID), zap.Int("links", total))
+	}
 	return nil
 }
 

@@ -475,6 +475,59 @@ func (db *DB) TopologyLinksSince(ctx context.Context,
 	return out, rows.Err()
 }
 
+// TopologyLinksAll returns EVERY topology edge for the tenant, paged by id (a
+// UUID primary key) so the keyset is strictly unique — unlike TopologyLinksSince,
+// whose updated_at cursor silently skips rows that share the batch-boundary
+// timestamp (a bulk recompute/load stamps many rows with one now()). Pass
+// afterID="" for the first page; then pass the last returned id. This is the
+// full-snapshot read used by the forwarder's periodic topology re-sync, which is
+// what lets a wiped Aggregator (its migrate drops topology_links every deploy)
+// recover ALL links instead of only those whose updated_at moved since the
+// delta cursor.
+func (db *DB) TopologyLinksAll(ctx context.Context,
+	orgID, netID, grpID, afterID string, limit int) ([]FwdTopologyLink, error) {
+
+	after := afterID
+	if after == "" {
+		after = "00000000-0000-0000-0000-000000000000"
+	}
+	rows, err := db.pool.Query(ctx, `
+		SELECT tl.id, sd.datacenter_id, sd.floor_id,
+		       tl.layer,
+		       tl.src_device_id, COALESCE(tl.src_interface_id::text,''),
+		       sd.hostname, tl.src_port_name,
+		       tl.dst_device_id, COALESCE(tl.dst_interface_id::text,''),
+		       dd.hostname, tl.dst_port_name,
+		       tl.link_speed_mbps, COALESCE(tl.link_type,''), tl.protocol, tl.relation, tl.is_active, tl.updated_at
+		FROM topology_links tl
+		JOIN devices sd ON sd.id = tl.src_device_id
+		JOIN devices dd ON dd.id = tl.dst_device_id
+		WHERE sd.org_id=$1
+		  AND sd.network_id=$2 AND sd.group_id=$3
+		  AND tl.id > $4::uuid
+		ORDER BY tl.id ASC
+		LIMIT $5`,
+		orgID, netID, grpID, after, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FwdTopologyLink
+	for rows.Next() {
+		var tl FwdTopologyLink
+		if err := rows.Scan(&tl.ID, &tl.SrcDatacenterID, &tl.SrcFloorID,
+			&tl.Layer,
+			&tl.SrcDeviceID, &tl.SrcInterfaceID, &tl.SrcHostname, &tl.SrcPortName,
+			&tl.DstDeviceID, &tl.DstInterfaceID, &tl.DstHostname, &tl.DstPortName,
+			&tl.LinkSpeedMbps, &tl.LinkType, &tl.Protocol, &tl.Relation, &tl.IsActive, &tl.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, tl)
+	}
+	return out, rows.Err()
+}
+
 // ─── Events query ─────────────────────────────────────────────────────────────
 
 // EventsSince returns events with ts > since, resolved to a forwardable device.
