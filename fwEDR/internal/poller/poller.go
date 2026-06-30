@@ -305,10 +305,27 @@ func (p *Poller) runTarget(ctx context.Context, t *target.Target, firstWalkDone 
 	case <-time.After(time.Duration(rand.Int63n(int64(spread)))):
 	}
 
-	// Discovery: walk until the device answers once. Retrying the initial walk
-	// means a device that was unreachable at startup still gets inventoried when
-	// it comes up. The full walkAll here builds inventory AND emits one sample of
-	// every enabled tier; steady-state telemetry then refreshes the cheap tiers.
+	rewalk := time.Duration(p.snmpCfg.RewalkIntervalMs) * time.Millisecond
+	if rewalk > 0 {
+		// Periodic full re-walk mode: walk now, then on the configured interval.
+		p.walkAll(ctx, t)
+		firstWalkDone()
+		ticker := time.NewTicker(rewalk)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				p.walkAll(ctx, t)
+			}
+		}
+	}
+
+	// One-shot mode (default): walk until the device answers once, then stop and
+	// let traps drive events. Retrying the initial walk means a device that was
+	// unreachable at startup still gets inventoried when it comes up — without any
+	// steady-state polling afterward.
 	retry := time.Duration(p.snmpCfg.WalkRetryIntervalMs) * time.Millisecond
 	if retry <= 0 {
 		retry = 30 * time.Second
@@ -321,9 +338,37 @@ func (p *Poller) runTarget(ctx context.Context, t *target.Target, firstWalkDone 
 			walkedOnce = true
 		}
 		if ok {
-			p.log.Debug("initial SNMP walk complete — entering steady-state polling",
+			// Lightweight liveness heartbeat: after the one-shot walk, keep doing a
+			// single FAST (sysName+uptime) GET on an interval so a source-side rename
+			// propagates to the DB without a full re-walk. Much cheaper than rewalk —
+			// one OID-set, no interface/counter/sensor walks. Keeps the session open
+			// (the heartbeat reuses it). Only when rewalk isn't already running.
+			if hb := time.Duration(p.snmpCfg.LivenessIntervalMs) * time.Millisecond; hb > 0 {
+				p.log.Debug("initial SNMP walk complete — entering FAST liveness heartbeat",
+					zap.String("target", t.SourceID()), zap.Duration("interval", hb))
+				ticker := time.NewTicker(hb)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						p.closeConn(t)
+						return
+					case <-ticker.C:
+						p.pollSNMP(ctx, t, snmp.TierFast) // 1 GET: sysName+uptime → rename + last_seen
+					}
+				}
+			}
+			// One-shot done: release this device's SNMP session. Traps don't use
+			// it, and ~hundreds of idle UDP sockets lingering is what exhausts
+			// Windows socket buffers (WSAENOBUFS) — keeping only in-flight walks
+			// holding sockets avoids that. A re-walk (rewalk mode) keeps its
+			// session; this path is one-shot only.
+			p.closeConn(t)
+			// Debug, not Info: this fires once per device (hundreds of lines on a
+			// serial walk). Watch the single "topology links emitted from JSON" line
+			// for readiness instead.
+			p.log.Debug("initial SNMP walk complete — switching to trap-driven monitoring",
 				zap.String("target", t.SourceID()))
-			p.runSteadyState(ctx, t)
 			return
 		}
 		select {
@@ -331,106 +376,6 @@ func (p *Poller) runTarget(ctx context.Context, t *target.Target, firstWalkDone 
 			return
 		case <-time.After(retry):
 		}
-	}
-}
-
-// runSteadyState drives the three post-discovery cadences for one device, all on
-// a SINGLE goroutine (so the shared SNMP session is never used concurrently):
-//
-//   - FAST heartbeat (liveness_interval_ms): one sysName+uptime GET — refreshes
-//     last_seen and propagates a source-side rename. ~1 op.
-//   - TELEMETRY (telemetry_interval_ms / server_telemetry_interval_ms): re-polls
-//     ONLY the cheap TierEnvironment / TierServerHealth tiers so per-device metrics
-//     (pdu/generator/sensor/ups + server temp/storage) refresh as a time series.
-//   - HEAVY re-walk (rewalk_interval_ms): the costly Medium/Slow/Topology walks,
-//     for periodic inventory/topology refresh — meant to run rarely (e.g. daily).
-//
-// Every branch goes through pollSNMP, so all SNMP work stays bounded by the global
-// rate limiter + socket cap + circuit breakers. When no cadence is enabled this is
-// a pure one-shot: release the session and return (traps drive events).
-func (p *Poller) runSteadyState(ctx context.Context, t *target.Target) {
-	fast := time.Duration(p.snmpCfg.LivenessIntervalMs) * time.Millisecond
-	heavy := time.Duration(p.snmpCfg.RewalkIntervalMs) * time.Millisecond
-	telemEvery, telemTiers := p.telemetryPlan(t)
-
-	if fast <= 0 && heavy <= 0 && telemEvery <= 0 {
-		// Pure one-shot: release this device's SNMP session. ~hundreds of idle UDP
-		// sockets lingering is what exhausts Windows socket buffers (WSAENOBUFS);
-		// keeping only in-flight walks holding sockets avoids that.
-		p.closeConn(t)
-		p.log.Debug("no steady-state cadence — switching to trap-driven monitoring",
-			zap.String("target", t.SourceID()))
-		return
-	}
-
-	// newTicker returns a (channel, stop) pair, or (nil, noop) when the interval is
-	// disabled so its select case is never ready.
-	newTicker := func(d time.Duration) (<-chan time.Time, func()) {
-		if d <= 0 {
-			return nil, func() {}
-		}
-		tk := time.NewTicker(d)
-		return tk.C, tk.Stop
-	}
-	fastC, stopFast := newTicker(fast)
-	telemC, stopTelem := newTicker(telemEvery)
-	heavyC, stopHeavy := newTicker(heavy)
-	defer stopFast()
-	defer stopTelem()
-	defer stopHeavy()
-
-	for {
-		select {
-		case <-ctx.Done():
-			p.closeConn(t)
-			return
-		case <-fastC:
-			p.pollSNMP(ctx, t, snmp.TierFast) // 1 GET: sysName+uptime → rename + last_seen
-		case <-telemC:
-			for _, tier := range telemTiers {
-				p.pollSNMP(ctx, t, tier)
-			}
-		case <-heavyC:
-			p.heavyWalk(ctx, t)
-		}
-	}
-}
-
-// telemetryPlan returns the telemetry cadence and the tiers to poll for a device,
-// or (0, nil) when this device type carries no light SNMP telemetry (network gear
-// gets its ongoing telemetry from gNMI, not SNMP). Servers run on the slower
-// server cadence because their TierEnvironment does ENTITY/HOST-RESOURCES walks;
-// scalar devices (sensor/pdu/generator/ups) run on the fast telemetry cadence.
-func (p *Poller) telemetryPlan(t *target.Target) (time.Duration, []snmp.Tier) {
-	if !p.snmpCfg.WalkSensors {
-		return 0, nil // light telemetry gated by walk_sensors
-	}
-	switch t.DeviceType {
-	case "server":
-		tiers := []snmp.Tier{snmp.TierEnvironment} // chassis/CPU temp + HR storage
-		if p.snmpCfg.WalkServerHealth {
-			tiers = append(tiers, snmp.TierServerHealth) // UCD CPU/RAM (opt-in)
-		}
-		return time.Duration(p.snmpCfg.ServerTelemetryIntervalMs) * time.Millisecond, tiers
-	case "sensor", "pdu", "floor_pdu", "generator", "ups":
-		return time.Duration(p.snmpCfg.TelemetryIntervalMs) * time.Millisecond, []snmp.Tier{snmp.TierEnvironment}
-	default:
-		return 0, nil // router/switch/firewall/lb/oob — gNMI or FAST-only
-	}
-}
-
-// heavyWalk runs the costly inventory tiers (Medium/Slow/Topology) per their
-// config flags — invoked only on the rare rewalk cadence. FAST and the telemetry
-// tiers are handled by their own cadences, so they are not repeated here.
-func (p *Poller) heavyWalk(ctx context.Context, t *target.Target) {
-	if p.snmpCfg.WalkMedium {
-		p.pollSNMP(ctx, t, snmp.TierMedium)
-	}
-	if p.snmpCfg.WalkTopology {
-		p.pollSNMP(ctx, t, snmp.TierTopology)
-	}
-	if p.snmpCfg.WalkSlow {
-		p.pollSNMP(ctx, t, snmp.TierSlow)
 	}
 }
 

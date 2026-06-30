@@ -47,24 +47,16 @@ const (
 	OIDHrStorageSize       = "1.3.6.1.2.1.25.2.2.1.5"
 	OIDHrStorageUsed       = "1.3.6.1.2.1.25.2.2.1.6"
 
-	// UCD-SNMP-MIB — CPU. The simulator's _server_entries serves the CPU gauges at
-	// ssCpu .11.1 (user) / .11.2 (system) / .11.4 (idle) — NOT the standard ssCpuUser
-	// .11.9 / ssCpuSystem .11.10 / ssCpuIdle .11.11. Reading the standard columns
-	// returned the simulator's unrelated values (.11.9 = softirq, .11.11 = the
-	// "systemStats" label string → 0), so server.cpu_* came back wrong/empty. Match
-	// the simulator layout, same as the hrStorage/.25.2.2 and UPS adaptations above.
-	OIDUcdSsCpuUser   = "1.3.6.1.4.1.2021.11.1.0"
-	OIDUcdSsCpuSystem = "1.3.6.1.4.1.2021.11.2.0"
-	OIDUcdSsCpuIdle   = "1.3.6.1.4.1.2021.11.4.0"
+	// UCD-SNMP-MIB — CPU
+	OIDUcdSsCpuUser   = "1.3.6.1.4.1.2021.11.9.0"
+	OIDUcdSsCpuSystem = "1.3.6.1.4.1.2021.11.10.0"
+	OIDUcdSsCpuIdle   = "1.3.6.1.4.1.2021.11.11.0"
 
-	// UCD-SNMP-MIB — Memory. Total/avail are standard (.4.5/.4.6). The simulator
-	// serves cached at .4.11 and buffer at .4.12 (memTotalFree/-Shared slots), not the
-	// standard memBuffer .4.14 / memCached .4.15 — reading the standard columns hit a
-	// type-4 label string. Match the simulator layout.
+	// UCD-SNMP-MIB — Memory
 	OIDUcdMemTotalReal = "1.3.6.1.4.1.2021.4.5.0"
 	OIDUcdMemAvailReal = "1.3.6.1.4.1.2021.4.6.0"
-	OIDUcdMemCached    = "1.3.6.1.4.1.2021.4.11.0"
-	OIDUcdMemBuffer    = "1.3.6.1.4.1.2021.4.12.0"
+	OIDUcdMemCached    = "1.3.6.1.4.1.2021.4.14.0"
+	OIDUcdMemBuffer    = "1.3.6.1.4.1.2021.4.15.0"
 
 	// UPS-MIB (RFC 1628)
 	// Battery group layout matches the simulator's _ups_entries: status .1, minutes

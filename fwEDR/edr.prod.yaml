@@ -46,19 +46,13 @@ snmp:
   trap_addr:           "127.0.0.1:162"
   mgmt_port:           1161   # simulator live-name agent (host networking → reaches sim)
   liveness_interval_ms: 30000
-  # Light telemetry loop — refreshes cheap per-device SNMP metrics WITHOUT the heavy
-  # counter/HR/LLDP walks. Bounded by rate_limit_per_sec + max_concurrent regardless
-  # of cadence, so it cannot exceed current SNMP pressure on the single-CPU VM.
-  telemetry_interval_ms:        60000    # sensor/pdu/generator/ups scalar GETs; 60s
-  server_telemetry_interval_ms: 300000   # server temp + HR storage walks (many servers); 300s
-  rewalk_interval_ms:  86400000          # heavy Medium/Slow/Topology re-walk once/day
   max_concurrent:      3
   rate_limit_per_sec:  30
   walk_medium:         true
   walk_topology:       false
   walk_slow:           false
   walk_sensors:        true
-  walk_server_health:  true    # UCD cpu/mem scalars on the 300s server telemetry loop (OIDs aligned to the sim). Cheap (1 GET/server); complements Redfish.
+  walk_server_health:  false   # servers are polled via Redfish (see redfish: block), not SNMP
   breaker_threshold:   3
   breaker_cooldown_ms: 30000
   metrics_log_interval_ms: 0

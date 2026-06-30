@@ -165,13 +165,6 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 				pkts = append(pkts, p...)
 			}
 		case "ups":
-			// Core UPS-MIB battery + input/output group (status, charge, runtime,
-			// voltages, currents, load). Lives here — not just the SLOW tier — so the
-			// primary UPS electrical telemetry refreshes on the light telemetry loop
-			// instead of only at discovery. ~1 GET + 4 small walks; cheap (few UPS).
-			if p, err := c.collectUPS(); err == nil {
-				pkts = append(pkts, p...)
-			}
 			if p, err := c.collectUPSTemp(); err == nil {
 				pkts = append(pkts, p...)
 			}
@@ -444,14 +437,14 @@ func (c *Collector) collectServerHR() ([]*v1.TelemetryPacket, error) {
 	typeMap := walkIndexed(c.client, OIDHrStorageType)
 	descrMap := walkIndexedStr(c.client, OIDHrStorageDescr)
 	allocMap := walkIndexed(c.client, OIDHrStorageAllocUnits)
-	usedMap := walkIndexed(c.client, OIDHrStorageUsed) // walk once, index by row
 	sizePDUs, _ := c.client.Walk(OIDHrStorageSize)
+	usedPDUs, _ := c.client.Walk(OIDHrStorageUsed)
 
 	for _, p := range sizePDUs {
 		idx := LastOIDComponent(p.Name)
 		allocUnits := allocMap[idx]
 		sizeUnits := ToFloat64(p)
-		usedUnits := usedMap[idx]
+		usedUnits := walkIndexed(c.client, OIDHrStorageUsed)[idx]
 		sizeKB := sizeUnits * allocUnits / 1024
 		usedKB := usedUnits * allocUnits / 1024
 		avail := sizeKB - usedKB
@@ -470,6 +463,7 @@ func (c *Collector) collectServerHR() ([]*v1.TelemetryPacket, error) {
 			c.newMetric("server.storage_used_kb", descr, usedKB, meta),
 			c.newMetric("server.storage_available_kb", descr, avail, meta),
 		)
+		_ = usedPDUs // consumed via walkIndexed above
 	}
 
 	return pkts, nil
