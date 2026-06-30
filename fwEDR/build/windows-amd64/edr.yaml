@@ -46,13 +46,19 @@ snmp:
   trap_addr:           "127.0.0.1:162"
   mgmt_port:           1161   # SIMULATOR-ONLY SET/mgmt agent. Serves the LIVE in-memory device name on a GET sysName, so the liveness heartbeat reads the truly-current name instantly instead of lagging the 161 .snmprec. Leave UNSET (0) in production — real devices have no such agent.
   liveness_interval_ms: 15000 # after the one-shot walk, do a single sysName+uptime GET per device every 15s (NOT a full re-walk). Refreshes last_seen and propagates a source-side rename to the DB/UI/events cheaply (rename visible in ≤~20s). 0 = off.
+  # Light telemetry loop — refreshes cheap per-device metrics WITHOUT the heavy
+  # counter/HR/LLDP walks. Gated by walk_sensors. Both ride the global rate
+  # limiter + socket cap, so total SNMP load stays bounded regardless of cadence.
+  telemetry_interval_ms:        60000   # sensor/pdu/generator/ups — scalar GETs, cheap; 60s
+  server_telemetry_interval_ms: 300000  # server temp + HR storage walks (many servers); 300s
+  rewalk_interval_ms:  86400000 # heavy Medium/Slow/Topology re-walk ONCE/DAY (inventory/topology refresh). The costly walks; kept rare so they never load the single-CPU VM. 0 = off (discovery walk only).
   max_concurrent:      3      # GLOBAL concurrent SNMP socket cap (all tiers). The simulator is ONE snmpsim process (single asyncio loop, single UDP socket) — it serializes requests, so high concurrency is wasted and only risks UDP-buffer bursts. 3 keeps 2 heavy walks overlapped (latency hiding) + 1 slot for FAST liveness.
   rate_limit_per_sec:  30     # global SNMP req/sec token bucket — modest ceiling matched to the single serial responder.
   walk_medium:         true   # interface state (also builds interfaces table — needed for link-event interface correlation)
   walk_topology:       false  # topology comes from the JSON (instant, complete) — skip slow LLDP topology walk and avoid duplicate rows
   walk_slow:           false  # SKIP heavy counter/HR/UPS/sensor walks — biggest SNMP load, not needed for inventory or link topology
   walk_sensors:        true   # environment sensors ONLY (temperature/humidity from sensor+PDU devices) for the heatmap — light, independent of walk_slow
-  walk_server_health:  false  # servers polled via Redfish (see redfish: block), not SNMP
+  walk_server_health:  true   # UCD cpu/mem scalars (OIDs aligned to the sim) on the 300s server telemetry loop. Cheap (1 GET/server); complements Redfish server.cpu_percent/memory_used_*.
   breaker_threshold:   3
   breaker_cooldown_ms: 30000
   metrics_log_interval_ms: 0   # 0 = no periodic "snmp poll metrics" log line (quiet once idle)

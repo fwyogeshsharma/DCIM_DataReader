@@ -364,9 +364,12 @@ func (s *Subscriber) emitTree(b *deviceBinding, root map[string]any, ts int64) [
 	// ── system ──
 	if sys, ok := dig(root, "openconfig-system:system").(map[string]any); ok {
 		if st, ok := sys["state"].(map[string]any); ok {
-			// OpenConfig system uptime is in seconds; DCS liveness uses centiseconds.
+			// The gNMI source serves state.uptime already in CENTISECONDS (the
+			// simulator derives ns = uptime×10_000_000, i.e. ns/1e7 = centiseconds),
+			// matching the SNMP sysUpTime unit DCS liveness expects. Emit as-is — an
+			// earlier ×100 (assuming seconds) inflated it 100×.
 			if v, ok := num(st["uptime"]); ok {
-				add("system.uptime_centiseconds", "", v*100)
+				add("system.uptime_centiseconds", "", v)
 			}
 		}
 		if mem, ok := dig(sys, "memory", "state").(map[string]any); ok {

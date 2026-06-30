@@ -189,6 +189,22 @@ type SNMPConfig struct {
 	// re-reads sysName). default 0.
 	LivenessIntervalMs int `yaml:"liveness_interval_ms"`
 
+	// Light telemetry loop intervals. Independent of the heavy inventory walk:
+	// after the one-shot discovery walk, EDR re-polls ONLY the cheap telemetry
+	// tiers (TierEnvironment / TierServerHealth) on these cadences so per-device
+	// metrics (pdu/generator/sensor/ups + server temp/storage) refresh as a time
+	// series WITHOUT re-running the costly counter/HR/LLDP walks.
+	//
+	//   TelemetryIntervalMs       — light scalar devices (sensor/pdu/generator/ups).
+	//                               A handful of GETs each; safe at 60s. 0 = off.
+	//   ServerTelemetryIntervalMs — servers (ENTITY temp + HOST-RESOURCES storage
+	//                               walks). ~7 walks/server × many servers, so it
+	//                               runs on a slower cadence (default 300s). 0 = off.
+	// Both ride the same pollSNMP guards (rate limiter, socket cap, breakers), so
+	// total SNMP load stays bounded by rate_limit_per_sec regardless of cadence.
+	TelemetryIntervalMs       int `yaml:"telemetry_interval_ms"`
+	ServerTelemetryIntervalMs int `yaml:"server_telemetry_interval_ms"`
+
 	// Per-tier toggles for the inventory walk. FAST (system/liveness) always runs.
 	// Set walk_slow:false to skip the heavy counter/HR/UPS/sensor walks — the
 	// biggest SNMP load and not needed for device inventory or link topology.
@@ -458,6 +474,14 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	}
 	if cfg.SNMP.WalkRetryIntervalMs <= 0 {
 		cfg.SNMP.WalkRetryIntervalMs = 30000
+	}
+	// Light-telemetry cadences. <=0 → default; loops are gated by walk_sensors /
+	// walk_server_health, so set those false to disable rather than zeroing these.
+	if cfg.SNMP.TelemetryIntervalMs <= 0 {
+		cfg.SNMP.TelemetryIntervalMs = 60000 // 60s — cheap scalar devices
+	}
+	if cfg.SNMP.ServerTelemetryIntervalMs <= 0 {
+		cfg.SNMP.ServerTelemetryIntervalMs = 300000 // 300s — server temp+storage walks
 	}
 	if cfg.SNMP.BreakerCooldownMs <= 0 {
 		cfg.SNMP.BreakerCooldownMs = 30000
