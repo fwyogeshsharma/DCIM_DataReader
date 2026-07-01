@@ -269,6 +269,13 @@ type GNMIConfig struct {
 	Username     string    `yaml:"username"`
 	Password     string    `yaml:"password"`
 	PollInterval int       `yaml:"poll_interval_ms"` // default 30000; gNMI SAMPLE interval
+
+	// UptimeScale multiplies the gNMI /system/state/uptime value to produce
+	// system.uptime_centiseconds. The default source (this simulator) already
+	// serves centiseconds → 1.0. If a real gNMI target serves seconds set 100; if
+	// nanoseconds set 1e-7. default 1.0. (An earlier hardcoded ×100 assumed the
+	// source was seconds and inflated the sim's centisecond value 100×.)
+	UptimeScale float64 `yaml:"uptime_scale"`
 }
 
 // BACnetConfig holds the BACnet/IP collector settings. EDR polls Verdigris EV2
@@ -405,6 +412,7 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	cfg.GNMI.PollInterval = 30000
 	cfg.GNMI.FallbackPort = 57400
 	cfg.GNMI.ProxyProbeIntervalMs = 5000
+	cfg.GNMI.UptimeScale = 1.0 // source serves centiseconds; override for real targets
 	cfg.Redfish.Enabled = true // default on; YAML "enabled: false" overrides
 	cfg.Redfish.Port = 443
 	cfg.Redfish.Username = "admin"

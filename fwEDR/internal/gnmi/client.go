@@ -364,9 +364,15 @@ func (s *Subscriber) emitTree(b *deviceBinding, root map[string]any, ts int64) [
 	// ── system ──
 	if sys, ok := dig(root, "openconfig-system:system").(map[string]any); ok {
 		if st, ok := sys["state"].(map[string]any); ok {
-			// OpenConfig system uptime is in seconds; DCS liveness uses centiseconds.
+			// state/uptime is scaled to centiseconds by cfg.UptimeScale. The source
+			// (simulator) serves centiseconds → scale 1.0. A prior hardcoded ×100
+			// assumed seconds and inflated the value 100×.
 			if v, ok := num(st["uptime"]); ok {
-				add("system.uptime_centiseconds", "", v*100)
+				scale := s.cfg.UptimeScale
+				if scale <= 0 {
+					scale = 1.0
+				}
+				add("system.uptime_centiseconds", "", v*scale)
 			}
 		}
 		if mem, ok := dig(sys, "memory", "state").(map[string]any); ok {
