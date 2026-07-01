@@ -93,6 +93,59 @@ server:
 	}
 }
 
+// TestDefaultProfileSensorOIDs pins the Raritan/Vertiv/APC sensor OIDs + Raritan
+// type codes to the current mibs.go constants.
+func TestDefaultProfileSensorOIDs(t *testing.T) {
+	p := DefaultProfile()
+	if p.RaritanSensorValue != "1.3.6.1.4.1.13742.6.5.5.3.1.4" ||
+		p.RaritanSensorType != "1.3.6.1.4.1.13742.6.5.5.3.1.3" {
+		t.Errorf("raritan OIDs drifted: type=%s value=%s", p.RaritanSensorType, p.RaritanSensorValue)
+	}
+	if p.RaritanTypeTemp != 10 || p.RaritanTypeHumidity != 11 {
+		t.Errorf("raritan type codes drifted: temp=%d hum=%d", p.RaritanTypeTemp, p.RaritanTypeHumidity)
+	}
+	if p.VertivTempValue != "1.3.6.1.4.1.21239.5.1.4.1.4" ||
+		p.VertivDewValue != "1.3.6.1.4.1.21239.5.1.6.1.4" {
+		t.Errorf("vertiv OIDs drifted: temp=%s dew=%s", p.VertivTempValue, p.VertivDewValue)
+	}
+	if p.APCSensorValue != "1.3.6.1.4.1.318.1.1.10.4.2.2.1.10" ||
+		p.APCSensorLabel != "1.3.6.1.4.1.318.1.1.10.4.2.2.1.2" {
+		t.Errorf("apc OIDs drifted: label=%s value=%s", p.APCSensorLabel, p.APCSensorValue)
+	}
+}
+
+// TestLoadProfileSensorOverride proves a profile can retarget sensor OIDs and the
+// Raritan numeric type codes, inheriting defaults for anything omitted.
+func TestLoadProfileSensorOverride(t *testing.T) {
+	yaml := `
+name: real-sensors
+sensors:
+  raritan_type_temp: 1
+  raritan_type_humidity: 2
+  vertiv_temp_value: "1.3.6.1.4.1.21239.9.9.9.9"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sensors.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadProfile(path)
+	if err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+	if p.RaritanTypeTemp != 1 || p.RaritanTypeHumidity != 2 {
+		t.Errorf("raritan type override lost: temp=%d hum=%d", p.RaritanTypeTemp, p.RaritanTypeHumidity)
+	}
+	if p.VertivTempValue != "1.3.6.1.4.1.21239.9.9.9.9" {
+		t.Errorf("vertiv temp override lost: %s", p.VertivTempValue)
+	}
+	// Untouched sensor OIDs inherit defaults.
+	if p.RaritanSensorValue != DefaultProfile().RaritanSensorValue ||
+		p.APCSensorValue != DefaultProfile().APCSensorValue {
+		t.Error("untouched sensor OIDs should inherit default")
+	}
+}
+
 // TestLoadProfileEmptyIsDefault proves the zero-config path is byte-identical to
 // the built-in default (the "no break" guarantee).
 func TestLoadProfileEmptyIsDefault(t *testing.T) {

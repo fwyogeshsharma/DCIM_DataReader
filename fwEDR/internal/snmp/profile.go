@@ -52,6 +52,20 @@ type Profile struct {
 	UcdMemAvail         string
 	UcdMemCached        string
 	UcdMemBuffer        string
+
+	// Environmental sensor vendor tables (Raritan / Vertiv / APC). These are real
+	// vendor OIDs, but externalizing them lets a deployment add/retarget sensor
+	// vendors — including the per-vendor type/value column indices and Raritan's
+	// numeric type codes — without a code change. Defaults = current mibs.go values.
+	RaritanSensorType   string
+	RaritanSensorValue  string
+	RaritanTypeTemp     int
+	RaritanTypeHumidity int
+	VertivTempValue     string
+	VertivHumValue      string
+	VertivDewValue      string
+	APCSensorLabel      string
+	APCSensorValue      string
 }
 
 // DefaultProfile returns the built-in "simulator" profile — the exact OIDs and
@@ -122,6 +136,16 @@ func DefaultProfile() *Profile {
 		UcdMemAvail:         OIDUcdMemAvailReal,
 		UcdMemCached:        OIDUcdMemCached,
 		UcdMemBuffer:        OIDUcdMemBuffer,
+		// Sensor vendor tables (Raritan / Vertiv / APC).
+		RaritanSensorType:   OIDRaritanSensorType,
+		RaritanSensorValue:  OIDRaritanSensorValue,
+		RaritanTypeTemp:     RaritanTypeTemp,
+		RaritanTypeHumidity: RaritanTypeHumidity,
+		VertivTempValue:     OIDVertivTempValue,
+		VertivHumValue:      OIDVertivHumValue,
+		VertivDewValue:      OIDVertivDewValue,
+		APCSensorLabel:      OIDAPCNetBotzLabel,
+		APCSensorValue:      OIDAPCNetBotzValue,
 	}
 }
 
@@ -161,6 +185,17 @@ type profileFile struct {
 		UcdMemCached        string `yaml:"ucd_mem_cached"`
 		UcdMemBuffer        string `yaml:"ucd_mem_buffer"`
 	} `yaml:"server"`
+	Sensors struct {
+		RaritanSensorType   string `yaml:"raritan_sensor_type"`
+		RaritanSensorValue  string `yaml:"raritan_sensor_value"`
+		RaritanTypeTemp     int    `yaml:"raritan_type_temp"`
+		RaritanTypeHumidity int    `yaml:"raritan_type_humidity"`
+		VertivTempValue     string `yaml:"vertiv_temp_value"`
+		VertivHumValue      string `yaml:"vertiv_hum_value"`
+		VertivDewValue      string `yaml:"vertiv_dew_value"`
+		APCSensorLabel      string `yaml:"apc_sensor_label"`
+		APCSensorValue      string `yaml:"apc_sensor_value"`
+	} `yaml:"sensors"`
 }
 
 // LoadProfile returns the SNMP profile for the given file path. An empty path
@@ -215,6 +250,16 @@ func LoadProfile(path string) (*Profile, error) {
 	setIf(&p.UcdMemAvail, f.Server.UcdMemAvail)
 	setIf(&p.UcdMemCached, f.Server.UcdMemCached)
 	setIf(&p.UcdMemBuffer, f.Server.UcdMemBuffer)
+	// Sensor vendor tables.
+	setIf(&p.RaritanSensorType, f.Sensors.RaritanSensorType)
+	setIf(&p.RaritanSensorValue, f.Sensors.RaritanSensorValue)
+	setIfInt(&p.RaritanTypeTemp, f.Sensors.RaritanTypeTemp)
+	setIfInt(&p.RaritanTypeHumidity, f.Sensors.RaritanTypeHumidity)
+	setIf(&p.VertivTempValue, f.Sensors.VertivTempValue)
+	setIf(&p.VertivHumValue, f.Sensors.VertivHumValue)
+	setIf(&p.VertivDewValue, f.Sensors.VertivDewValue)
+	setIf(&p.APCSensorLabel, f.Sensors.APCSensorLabel)
+	setIf(&p.APCSensorValue, f.Sensors.APCSensorValue)
 	return p, nil
 }
 
@@ -222,6 +267,14 @@ func LoadProfile(path string) (*Profile, error) {
 // field keeps its default.
 func setIf(dst *string, v string) {
 	if v != "" {
+		*dst = v
+	}
+}
+
+// setIfInt overwrites *dst with v only when v is non-zero, so an omitted numeric
+// field keeps its default.
+func setIfInt(dst *int, v int) {
+	if v != 0 {
 		*dst = v
 	}
 }

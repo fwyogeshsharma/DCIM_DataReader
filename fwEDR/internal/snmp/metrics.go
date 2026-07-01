@@ -711,8 +711,8 @@ func (c *Collector) collectSensors() ([]*v1.TelemetryPacket, error) {
 }
 
 func (c *Collector) collectRaritanSensors() ([]*v1.TelemetryPacket, error) {
-	typeMap := walkIndexedInt(c.client, OIDRaritanSensorType)
-	valuePDUs, err := c.client.Walk(OIDRaritanSensorValue)
+	typeMap := walkIndexedInt(c.client, c.profile.RaritanSensorType)
+	valuePDUs, err := c.client.Walk(c.profile.RaritanSensorValue)
 	if err != nil {
 		return nil, err
 	}
@@ -724,9 +724,9 @@ func (c *Collector) collectRaritanSensors() ([]*v1.TelemetryPacket, error) {
 		meta := c.hostMeta()
 		meta["sensor_index"] = idx
 		switch sensorType {
-		case RaritanTypeTemp:
+		case c.profile.RaritanTypeTemp:
 			pkts = append(pkts, c.newMetric("environment.temperature_c", idx, val, meta))
-		case RaritanTypeHumidity:
+		case c.profile.RaritanTypeHumidity:
 			pkts = append(pkts, c.newMetric("environment.humidity_percent", idx, val, meta))
 		}
 	}
@@ -737,13 +737,13 @@ func (c *Collector) collectRaritanSensors() ([]*v1.TelemetryPacket, error) {
 func (c *Collector) collectVertivSensors() ([]*v1.TelemetryPacket, error) {
 	var pkts []*v1.TelemetryPacket
 	seen := 0
-	if p, n, err := walkEnvMetric(c.client, OIDVertivTempValue, "environment.temperature_c", c); err == nil {
+	if p, n, err := walkEnvMetric(c.client, c.profile.VertivTempValue, "environment.temperature_c", c); err == nil {
 		pkts, seen = append(pkts, p...), seen+n
 	}
-	if p, n, err := walkEnvMetric(c.client, OIDVertivHumValue, "environment.humidity_percent", c); err == nil {
+	if p, n, err := walkEnvMetric(c.client, c.profile.VertivHumValue, "environment.humidity_percent", c); err == nil {
 		pkts, seen = append(pkts, p...), seen+n
 	}
-	if p, n, err := walkEnvMetric(c.client, OIDVertivDewValue, "environment.dew_point_c", c); err == nil {
+	if p, n, err := walkEnvMetric(c.client, c.profile.VertivDewValue, "environment.dew_point_c", c); err == nil {
 		pkts, seen = append(pkts, p...), seen+n
 	}
 	c.warnEmptySensorWalk("vertiv", seen, len(pkts))
@@ -759,8 +759,8 @@ func (c *Collector) collectVertivSensors() ([]*v1.TelemetryPacket, error) {
 // temperature and airflow are ×10 (÷10 here); humidity is written as a whole
 // percent (no division).
 func (c *Collector) collectAPCSensors() ([]*v1.TelemetryPacket, error) {
-	labelMap := walkIndexedStr(c.client, OIDAPCNetBotzLabel)
-	valuePDUs, err := c.client.Walk(OIDAPCNetBotzValue)
+	labelMap := walkIndexedStr(c.client, c.profile.APCSensorLabel)
+	valuePDUs, err := c.client.Walk(c.profile.APCSensorValue)
 	if err != nil {
 		return nil, err
 	}
