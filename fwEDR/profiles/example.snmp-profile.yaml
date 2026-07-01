@@ -33,3 +33,13 @@ enterprise:
 
   # generator_scalars / ups_ent_scalars omitted here → they inherit the built-in
   # default. In a real profile, define them with the vendor's real columns.
+
+# Server OS OIDs (HOST-RESOURCES + UCD). The simulator serves hrStorage under the
+# nonstandard .25.2.2 base; real net-snmp agents use the standard hrStorageTable
+# .25.2.3.1.x. Override here to target standard indices. Omitted fields inherit
+# the built-in default.
+server:
+  hr_storage_size: "1.3.6.1.2.1.25.2.3.1.5"   # standard hrStorageSize
+  hr_storage_used: "1.3.6.1.2.1.25.2.3.1.6"   # standard hrStorageUsed
+  # hr_storage_type / hr_storage_descr / hr_storage_alloc_units likewise under .25.2.3.1
+  # ucd_cpu_user / ucd_mem_* : override if the real agent's UCD layout differs

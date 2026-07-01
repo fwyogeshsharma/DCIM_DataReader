@@ -435,7 +435,7 @@ func (c *Collector) collectServerHR() ([]*v1.TelemetryPacket, error) {
 	var pkts []*v1.TelemetryPacket
 
 	// CPU per core
-	cpuPDUs, err := c.client.Walk(OIDHrProcessorLoad)
+	cpuPDUs, err := c.client.Walk(c.profile.HrProcessorLoad)
 	if err == nil {
 		for _, p := range cpuPDUs {
 			idx := LastOIDComponent(p.Name)
@@ -445,17 +445,17 @@ func (c *Collector) collectServerHR() ([]*v1.TelemetryPacket, error) {
 	}
 
 	// Storage: collect type, alloc units, size, used; compute KB values
-	typeMap := walkIndexed(c.client, OIDHrStorageType)
-	descrMap := walkIndexedStr(c.client, OIDHrStorageDescr)
-	allocMap := walkIndexed(c.client, OIDHrStorageAllocUnits)
-	sizePDUs, _ := c.client.Walk(OIDHrStorageSize)
-	usedPDUs, _ := c.client.Walk(OIDHrStorageUsed)
+	typeMap := walkIndexed(c.client, c.profile.HrStorageType)
+	descrMap := walkIndexedStr(c.client, c.profile.HrStorageDescr)
+	allocMap := walkIndexed(c.client, c.profile.HrStorageAllocUnits)
+	sizePDUs, _ := c.client.Walk(c.profile.HrStorageSize)
+	usedPDUs, _ := c.client.Walk(c.profile.HrStorageUsed)
 
 	for _, p := range sizePDUs {
 		idx := LastOIDComponent(p.Name)
 		allocUnits := allocMap[idx]
 		sizeUnits := ToFloat64(p)
-		usedUnits := walkIndexed(c.client, OIDHrStorageUsed)[idx]
+		usedUnits := walkIndexed(c.client, c.profile.HrStorageUsed)[idx]
 		sizeKB := sizeUnits * allocUnits / 1024
 		usedKB := usedUnits * allocUnits / 1024
 		avail := sizeKB - usedKB
@@ -484,21 +484,21 @@ func (c *Collector) collectServerHR() ([]*v1.TelemetryPacket, error) {
 
 func (c *Collector) collectUCD() ([]*v1.TelemetryPacket, error) {
 	oids := []string{
-		OIDUcdSsCpuUser, OIDUcdSsCpuSystem, OIDUcdSsCpuIdle,
-		OIDUcdMemTotalReal, OIDUcdMemAvailReal, OIDUcdMemCached, OIDUcdMemBuffer,
+		c.profile.UcdCpuUser, c.profile.UcdCpuSystem, c.profile.UcdCpuIdle,
+		c.profile.UcdMemTotal, c.profile.UcdMemAvail, c.profile.UcdMemCached, c.profile.UcdMemBuffer,
 	}
 	pkt, err := c.client.Get(oids)
 	if err != nil {
 		return nil, err
 	}
 	nameMap := map[string]string{
-		OIDUcdSsCpuUser:    "server.cpu_user_percent",
-		OIDUcdSsCpuSystem:  "server.cpu_system_percent",
-		OIDUcdSsCpuIdle:    "server.cpu_idle_percent",
-		OIDUcdMemTotalReal: "server.memory_total_kb",
-		OIDUcdMemAvailReal: "server.memory_available_kb",
-		OIDUcdMemCached:    "server.memory_cached_kb",
-		OIDUcdMemBuffer:    "server.memory_buffer_kb",
+		c.profile.UcdCpuUser:   "server.cpu_user_percent",
+		c.profile.UcdCpuSystem: "server.cpu_system_percent",
+		c.profile.UcdCpuIdle:   "server.cpu_idle_percent",
+		c.profile.UcdMemTotal:  "server.memory_total_kb",
+		c.profile.UcdMemAvail:  "server.memory_available_kb",
+		c.profile.UcdMemCached: "server.memory_cached_kb",
+		c.profile.UcdMemBuffer: "server.memory_buffer_kb",
 	}
 	var pkts []*v1.TelemetryPacket
 	for _, p := range pkt.Variables {

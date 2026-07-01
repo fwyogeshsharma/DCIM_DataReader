@@ -32,6 +32,26 @@ type Profile struct {
 	PDUScalars       []scalarMetric
 	GeneratorScalars []scalarMetric
 	UPSEntScalars    []scalarMetric
+
+	// Server OS OIDs whose PLACEMENT varies between the simulator and real agents:
+	//   - hrStorage: the sim serves the storage table under .25.2.2.1.x, NOT the
+	//     standard hrStorageTable .25.2.3.1.x.
+	//   - UCD ssCpu / memory columns differ by net-snmp version and agent.
+	// Externalizing them lets a real-hardware profile use the standard indices
+	// without a code change. Defaults reproduce the current mibs.go constants.
+	HrProcessorLoad     string
+	HrStorageType       string
+	HrStorageDescr      string
+	HrStorageAllocUnits string
+	HrStorageSize       string
+	HrStorageUsed       string
+	UcdCpuUser          string
+	UcdCpuSystem        string
+	UcdCpuIdle          string
+	UcdMemTotal         string
+	UcdMemAvail         string
+	UcdMemCached        string
+	UcdMemBuffer        string
 }
 
 // DefaultProfile returns the built-in "simulator" profile — the exact OIDs and
@@ -87,6 +107,21 @@ func DefaultProfile() *Profile {
 			{"4", "environment.ups_phase_status", "", 1},
 			{"5", "environment.ups_battery_status_ex", "", 1},
 		},
+		// Server OS OIDs — default to the current mibs.go constants (sim placement
+		// for hrStorage; standard-index UCD columns as shipped).
+		HrProcessorLoad:     OIDHrProcessorLoad,
+		HrStorageType:       OIDHrStorageType,
+		HrStorageDescr:      OIDHrStorageDescr,
+		HrStorageAllocUnits: OIDHrStorageAllocUnits,
+		HrStorageSize:       OIDHrStorageSize,
+		HrStorageUsed:       OIDHrStorageUsed,
+		UcdCpuUser:          OIDUcdSsCpuUser,
+		UcdCpuSystem:        OIDUcdSsCpuSystem,
+		UcdCpuIdle:          OIDUcdSsCpuIdle,
+		UcdMemTotal:         OIDUcdMemTotalReal,
+		UcdMemAvail:         OIDUcdMemAvailReal,
+		UcdMemCached:        OIDUcdMemCached,
+		UcdMemBuffer:        OIDUcdMemBuffer,
 	}
 }
 
@@ -111,6 +146,21 @@ type profileFile struct {
 		GeneratorScalars []scalarYAML `yaml:"generator_scalars"`
 		UPSEntScalars    []scalarYAML `yaml:"ups_ent_scalars"`
 	} `yaml:"enterprise"`
+	Server struct {
+		HrProcessorLoad     string `yaml:"hr_processor_load"`
+		HrStorageType       string `yaml:"hr_storage_type"`
+		HrStorageDescr      string `yaml:"hr_storage_descr"`
+		HrStorageAllocUnits string `yaml:"hr_storage_alloc_units"`
+		HrStorageSize       string `yaml:"hr_storage_size"`
+		HrStorageUsed       string `yaml:"hr_storage_used"`
+		UcdCpuUser          string `yaml:"ucd_cpu_user"`
+		UcdCpuSystem        string `yaml:"ucd_cpu_system"`
+		UcdCpuIdle          string `yaml:"ucd_cpu_idle"`
+		UcdMemTotal         string `yaml:"ucd_mem_total"`
+		UcdMemAvail         string `yaml:"ucd_mem_avail"`
+		UcdMemCached        string `yaml:"ucd_mem_cached"`
+		UcdMemBuffer        string `yaml:"ucd_mem_buffer"`
+	} `yaml:"server"`
 }
 
 // LoadProfile returns the SNMP profile for the given file path. An empty path
@@ -151,7 +201,29 @@ func LoadProfile(path string) (*Profile, error) {
 	if s := toScalars(f.Enterprise.UPSEntScalars); s != nil {
 		p.UPSEntScalars = s
 	}
+	// Server OS OIDs — override each only when the file sets it (non-empty).
+	setIf(&p.HrProcessorLoad, f.Server.HrProcessorLoad)
+	setIf(&p.HrStorageType, f.Server.HrStorageType)
+	setIf(&p.HrStorageDescr, f.Server.HrStorageDescr)
+	setIf(&p.HrStorageAllocUnits, f.Server.HrStorageAllocUnits)
+	setIf(&p.HrStorageSize, f.Server.HrStorageSize)
+	setIf(&p.HrStorageUsed, f.Server.HrStorageUsed)
+	setIf(&p.UcdCpuUser, f.Server.UcdCpuUser)
+	setIf(&p.UcdCpuSystem, f.Server.UcdCpuSystem)
+	setIf(&p.UcdCpuIdle, f.Server.UcdCpuIdle)
+	setIf(&p.UcdMemTotal, f.Server.UcdMemTotal)
+	setIf(&p.UcdMemAvail, f.Server.UcdMemAvail)
+	setIf(&p.UcdMemCached, f.Server.UcdMemCached)
+	setIf(&p.UcdMemBuffer, f.Server.UcdMemBuffer)
 	return p, nil
+}
+
+// setIf overwrites *dst with v only when v is non-empty, so an omitted profile
+// field keeps its default.
+func setIf(dst *string, v string) {
+	if v != "" {
+		*dst = v
+	}
 }
 
 // toScalars converts the YAML DTO slice to internal scalarMetric. Returns nil for

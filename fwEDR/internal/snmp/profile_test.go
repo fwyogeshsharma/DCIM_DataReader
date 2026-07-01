@@ -43,6 +43,56 @@ func TestDefaultProfileMatchesLegacy(t *testing.T) {
 	}
 }
 
+// TestDefaultProfileServerOIDs pins the server OS OIDs to the current mibs.go
+// constants — hrStorage under the sim's .25.2.2 base, standard-index UCD columns.
+func TestDefaultProfileServerOIDs(t *testing.T) {
+	p := DefaultProfile()
+	cases := map[string]string{
+		p.HrProcessorLoad:     "1.3.6.1.2.1.25.3.3.1.2",
+		p.HrStorageSize:       "1.3.6.1.2.1.25.2.2.1.5",
+		p.HrStorageUsed:       "1.3.6.1.2.1.25.2.2.1.6",
+		p.HrStorageAllocUnits: "1.3.6.1.2.1.25.2.2.1.4",
+		p.UcdCpuUser:          "1.3.6.1.4.1.2021.11.9.0",
+		p.UcdMemTotal:         "1.3.6.1.4.1.2021.4.5.0",
+		p.UcdMemCached:        "1.3.6.1.4.1.2021.4.14.0",
+	}
+	for got, want := range cases {
+		if got != want {
+			t.Errorf("server OID = %s, want %s", got, want)
+		}
+	}
+}
+
+// TestLoadProfileServerOverride proves a real-hardware profile can move hrStorage
+// back to the standard .25.2.3 base without touching the rest.
+func TestLoadProfileServerOverride(t *testing.T) {
+	yaml := `
+name: real-server
+server:
+  hr_storage_size: "1.3.6.1.2.1.25.2.3.1.5"
+  hr_storage_used: "1.3.6.1.2.1.25.2.3.1.6"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "srv.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadProfile(path)
+	if err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+	if p.HrStorageSize != "1.3.6.1.2.1.25.2.3.1.5" || p.HrStorageUsed != "1.3.6.1.2.1.25.2.3.1.6" {
+		t.Errorf("hrStorage override lost: size=%s used=%s", p.HrStorageSize, p.HrStorageUsed)
+	}
+	// Untouched server + enterprise fields inherit defaults.
+	if p.HrStorageType != DefaultProfile().HrStorageType || p.UcdCpuUser != DefaultProfile().UcdCpuUser {
+		t.Error("untouched server OIDs should inherit default")
+	}
+	if p.PDUBase != DefaultProfile().PDUBase {
+		t.Error("enterprise section should inherit default")
+	}
+}
+
 // TestLoadProfileEmptyIsDefault proves the zero-config path is byte-identical to
 // the built-in default (the "no break" guarantee).
 func TestLoadProfileEmptyIsDefault(t *testing.T) {
