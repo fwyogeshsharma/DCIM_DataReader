@@ -305,6 +305,11 @@ type RedfishConfig struct {
 	TimeoutMs      int    `yaml:"timeout_ms"`       // per-request timeout (default 5000)
 	MaxConcurrent  int    `yaml:"max_concurrent"`   // max servers polled in parallel (default 4)
 	TLSInsecure    bool   `yaml:"tls_insecure"`     // use https + skip cert verify (default false = plain http)
+	// ProfilePath points at a Redfish profile that overrides where server OS-usage
+	// metrics (cpu/mem/disk/net/alarm) are read from in the ComputerSystem doc.
+	// Empty = the built-in "simulator" profile (Oem.Simulator). See
+	// internal/redfish/profile.go.
+	ProfilePath string `yaml:"profile_path"`
 }
 
 // TargetConfig describes one device to poll. IP roles follow DCIM conventions —

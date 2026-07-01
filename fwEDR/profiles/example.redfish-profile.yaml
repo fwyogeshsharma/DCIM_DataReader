@@ -1,0 +1,35 @@
+# Example Redfish profile — decouples where EDR reads server OS-usage metrics
+# (cpu/mem/disk/network/alarm) from the simulator.
+#
+# Usage: set `redfish.profile_path: "profiles/<file>.yaml"` in edr.yaml /
+# edr.prod.yaml. Empty (default) uses the built-in "simulator" profile, which
+# reads these from the Oem.Simulator extension of the ComputerSystem resource.
+#
+# Standard Redfish resources EDR already reads portably (no override needed):
+#   - PowerState (chassis power)
+#   - /Thermal   (bmc.temp_c, bmc.fan_rpm)
+#   - /Power     (bmc.power_draw_w, bmc.psu_output_w)
+#   - Managers   (bmc.info)
+# Only the OS-usage/performance fields are simulator-specific, because real BMCs
+# do NOT expose them under Oem.Simulator.
+#
+# Each os_usage entry maps a metric to a dotted JSON path WITHIN the
+# ComputerSystem document:
+#   metric — the emitted metric_name (server.*), must match METRICS_REFERENCE
+#   path   — dotted path, e.g. "Oem.Vendor.CpuPercent"
+#
+# LIMITATION: a dotted path can only reach fields inside the ComputerSystem doc.
+# Real BMCs that expose performance data in a SEPARATE MetricReport resource
+# (a second GET) cannot be mapped by this flat-path profile alone — that needs a
+# richer collector (a future step). This profile covers flat/Oem-style layouts.
+
+name: example-real-bmc
+
+power_state_path: PowerState
+
+# Providing os_usage REPLACES the whole default list, so no Oem.Simulator paths
+# leak into a real deployment. Map only the fields the target BMC exposes flatly.
+os_usage:
+  - {metric: server.cpu_percent,         path: "Oem.Vendor.CpuUtilizationPercent"}
+  - {metric: server.memory_used_percent, path: "Oem.Vendor.MemoryUtilizationPercent"}
+  # ... map the remaining server.* metrics to the BMC's real field locations ...

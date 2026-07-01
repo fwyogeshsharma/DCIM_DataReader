@@ -83,22 +83,11 @@ type serviceRoot struct {
 	Managers odataRef `json:"Managers"`
 }
 
-type computerSystem struct {
-	PowerState string `json:"PowerState"`
-	Oem        struct {
-		Simulator struct {
-			CPUUtilizationPercent    *float64 `json:"CpuUtilizationPercent"`
-			MemoryUtilizationPercent *float64 `json:"MemoryUtilizationPercent"`
-			MemoryUsedBytes          *float64 `json:"MemoryUsedBytes"`
-			DiskUtilizationPercent   *float64 `json:"DiskUtilizationPercent"`
-			DiskUsedBytes            *float64 `json:"DiskUsedBytes"`
-			DiskTotalBytes           *float64 `json:"DiskTotalBytes"`
-			NetworkRxMbps            *float64 `json:"NetworkRxMbps"`
-			NetworkTxMbps            *float64 `json:"NetworkTxMbps"`
-			AlarmCount               *float64 `json:"AlarmCount"`
-		} `json:"Simulator"`
-	} `json:"Oem"`
-}
+// The ComputerSystem document is read generically (map[string]any) so the
+// OS-usage field locations come from the Redfish profile (see profile.go) rather
+// than fixed struct tags. PowerState + the Oem.Simulator fields are extracted by
+// dotted path. Thermal/Power/Manager below stay typed — they are standard Redfish
+// resources, portable to real BMCs as-is.
 
 type thermal struct {
 	Temperatures []struct {

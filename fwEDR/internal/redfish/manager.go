@@ -41,6 +41,7 @@ type Manager struct {
 
 	client   *Client
 	bindings []*binding
+	profile  *Profile // OS-usage field paths (default = simulator Oem.Simulator)
 }
 
 // NewManager builds a Manager over the server targets (device_type=server with a
@@ -52,12 +53,23 @@ func NewManager(
 	signer *packet.Signer,
 	log *zap.Logger,
 ) *Manager {
+	// Load the OS-usage field profile once; a bad file degrades to the built-in
+	// simulator default so Redfish collection never stops on a config typo.
+	profile, err := LoadProfile(cfg.ProfilePath)
+	if err != nil {
+		log.Warn("redfish profile load failed — using built-in simulator default",
+			zap.String("path", cfg.ProfilePath), zap.Error(err))
+		profile = DefaultProfile()
+	}
+	log.Info("redfish profile loaded", zap.String("name", profile.Name),
+		zap.String("path", cfg.ProfilePath))
 	m := &Manager{
 		cfg:      cfg,
 		identity: identity,
 		signer:   signer,
 		log:      log,
 		client:   NewClient(cfg),
+		profile:  profile,
 	}
 	for _, t := range targets {
 		if t.DeviceType != "server" {
@@ -159,31 +171,26 @@ func (m *Manager) pollOne(ctx context.Context, b *binding, out chan<- *v1.Teleme
 
 	var pkts []*v1.TelemetryPacket
 
-	// ComputerSystem: chassis power state + OS usage (Oem.Simulator extension).
-	var sys computerSystem
+	// ComputerSystem: chassis power state + OS usage. Read generically so the
+	// OS-usage field locations come from the profile (Oem.Simulator on the sim;
+	// retargetable for real BMCs) rather than hardcoded struct tags.
+	var sys map[string]any
 	if err := m.client.get(ctx, b.ip, b.sysPath, &sys); err != nil {
 		m.log.Debug("redfish: system read failed", zap.String("bmc", b.ip), zap.Error(err))
 		b.discovered = false // force rediscovery next tick (ids may have changed)
 		return
 	}
 	powerState := 1.0 // 1 = On (matches the BMC-SNMP chassis power encoding)
-	if strings.EqualFold(sys.PowerState, "Off") {
+	if strings.EqualFold(stringAtPath(sys, m.profile.PowerStatePath), "Off") {
 		powerState = 2.0
 	}
 	// Power is a fixed state, not telemetry — emit it as device_state so DCS
 	// stores it on the device row (persistent) instead of the metrics table
 	// (which expires under retention).
 	pkts = append(pkts, m.deviceState(b, "power_state", powerState))
-	o := sys.Oem.Simulator
-	pkts = appendIf(pkts, m.metricP(b, "server.cpu_percent", "", o.CPUUtilizationPercent))
-	pkts = appendIf(pkts, m.metricP(b, "server.memory_used_percent", "", o.MemoryUtilizationPercent))
-	pkts = appendIf(pkts, m.metricP(b, "server.memory_used_bytes", "", o.MemoryUsedBytes))
-	pkts = appendIf(pkts, m.metricP(b, "server.disk_used_percent", "", o.DiskUtilizationPercent))
-	pkts = appendIf(pkts, m.metricP(b, "server.disk_used_bytes", "", o.DiskUsedBytes))
-	pkts = appendIf(pkts, m.metricP(b, "server.disk_total_bytes", "", o.DiskTotalBytes))
-	pkts = appendIf(pkts, m.metricP(b, "server.network_rx_mbps", "", o.NetworkRxMbps))
-	pkts = appendIf(pkts, m.metricP(b, "server.network_tx_mbps", "", o.NetworkTxMbps))
-	pkts = appendIf(pkts, m.metricP(b, "server.alarm_count", "", o.AlarmCount))
+	for _, f := range m.profile.OSUsage {
+		pkts = appendIf(pkts, m.metricP(b, f.Metric, "", floatAtPath(sys, f.Path)))
+	}
 
 	// Thermal: temperatures + fans (counts dynamic — iterate the arrays).
 	if b.chassisPath != "" {
