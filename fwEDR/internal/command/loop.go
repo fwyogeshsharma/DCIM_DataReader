@@ -7,6 +7,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/faberwork/fwedr/internal/snmp"
 	"github.com/faberwork/fwedr/internal/target"
 	"github.com/faberwork/fwedr/pkg/config"
 )
@@ -27,7 +28,7 @@ type Runner struct {
 // New builds a command Runner. rf supplies Redfish credentials for power
 // commands; targets lets applied asset edits update the in-memory copy. Call Run
 // in a goroutine.
-func New(cfg config.CommandApplyConfig, rf config.RedfishConfig, targets []*target.Target, log *zap.Logger) *Runner {
+func New(cfg config.CommandApplyConfig, rf config.RedfishConfig, profile *snmp.Profile, targets []*target.Target, log *zap.Logger) *Runner {
 	byIP := make(map[string]*target.Target, len(targets))
 	for _, t := range targets {
 		if t.MgmtIP != "" {
@@ -40,7 +41,7 @@ func New(cfg config.CommandApplyConfig, rf config.RedfishConfig, targets []*targ
 	return &Runner{
 		cfg:     cfg,
 		client:  newDCSClient(cfg),
-		applier: NewApplier(cfg, rf),
+		applier: NewApplier(cfg, rf, profile),
 		log:     log,
 		byIP:    byIP,
 	}

@@ -407,7 +407,15 @@ func run(cfgPath string, forceRediscover bool) error {
 		if cfg.CommandApply.DCSBaseURL == "" {
 			log.Warn("command_apply enabled but dcs_base_url is empty — skipping")
 		} else {
-			cr := command.New(cfg.CommandApply, cfg.Redfish, targets, log)
+			// SNMP-SET write map comes from the same profile as the read path; a bad
+			// file degrades to the built-in simulator default rather than blocking.
+			cmdProfile, perr := snmp.LoadProfile(cfg.SNMP.ProfilePath)
+			if perr != nil {
+				log.Warn("snmp profile load failed for command-apply — using default",
+					zap.String("path", cfg.SNMP.ProfilePath), zap.Error(perr))
+				cmdProfile = snmp.DefaultProfile()
+			}
+			cr := command.New(cfg.CommandApply, cfg.Redfish, cmdProfile, targets, log)
 			go cr.Run(ctx)
 		}
 	}

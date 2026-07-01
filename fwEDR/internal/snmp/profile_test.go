@@ -146,6 +146,60 @@ sensors:
 	}
 }
 
+// TestDefaultProfileWriteOIDs pins the SNMP-SET write map to the previous
+// command/apply.go values (count + representative entries + airflow ×10 set).
+func TestDefaultProfileWriteOIDs(t *testing.T) {
+	p := DefaultProfile()
+	if len(p.WriteOIDs) != 47 {
+		t.Fatalf("write map size = %d, want 47", len(p.WriteOIDs))
+	}
+	cases := map[string]WriteOID{
+		"name":              {"1.3.6.1.2.1.1.5.0", false},   // standard identity
+		"country":           {"1.3.6.1.4.1.99999.4.1.0", false},
+		"rack_unit":         {"1.3.6.1.4.1.99999.4.8.0", true},
+		"sensorairflowhigh": {"1.3.6.1.4.1.99999.3.19.0", true},
+	}
+	for field, want := range cases {
+		if got := p.WriteOIDs[field]; got != want {
+			t.Errorf("WriteOIDs[%q] = %+v, want %+v", field, got, want)
+		}
+	}
+	if len(p.AirflowX10OIDs) != 4 || !p.AirflowX10OIDs["1.3.6.1.4.1.99999.3.19.0"] {
+		t.Errorf("airflow ×10 set wrong: %v", p.AirflowX10OIDs)
+	}
+}
+
+// TestLoadProfileWriteOverride proves a real-hardware profile replaces the whole
+// write map (not merged) so it never inherits the simulator's enterprise OIDs.
+func TestLoadProfileWriteOverride(t *testing.T) {
+	yaml := `
+name: real-writes
+write:
+  oids:
+    name: {oid: "1.3.6.1.2.1.1.5.0", is_int: false}
+    rack_unit: {oid: "1.3.6.1.4.1.674.1.1", is_int: true}
+  airflow_x10_oids: []
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "w.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadProfile(path)
+	if err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+	if len(p.WriteOIDs) != 2 {
+		t.Fatalf("write map should be replaced (2), got %d", len(p.WriteOIDs))
+	}
+	if p.WriteOIDs["rack_unit"] != (WriteOID{"1.3.6.1.4.1.674.1.1", true}) {
+		t.Errorf("rack_unit override wrong: %+v", p.WriteOIDs["rack_unit"])
+	}
+	if _, ok := p.WriteOIDs["country"]; ok {
+		t.Error("sim-only field 'country' should be gone after whole-map replace")
+	}
+}
+
 // TestLoadProfileEmptyIsDefault proves the zero-config path is byte-identical to
 // the built-in default (the "no break" guarantee).
 func TestLoadProfileEmptyIsDefault(t *testing.T) {

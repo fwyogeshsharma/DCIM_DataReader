@@ -32,82 +32,10 @@ import (
 
 func insecureTLS() *tls.Config { return &tls.Config{InsecureSkipVerify: true} } //nolint:gosec
 
-// oidSpec maps a UI field to its writable OID and SNMP type.
-type oidSpec struct {
-	oid   string
-	isInt bool
-}
-
-// snmpFieldMap is the authoritative set of SNMP-SET-writable fields, per the
-// simulator SNMP_ARCHITECTURE.md §2.2 (mgmt plane, UDP 1161). Both the canonical
-// field name and common aliases map to the same OID.
-var snmpFieldMap = map[string]oidSpec{
-	// System identity — 1.3.6.1.2.1.1.x
-	"sys_contact":  {"1.3.6.1.2.1.1.4.0", false},
-	"contact":      {"1.3.6.1.2.1.1.4.0", false},
-	"name":         {"1.3.6.1.2.1.1.5.0", false},
-	"sysname":      {"1.3.6.1.2.1.1.5.0", false}, // aggregator sends camelCase "sysName" → lowercased here
-	"hostname":     {"1.3.6.1.2.1.1.5.0", false},
-	"sys_location": {"1.3.6.1.2.1.1.6.0", false},
-	"location":     {"1.3.6.1.2.1.1.6.0", false},
-	// Asset / location — enterprise 1.3.6.1.4.1.99999.4.x
-	"country":         {"1.3.6.1.4.1.99999.4.1.0", false},
-	"datacenter_city": {"1.3.6.1.4.1.99999.4.2.0", false},
-	"city":            {"1.3.6.1.4.1.99999.4.2.0", false},
-	"datacenter":      {"1.3.6.1.4.1.99999.4.3.0", false},
-	"floor":           {"1.3.6.1.4.1.99999.4.4.0", false},
-	"room":            {"1.3.6.1.4.1.99999.4.5.0", false},
-	"rack_row":        {"1.3.6.1.4.1.99999.4.6.0", true},
-	"rack_num":        {"1.3.6.1.4.1.99999.4.7.0", true},
-	"rack_unit":       {"1.3.6.1.4.1.99999.4.8.0", true},
-	"model":           {"1.3.6.1.4.1.99999.4.9.0", false},
-	"model_name":      {"1.3.6.1.4.1.99999.4.9.0", false},
-	"power_draw_w":    {"1.3.6.1.4.1.99999.4.10.0", true},
-
-	// Per-device alert thresholds — enterprise 1.3.6.1.4.1.99999.3.x (Integer),
-	// the same OIDs the threshold poller reads. Keys are lowercase because Apply
-	// lowercases the field name. Airflow values are served/written ×10.
-	"highcpu":                   {"1.3.6.1.4.1.99999.3.1.0", true},
-	"highcpusustained":          {"1.3.6.1.4.1.99999.3.2.0", true},
-	"cpunormal":                 {"1.3.6.1.4.1.99999.3.3.0", true},
-	"highmemory":                {"1.3.6.1.4.1.99999.3.4.0", true},
-	"hightemperature":           {"1.3.6.1.4.1.99999.3.6.0", true},
-	"rackfailuremin":            {"1.3.6.1.4.1.99999.3.9.0", true},
-	"sensorambienttemphigh":     {"1.3.6.1.4.1.99999.3.10.0", true},
-	"sensorambienttempcritical": {"1.3.6.1.4.1.99999.3.11.0", true},
-	"sensorambienttempnormal":   {"1.3.6.1.4.1.99999.3.12.0", true},
-	"sensorhighhumidity":        {"1.3.6.1.4.1.99999.3.13.0", true},
-	"sensorcriticalhumidity":    {"1.3.6.1.4.1.99999.3.14.0", true},
-	"sensorlowhumidity":         {"1.3.6.1.4.1.99999.3.15.0", true},
-	"sensorhumiditynormallow":   {"1.3.6.1.4.1.99999.3.16.1.0", true},
-	"sensorhumiditynormalhigh":  {"1.3.6.1.4.1.99999.3.16.2.0", true},
-	"sensorhighdewpoint":        {"1.3.6.1.4.1.99999.3.17.0", true},
-	"sensordewpointnormal":      {"1.3.6.1.4.1.99999.3.18.0", true},
-	"sensorhighairflow":         {"1.3.6.1.4.1.99999.3.19.0", true},
-	"sensorlowairflow":          {"1.3.6.1.4.1.99999.3.20.0", true},
-	"sensorairflownormallow":    {"1.3.6.1.4.1.99999.3.21.1.0", true},
-	"sensorairflownormalhigh":   {"1.3.6.1.4.1.99999.3.21.2.0", true},
-
-	// Aggregator UI threshold names (THRESHOLD_DEFAULTS in agents.ts) differ from
-	// the canonical keys above — alias them to the same OIDs so UI edits apply.
-	"sensortemphigh":         {"1.3.6.1.4.1.99999.3.10.0", true},
-	"sensortempcritical":     {"1.3.6.1.4.1.99999.3.11.0", true},
-	"sensorhumidityhigh":     {"1.3.6.1.4.1.99999.3.13.0", true},
-	"sensorhumiditycritical": {"1.3.6.1.4.1.99999.3.14.0", true},
-	"sensorhumiditylow":      {"1.3.6.1.4.1.99999.3.15.0", true},
-	"sensordewpointhigh":     {"1.3.6.1.4.1.99999.3.17.0", true},
-	"sensorairflowhigh":      {"1.3.6.1.4.1.99999.3.19.0", true}, // ×10: UI must send integer ×10 (3.5 m/s → 35)
-	"sensorairflowlow":       {"1.3.6.1.4.1.99999.3.20.0", true}, // ×10
-}
-
-// airflowX10OIDs are written ×10 (m/s). A decimal value from the UI is scaled to
-// the integer the SET agent expects; an already-integer value is passed through.
-var airflowX10OIDs = map[string]bool{
-	"1.3.6.1.4.1.99999.3.19.0":   true, // SensorHighAirflow
-	"1.3.6.1.4.1.99999.3.20.0":   true, // SensorLowAirflow
-	"1.3.6.1.4.1.99999.3.21.1.0": true, // SensorAirflowNormal low
-	"1.3.6.1.4.1.99999.3.21.2.0": true, // SensorAirflowNormal high
-}
+// The SNMP-SET write map (field→OID) and the ×10 airflow OID set now live in the
+// SNMP profile (internal/snmp/profile.go). The default profile reproduces the
+// previous simulator maps exactly; a real-hardware profile can retarget the write
+// path without a code change. See a.profile.WriteOIDs / a.profile.AirflowX10OIDs.
 
 // powerFields are routed to Redfish instead of SNMP.
 var powerFields = map[string]bool{
@@ -120,14 +48,19 @@ var powerFields = map[string]bool{
 type Applier struct {
 	cfg     config.CommandApplyConfig
 	redfish config.RedfishConfig
-	hc      *http.Client // shared Redfish client — reused, not per-request (avoids conn leak)
+	profile *snmp.Profile // SNMP-SET write map (field→OID) + ×10 airflow OIDs
+	hc      *http.Client  // shared Redfish client — reused, not per-request (avoids conn leak)
 }
 
-// NewApplier builds an Applier from the command-apply + redfish config.
-func NewApplier(cfg config.CommandApplyConfig, rf config.RedfishConfig) *Applier {
+// NewApplier builds an Applier from the command-apply + redfish config. profile
+// supplies the SNMP-SET write map; pass nil to use the built-in simulator default.
+func NewApplier(cfg config.CommandApplyConfig, rf config.RedfishConfig, profile *snmp.Profile) *Applier {
 	to := rf.TimeoutMs
 	if to <= 0 {
 		to = 5000
+	}
+	if profile == nil {
+		profile = snmp.DefaultProfile()
 	}
 	tr := &http.Transport{MaxIdleConns: 8, MaxIdleConnsPerHost: 2, IdleConnTimeout: 60 * time.Second}
 	if rf.TLSInsecure {
@@ -136,6 +69,7 @@ func NewApplier(cfg config.CommandApplyConfig, rf config.RedfishConfig) *Applier
 	return &Applier{
 		cfg:     cfg,
 		redfish: rf,
+		profile: profile,
 		hc:      &http.Client{Timeout: time.Duration(to) * time.Millisecond, Transport: tr},
 	}
 }
@@ -161,7 +95,7 @@ func (a *Applier) Apply(ctx context.Context, cmd Command) error {
 	if field == "indicator_led" || field == "led" {
 		return a.applyRedfishLED(ctx, deviceIP, cmd.Value)
 	}
-	spec, ok := snmpFieldMap[field]
+	spec, ok := a.profile.WriteOIDs[field]
 	if !ok {
 		return fmt.Errorf("unsupported field %q (no SNMP/Redfish write path)", cmd.Field)
 	}
@@ -169,7 +103,7 @@ func (a *Applier) Apply(ctx context.Context, cmd Command) error {
 }
 
 // applySNMPSet writes one OID via SNMPv2c SET to the device's mgmt plane.
-func (a *Applier) applySNMPSet(ctx context.Context, deviceIP string, spec oidSpec, value string) error {
+func (a *Applier) applySNMPSet(ctx context.Context, deviceIP string, spec snmp.WriteOID, value string) error {
 	host := a.cfg.SNMPSetAgent
 	if host == "" {
 		host = deviceIP // talk straight to the device when no agent host is set
@@ -203,10 +137,10 @@ func (a *Applier) applySNMPSet(ctx context.Context, deviceIP string, spec oidSpe
 	defer g.Conn.Close()
 
 	var pdu gosnmp.SnmpPDU
-	if spec.isInt {
+	if spec.IsInt {
 		v := strings.TrimSpace(value)
 		var n int
-		if airflowX10OIDs[spec.oid] {
+		if a.profile.AirflowX10OIDs[spec.OID] {
 			// Airflow OIDs are written ×10 (m/s). The UI sends a decimal (e.g.
 			// 3.5 m/s) — scale it to the integer the agent expects (35). An
 			// already-integer value is assumed pre-scaled and passed through.
@@ -226,17 +160,17 @@ func (a *Applier) applySNMPSet(ctx context.Context, deviceIP string, spec oidSpe
 				return fmt.Errorf("field expects integer, got %q: %w", value, err)
 			}
 		}
-		pdu = gosnmp.SnmpPDU{Name: spec.oid, Type: gosnmp.Integer, Value: n}
+		pdu = gosnmp.SnmpPDU{Name: spec.OID, Type: gosnmp.Integer, Value: n}
 	} else {
-		pdu = gosnmp.SnmpPDU{Name: spec.oid, Type: gosnmp.OctetString, Value: value}
+		pdu = gosnmp.SnmpPDU{Name: spec.OID, Type: gosnmp.OctetString, Value: value}
 	}
 
 	res, err := g.Set([]gosnmp.SnmpPDU{pdu})
 	if err != nil {
-		return fmt.Errorf("snmp set %s: %w", spec.oid, err)
+		return fmt.Errorf("snmp set %s: %w", spec.OID, err)
 	}
 	if res != nil && res.Error != gosnmp.NoError {
-		return fmt.Errorf("snmp set %s: agent error %v", spec.oid, res.Error)
+		return fmt.Errorf("snmp set %s: agent error %v", spec.OID, res.Error)
 	}
 	return nil
 }

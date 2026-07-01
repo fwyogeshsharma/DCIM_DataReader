@@ -66,6 +66,20 @@ type Profile struct {
 	VertivDewValue      string
 	APCSensorLabel      string
 	APCSensorValue      string
+
+	// WriteOIDs is the SNMP-SET (command-apply) field→OID map. The asset/location
+	// (99999.4.x) and threshold (99999.3.x) OIDs are simulator enterprise trees;
+	// real hardware writes different OIDs (or none). Externalizing lets a deployment
+	// retarget the write path via config. AirflowX10OIDs lists the OIDs the agent
+	// stores ×10. Defaults reproduce the previous command/apply.go maps.
+	WriteOIDs      map[string]WriteOID
+	AirflowX10OIDs map[string]bool
+}
+
+// WriteOID maps a UI field to its writable OID and SNMP type (Integer vs string).
+type WriteOID struct {
+	OID   string
+	IsInt bool
 }
 
 // DefaultProfile returns the built-in "simulator" profile — the exact OIDs and
@@ -146,6 +160,68 @@ func DefaultProfile() *Profile {
 		VertivDewValue:      OIDVertivDewValue,
 		APCSensorLabel:      OIDAPCNetBotzLabel,
 		APCSensorValue:      OIDAPCNetBotzValue,
+		// SNMP-SET (command-apply) write map. Standard system identity OIDs
+		// (.1.1.x) plus the simulator enterprise asset (99999.4.x) / threshold
+		// (99999.3.x) trees. Canonical field names + aliases map to the same OID.
+		WriteOIDs: map[string]WriteOID{
+			// System identity — 1.3.6.1.2.1.1.x (standard)
+			"sys_contact":  {"1.3.6.1.2.1.1.4.0", false},
+			"contact":      {"1.3.6.1.2.1.1.4.0", false},
+			"name":         {"1.3.6.1.2.1.1.5.0", false},
+			"sysname":      {"1.3.6.1.2.1.1.5.0", false},
+			"hostname":     {"1.3.6.1.2.1.1.5.0", false},
+			"sys_location": {"1.3.6.1.2.1.1.6.0", false},
+			"location":     {"1.3.6.1.2.1.1.6.0", false},
+			// Asset / location — enterprise 99999.4.x
+			"country":         {"1.3.6.1.4.1.99999.4.1.0", false},
+			"datacenter_city": {"1.3.6.1.4.1.99999.4.2.0", false},
+			"city":            {"1.3.6.1.4.1.99999.4.2.0", false},
+			"datacenter":      {"1.3.6.1.4.1.99999.4.3.0", false},
+			"floor":           {"1.3.6.1.4.1.99999.4.4.0", false},
+			"room":            {"1.3.6.1.4.1.99999.4.5.0", false},
+			"rack_row":        {"1.3.6.1.4.1.99999.4.6.0", true},
+			"rack_num":        {"1.3.6.1.4.1.99999.4.7.0", true},
+			"rack_unit":       {"1.3.6.1.4.1.99999.4.8.0", true},
+			"model":           {"1.3.6.1.4.1.99999.4.9.0", false},
+			"model_name":      {"1.3.6.1.4.1.99999.4.9.0", false},
+			"power_draw_w":    {"1.3.6.1.4.1.99999.4.10.0", true},
+			// Per-device alert thresholds — enterprise 99999.3.x
+			"highcpu":                   {"1.3.6.1.4.1.99999.3.1.0", true},
+			"highcpusustained":          {"1.3.6.1.4.1.99999.3.2.0", true},
+			"cpunormal":                 {"1.3.6.1.4.1.99999.3.3.0", true},
+			"highmemory":                {"1.3.6.1.4.1.99999.3.4.0", true},
+			"hightemperature":           {"1.3.6.1.4.1.99999.3.6.0", true},
+			"rackfailuremin":            {"1.3.6.1.4.1.99999.3.9.0", true},
+			"sensorambienttemphigh":     {"1.3.6.1.4.1.99999.3.10.0", true},
+			"sensorambienttempcritical": {"1.3.6.1.4.1.99999.3.11.0", true},
+			"sensorambienttempnormal":   {"1.3.6.1.4.1.99999.3.12.0", true},
+			"sensorhighhumidity":        {"1.3.6.1.4.1.99999.3.13.0", true},
+			"sensorcriticalhumidity":    {"1.3.6.1.4.1.99999.3.14.0", true},
+			"sensorlowhumidity":         {"1.3.6.1.4.1.99999.3.15.0", true},
+			"sensorhumiditynormallow":   {"1.3.6.1.4.1.99999.3.16.1.0", true},
+			"sensorhumiditynormalhigh":  {"1.3.6.1.4.1.99999.3.16.2.0", true},
+			"sensorhighdewpoint":        {"1.3.6.1.4.1.99999.3.17.0", true},
+			"sensordewpointnormal":      {"1.3.6.1.4.1.99999.3.18.0", true},
+			"sensorhighairflow":         {"1.3.6.1.4.1.99999.3.19.0", true},
+			"sensorlowairflow":          {"1.3.6.1.4.1.99999.3.20.0", true},
+			"sensorairflownormallow":    {"1.3.6.1.4.1.99999.3.21.1.0", true},
+			"sensorairflownormalhigh":   {"1.3.6.1.4.1.99999.3.21.2.0", true},
+			// Aggregator UI threshold aliases → same OIDs.
+			"sensortemphigh":         {"1.3.6.1.4.1.99999.3.10.0", true},
+			"sensortempcritical":     {"1.3.6.1.4.1.99999.3.11.0", true},
+			"sensorhumidityhigh":     {"1.3.6.1.4.1.99999.3.13.0", true},
+			"sensorhumiditycritical": {"1.3.6.1.4.1.99999.3.14.0", true},
+			"sensorhumiditylow":      {"1.3.6.1.4.1.99999.3.15.0", true},
+			"sensordewpointhigh":     {"1.3.6.1.4.1.99999.3.17.0", true},
+			"sensorairflowhigh":      {"1.3.6.1.4.1.99999.3.19.0", true},
+			"sensorairflowlow":       {"1.3.6.1.4.1.99999.3.20.0", true},
+		},
+		AirflowX10OIDs: map[string]bool{
+			"1.3.6.1.4.1.99999.3.19.0":   true,
+			"1.3.6.1.4.1.99999.3.20.0":   true,
+			"1.3.6.1.4.1.99999.3.21.1.0": true,
+			"1.3.6.1.4.1.99999.3.21.2.0": true,
+		},
 	}
 }
 
@@ -196,6 +272,13 @@ type profileFile struct {
 		APCSensorLabel      string `yaml:"apc_sensor_label"`
 		APCSensorValue      string `yaml:"apc_sensor_value"`
 	} `yaml:"sensors"`
+	Write struct {
+		OIDs map[string]struct {
+			OID   string `yaml:"oid"`
+			IsInt bool   `yaml:"is_int"`
+		} `yaml:"oids"`
+		AirflowX10OIDs []string `yaml:"airflow_x10_oids"`
+	} `yaml:"write"`
 }
 
 // LoadProfile returns the SNMP profile for the given file path. An empty path
@@ -260,6 +343,22 @@ func LoadProfile(path string) (*Profile, error) {
 	setIf(&p.VertivDewValue, f.Sensors.VertivDewValue)
 	setIf(&p.APCSensorLabel, f.Sensors.APCSensorLabel)
 	setIf(&p.APCSensorValue, f.Sensors.APCSensorValue)
+	// Write path — a real device declares its own full field set, so a provided
+	// write map REPLACES the default (not merged) to avoid inheriting sim OIDs.
+	if len(f.Write.OIDs) > 0 {
+		m := make(map[string]WriteOID, len(f.Write.OIDs))
+		for field, w := range f.Write.OIDs {
+			m[field] = WriteOID{OID: w.OID, IsInt: w.IsInt}
+		}
+		p.WriteOIDs = m
+	}
+	if len(f.Write.AirflowX10OIDs) > 0 {
+		m := make(map[string]bool, len(f.Write.AirflowX10OIDs))
+		for _, oid := range f.Write.AirflowX10OIDs {
+			m[oid] = true
+		}
+		p.AirflowX10OIDs = m
+	}
 	return p, nil
 }
 
