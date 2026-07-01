@@ -70,6 +70,7 @@ type Manager struct {
 	bindings []*binding
 	byIP     map[string]*binding // COV demux: notification src IP → binding
 	invoke   uint32
+	profile  *Profile // cooling-plant object maps (default = simulator)
 }
 
 // NewManager builds a Manager over the BACnet-capable targets.
@@ -80,12 +81,23 @@ func NewManager(
 	signer *packet.Signer,
 	log *zap.Logger,
 ) *Manager {
+	// Load the cooling-plant object profile once. A bad file degrades to the
+	// built-in simulator default so BACnet collection never stops on a config typo.
+	profile, err := LoadProfile(cfg.ProfilePath)
+	if err != nil {
+		log.Warn("bacnet profile load failed — using built-in simulator default",
+			zap.String("path", cfg.ProfilePath), zap.Error(err))
+		profile = DefaultProfile()
+	}
+	log.Info("bacnet profile loaded", zap.String("name", profile.Name),
+		zap.String("path", cfg.ProfilePath))
 	m := &Manager{
 		cfg:      cfg,
 		identity: identity,
 		signer:   signer,
 		log:      log,
 		byIP:     make(map[string]*binding),
+		profile:  profile,
 	}
 	for _, t := range targets {
 		if !t.Has(target.CapBACnet) {
@@ -105,7 +117,7 @@ func NewManager(
 		// point list; EV2 power meters expose panel + per-circuit objects.
 		var objs []objMeta
 		scope := "cooling" // plant devices are the cooling subsystem
-		if plant, ok := plantObjects[t.DeviceType]; ok {
+		if plant, ok := m.profile.Plant[t.DeviceType]; ok {
 			objs = plant
 		} else {
 			// EV2: read only circuits with a load wired to them (from the topology

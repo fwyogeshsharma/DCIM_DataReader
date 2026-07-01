@@ -284,6 +284,10 @@ type BACnetConfig struct {
 	ObjectsPerRead int  `yaml:"objects_per_read"` // objects per ReadPropertyMultiple to fit the APDU (default 12)
 	UseCOV         bool `yaml:"use_cov"`          // also SubscribeCOV for push notifications (default true)
 	COVLifetimeSec int  `yaml:"cov_lifetime_sec"` // COV subscription lifetime; renewed before expiry (default 300)
+	// ProfilePath points at a BACnet plant object-map profile that overrides the
+	// per-device-type (object type, instance) → metric maps for real hardware.
+	// Empty = the built-in "simulator" profile. See internal/bacnet/profile.go.
+	ProfilePath string `yaml:"profile_path"`
 }
 
 // RedfishConfig holds the Redfish (HTTP) collector settings. EDR polls each

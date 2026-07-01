@@ -1,0 +1,33 @@
+# Example BACnet plant object-map profile — decouples EDR's cooling-plant
+# (object type, instance) → metric mapping from the simulator.
+#
+# Usage: set `bacnet.profile_path: "profiles/<file>.yaml"` in edr.yaml /
+# edr.prod.yaml. Empty (default) uses the built-in "simulator" profile.
+#
+# On the simulator, plant instance numbers are POSITIONAL (spec-list order), so
+# real chiller/CRAH/CDU firmware — which assigns arbitrary instances — needs its
+# own map here. When a device type is provided it REPLACES that type's whole
+# object list (positional maps are not safely merged); omitted types keep the
+# built-in default.
+#
+# Each object:
+#   type  — analogInput (or ai) | binaryInput (or bi)
+#   inst  — the BACnet object instance number on the target device
+#   name  — the emitted metric_name (cooling.*), must match METRICS_REFERENCE
+#   tag   — optional sub-key; usually empty for plant points
+#   scale — value divisor undoing any fixed-point encoding (1 = none)
+#
+# The instances below are ILLUSTRATIVE. Discover the real device's instances
+# (e.g. a BACnet browser reading Object_Name, property 77) and map them here.
+
+name: example-real-plant
+
+plant:
+  chiller:
+    - {type: analogInput, inst: 1,  name: cooling.chw_supply_temp_c,  scale: 1}
+    - {type: analogInput, inst: 2,  name: cooling.chw_return_temp_c,  scale: 1}
+    # ... map the remaining points to the target chiller's real instances ...
+    - {type: binaryInput, inst: 1,  name: cooling.chiller_running}
+
+  # pump / cooling_tower / valve / cdu / crah omitted here → they inherit the
+  # built-in simulator default. Define each with the real device's instances.
