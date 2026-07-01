@@ -114,6 +114,10 @@ type SNMPConfig struct {
 	Community          string `yaml:"community"`
 	Version            int    `yaml:"version"`
 	V3                 SNMPV3 `yaml:"v3"`
+	// ProfilePath points at an SNMP OID profile file that overrides the device-family
+	// enterprise mappings (PDU/generator/UPS trees) for real hardware. Empty = the
+	// built-in "simulator" profile (unchanged behavior). See internal/snmp/profile.go.
+	ProfilePath string `yaml:"profile_path"`
 	PollInterval       int    `yaml:"poll_interval_ms"`     // legacy; seeds fast tier if fast_interval_ms unset
 	FastIntervalMs     int    `yaml:"fast_interval_ms"`     // default 30000
 	MediumIntervalMs   int    `yaml:"medium_interval_ms"`   // default 120000

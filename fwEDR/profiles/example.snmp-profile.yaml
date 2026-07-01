@@ -1,0 +1,35 @@
+# Example SNMP OID profile — decouples EDR's enterprise power-device mappings from
+# the simulator so the same binary can poll real hardware by config, not code.
+#
+# Usage: set `snmp.profile_path: "profiles/<file>.yaml"` in edr.yaml / edr.prod.yaml.
+# Empty profile_path (the default) uses the built-in "simulator" profile, which
+# reproduces the exact OIDs/scaling used before this file existed — no behavior
+# change. A profile file overrides ONLY the sections it defines; anything omitted
+# keeps the built-in default, so partial profiles are valid.
+#
+# Each scalar maps one enterprise column `base.<col>.0` to a metric_name:
+#   col   — the column number under the base OID
+#   name  — the emitted metric_name (must match METRICS_REFERENCE)
+#   tag   — optional sub-key (phase/type); empty for scalar series
+#   scale — divisor that undoes the device's fixed-point ×N encoding (1 = none)
+#
+# The values below are illustrative REAL-vendor OIDs, NOT the simulator's. Do not
+# point the simulator at this file; it is a template for real deployments.
+
+name: example-real-vendor
+
+enterprise:
+  # Real PDUs/generators/UPSs answer under vendor MIBs, not the sim's 99999 tree.
+  # Replace these bases + columns with the target vendor's actual MIB layout.
+  pdu_base: "1.3.6.1.4.1.318.1.1.12"     # e.g. an APC-style PDU subtree
+  generator_base: "1.3.6.1.4.1.9999.7"   # replace with the generator vendor MIB
+  ups_ent_base: "1.3.6.1.4.1.318.1.1.1"  # e.g. an APC UPS subtree
+
+  pdu_scalars:
+    - {col: "1",  name: "pdu.load_percent",  tag: "",    scale: 1}
+    - {col: "2",  name: "pdu.voltage_v",     tag: "",    scale: 1}
+    - {col: "3",  name: "pdu.current_a",     tag: "",    scale: 10}
+    # ... add the remaining columns for the target vendor ...
+
+  # generator_scalars / ups_ent_scalars omitted here → they inherit the built-in
+  # default. In a real profile, define them with the vendor's real columns.

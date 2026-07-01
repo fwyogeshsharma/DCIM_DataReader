@@ -42,6 +42,11 @@ type Poller struct {
 	out      chan<- *v1.TelemetryPacket
 	log      *zap.Logger
 
+	// profile carries the device-family SNMP OID mappings (enterprise PDU/generator/
+	// UPS trees). Loaded once from snmp.profile_path; the built-in simulator default
+	// when unset. Shared read-only by every per-poll Collector.
+	profile *snmp.Profile
+
 	// socketSem is the SINGLE global cap on concurrent SNMP UDP sockets. EVERY tier
 	// (fast + heavy) must hold a token before snmp.NewClient or any SNMP UDP op, so
 	// total in-flight sockets never exceeds its size — this is what prevents the
@@ -154,6 +159,17 @@ func New(
 		zap.Bool("pooled_sockets", pooled),
 		zap.Int("pool_size", poolSize))
 	snmp.ConfigureSocketLimit(effCap)
+	// Load the SNMP OID profile once (enterprise PDU/generator/UPS mappings). On any
+	// error fall back to the built-in simulator default so a bad profile file never
+	// stops collection — it just keeps the previous behavior and logs loudly.
+	profile, err := snmp.LoadProfile(snmpCfg.ProfilePath)
+	if err != nil {
+		log.Warn("snmp profile load failed — using built-in simulator default",
+			zap.String("path", snmpCfg.ProfilePath), zap.Error(err))
+		profile = snmp.DefaultProfile()
+	}
+	log.Info("snmp profile loaded", zap.String("name", profile.Name),
+		zap.String("path", snmpCfg.ProfilePath))
 	p := &Poller{
 		targets:   targets,
 		snmpCfg:   snmpCfg,
@@ -171,6 +187,7 @@ func New(
 		throttle:  newLogThrottle(time.Duration(snmpCfg.LogThrottleMs) * time.Millisecond),
 		pooled:    pooled,
 		poolSize:  poolSize,
+		profile:   profile,
 	}
 	if snmpCfg.RateLimitPerSec > 0 {
 		p.limiter = newRateLimiter(snmpCfg.RateLimitPerSec)
@@ -663,6 +680,7 @@ func (p *Poller) pollSNMP(ctx context.Context, t *target.Target, tier snmp.Tier)
 		p.identity.GroupID, p.identity.ReaderID,
 		p.signer,
 		p.snmpCfg.MgmtPort, p.snmpCfg.Timeout,
+		p.profile,
 		p.log,
 	)
 	pkts, err := collector.Collect(tier)

@@ -33,6 +33,11 @@ type Collector struct {
 	// PDUs but produces zero metric packets — the signature of an OID mismatch).
 	// May be nil; all uses must guard.
 	log *zap.Logger
+
+	// profile holds the device-family OID mappings (enterprise PDU/generator/UPS
+	// trees) that vary between the simulator and real hardware. Never nil — set to
+	// DefaultProfile() when none is supplied, giving the previous hardcoded values.
+	profile *Profile
 }
 
 type basePacket struct {
@@ -41,15 +46,20 @@ type basePacket struct {
 
 // NewCollector creates a Collector. The caller must Close() when done.
 // mgmtPort/mgmtTimeoutMs configure the optional live-sysName read against the
-// simulator SET agent (0 = disabled / production).
+// simulator SET agent (0 = disabled / production). profile supplies the
+// device-family OID mappings; pass nil to use DefaultProfile() (simulator).
 func NewCollector(
 	t *target.Target,
 	client *Client,
 	orgID, dcID, floorID, netID, grpID, readerID string,
 	signer *packet.Signer,
 	mgmtPort, mgmtTimeoutMs int,
+	profile *Profile,
 	log *zap.Logger,
 ) *Collector {
+	if profile == nil {
+		profile = DefaultProfile()
+	}
 	return &Collector{
 		target:        t,
 		client:        client,
@@ -57,6 +67,7 @@ func NewCollector(
 		signer:        signer,
 		mgmtPort:      mgmtPort,
 		mgmtTimeoutMs: mgmtTimeoutMs,
+		profile:       profile,
 		log:           log,
 	}
 }
@@ -564,65 +575,21 @@ type scalarMetric struct {
 	scale float64
 }
 
-// pduScalars maps the simulator's _pdu_entries (99999.5.N.0) to metrics. Temp
-// and humidity are folded into the shared environment.* names (tag PDU) so they
-// land on the heatmap alongside sensor/server/ups readings.
-var pduScalars = []scalarMetric{
-	{"1", "pdu.load_percent", "", 1},
-	{"2", "pdu.voltage_v", "", 1},
-	{"3", "pdu.power_factor", "", 100},
-	{"4", "pdu.phase_imbalance_percent", "", 1},
-	{"5", "pdu.outlet_status", "", 1},
-	{"6", "pdu.breaker_status", "", 1},
-	{"7", "pdu.outlet_failure", "", 1},
-	{"8", "pdu.smoke_detected", "", 1},
-	{"9", "pdu.current_a", "", 10},
-	{"10", "pdu.ground_fault", "", 1},
-	{"11", "pdu.real_power_w", "", 1},
-	{"12", "pdu.apparent_power_va", "", 1},
-	{"13", "pdu.energy_kwh", "", 10},
-	{"14", "pdu.frequency_hz", "", 10},
-	{"15", "environment.temperature_c", "PDU", 10},
-	{"16", "environment.humidity_percent", "", 10},
-	{"17", "pdu.outlet_power_w", "", 1},
-}
-
-// genScalars maps the simulator's _generator_entries (99999.7.N.0) to metrics.
-var genScalars = []scalarMetric{
-	{"1", "generator.fuel_percent", "", 1},
-	{"2", "generator.run_hours", "", 1},
-	{"3", "generator.status", "", 1},
-	{"4", "generator.load_percent", "", 1},
-	{"5", "generator.output_kw", "", 1},
-	{"6", "generator.output_voltage_v", "PhA", 10},
-	{"7", "generator.output_voltage_v", "PhB", 10},
-	{"8", "generator.output_voltage_v", "PhC", 10},
-	{"9", "generator.frequency_hz", "", 10},
-	{"10", "generator.coolant_status", "", 1},
-	{"11", "generator.oil_pressure_status", "", 1},
-	{"12", "generator.battery_status", "", 1},
-	{"13", "generator.start_attempts", "", 1},
-}
-
-// upsEntScalars maps the UPS enterprise status block (99999.4.N.0) to metrics.
-var upsEntScalars = []scalarMetric{
-	{"1", "environment.ups_fan_status", "", 1},
-	{"2", "environment.ups_charger_status", "", 1},
-	{"3", "environment.ups_rectifier_status", "", 1},
-	{"4", "environment.ups_phase_status", "", 1},
-	{"5", "environment.ups_battery_status_ex", "", 1},
-}
+// The PDU / generator / UPS-enterprise scalar tables and their base OIDs now live
+// in the Profile (see profile.go / DefaultProfile). The collectors read them from
+// c.profile so a different profile file can retarget real vendor MIBs without a
+// code change; with no profile configured these equal the previous hardcoded set.
 
 func (c *Collector) collectPDU() ([]*v1.TelemetryPacket, error) {
-	return c.collectScalars(OIDPDUBase, pduScalars)
+	return c.collectScalars(c.profile.PDUBase, c.profile.PDUScalars)
 }
 
 func (c *Collector) collectGenerator() ([]*v1.TelemetryPacket, error) {
-	return c.collectScalars(OIDGeneratorBase, genScalars)
+	return c.collectScalars(c.profile.GeneratorBase, c.profile.GeneratorScalars)
 }
 
 func (c *Collector) collectUPSEnterprise() ([]*v1.TelemetryPacket, error) {
-	return c.collectScalars(OIDUPSEntBase, upsEntScalars)
+	return c.collectScalars(c.profile.UPSEntBase, c.profile.UPSEntScalars)
 }
 
 // collectScalars reads a set of enterprise scalar OIDs (base.col.0) in a single
