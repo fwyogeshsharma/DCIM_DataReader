@@ -1,0 +1,6 @@
+# stray local build binaries (deploy artifacts live in build/<platform>/)
+/dcs
+/dcs.exe
+/fwdcs
+/fwdcs.exe
+/buildwindows-amd64dcs.exe

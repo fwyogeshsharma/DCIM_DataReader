@@ -216,6 +216,21 @@ func (q *Queue) PopBatch(n int) ([]*v1.TelemetryPacket, error) {
 	return out, nil
 }
 
+// Usage returns the fraction of max_bytes currently used (0..1). Used by the
+// backpressure monitor to pause collection before the queue fills and drops.
+func (q *Queue) Usage() float64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.maxBytes <= 0 {
+		return 0
+	}
+	u := float64(q.usedBytes) / float64(q.maxBytes)
+	if u > 1 {
+		u = 1
+	}
+	return u
+}
+
 // Len returns the number of queued packets.
 func (q *Queue) Len() int {
 	var count int

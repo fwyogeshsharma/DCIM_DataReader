@@ -11,3 +11,9 @@ targets.json
 *.bak
 *.bak_*
 *.orig
+
+# stray local build binaries (deploy artifacts live in build/<platform>/)
+/edr
+/edr.exe
+/fwedr
+/fwedr.exe

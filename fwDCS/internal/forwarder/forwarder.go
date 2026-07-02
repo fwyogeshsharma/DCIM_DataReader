@@ -339,8 +339,14 @@ func (f *Forwarder) Run(ctx context.Context) {
 		zap.Duration("event_debounce", f.debounce),
 		zap.Bool("event_driven", f.notify != nil))
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	// Adaptive send cadence: the base interval when healthy, exponential backoff
+	// (up to backoffMax) while pushes fail — so a slow/overwhelmed aggregator gets
+	// room to recover instead of being hammered every interval (which drove it from
+	// slow → TLS-handshake-timeout → crash). Resets to base on the first success.
+	const backoffMax = 5 * time.Minute
+	fails := 0
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 
 	// Full topology re-sync: re-forward EVERY link periodically so a stable link
 	// (whose updated_at never moves, so the delta cursor never re-sends it)
@@ -356,11 +362,27 @@ func (f *Forwarder) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-resyncTicker.C:
-			f.resyncTopology(ctx)
-		case <-ticker.C:
+			// Skip the heavy full-topology resync while the aggregator is
+			// struggling — it would only pile more load on a stressed endpoint.
+			if fails == 0 {
+				f.resyncTopology(ctx)
+			}
+		case <-timer.C:
 			// Regular cadence: gated by per-table idle backoff.
 			if err := f.push(ctx, false); err != nil {
-				f.log.Warn("aggregator forwarder push failed", zap.Error(err))
+				fails++
+				d := backoffDelay(interval, fails, backoffMax)
+				f.log.Warn("aggregator push failed — backing off",
+					zap.Int("consecutive_fails", fails),
+					zap.Duration("next_retry", d), zap.Error(err))
+				timer.Reset(d)
+			} else {
+				if fails > 0 {
+					f.log.Info("aggregator push recovered — resuming normal cadence",
+						zap.Int("after_fails", fails))
+				}
+				fails = 0
+				timer.Reset(interval)
 			}
 		case <-f.notify:
 			// An event landed (trap/alarm/link change/rename — any kind). Coalesce
@@ -382,6 +404,19 @@ func (f *Forwarder) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// backoffDelay returns base × 2^(fails-1), capped at max — exponential backoff so
+// repeated aggregator failures widen the retry gap instead of hammering it.
+func backoffDelay(base time.Duration, fails int, max time.Duration) time.Duration {
+	d := base
+	for i := 1; i < fails && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	return d
 }
 
 // drainNotify empties any pending coalesced signals without blocking.

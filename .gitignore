@@ -1,0 +1,4 @@
+# Separate repositories kept locally for analysis only — NOT part of this repo.
+# They have their own git history; never track or commit them here.
+/Datacenter_Network_Simulator/
+/DCIM_Aggregator/

@@ -272,12 +272,14 @@ func (db *DB) UpsertDevice(ctx context.Context, pkt *v1.TelemetryPacket) error {
 			mgmt_ip, prod_ip, loopback_ip, oob_ip,
 			snmp_enabled, gnmi_enabled, collector_agent,
 			country, datacenter_city, datacenter, room, rack_row, rack_num, rack_unit,
+			sys_oid,
 			last_seen_at, updated_at
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
 		          NULLIF($13,'')::INET, NULLIF($14,'')::INET, NULLIF($15,'')::INET, NULLIF($16,'')::INET,
 		          $17,$18,$19,
 		          NULLIF($20,''), NULLIF($21,''), NULLIF($22,''), NULLIF($23,''),
 		          $24::SMALLINT, $25::SMALLINT, $26::SMALLINT,
+		          NULLIF($27,''),
 		          now(), now())
 		ON CONFLICT (org_id, datacenter_id, floor_id, network_id, group_id, hostname)
 		DO UPDATE SET
@@ -307,6 +309,7 @@ func (db *DB) UpsertDevice(ctx context.Context, pkt *v1.TelemetryPacket) error {
 			os_name         = COALESCE(NULLIF(EXCLUDED.os_name, ''),         devices.os_name),
 			os_version      = COALESCE(NULLIF(EXCLUDED.os_version, ''),      devices.os_version),
 			sys_description = COALESCE(NULLIF(EXCLUDED.sys_description, ''), devices.sys_description),
+			sys_oid         = COALESCE(NULLIF(EXCLUDED.sys_oid, ''),         devices.sys_oid),
 			model_name      = COALESCE(NULLIF(EXCLUDED.model_name, ''),      devices.model_name),
 			vendor          = COALESCE(NULLIF(EXCLUDED.vendor, ''),          devices.vendor),
 			mgmt_ip         = COALESCE(EXCLUDED.mgmt_ip,                     devices.mgmt_ip),
@@ -347,6 +350,7 @@ func (db *DB) UpsertDevice(ctx context.Context, pkt *v1.TelemetryPacket) error {
 		rackRow,
 		rackNum,
 		rackUnit,
+		pkt.Meta["sys_oid"],
 	)
 	return err
 }

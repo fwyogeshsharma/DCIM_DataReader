@@ -42,9 +42,9 @@ aggregator:
   enabled:     true
   endpoint:    "https://fwdcim.faberwork.com/api/v1/ingest"
   ingest_key:  "74613fe24e4da087f46d584c6558870a3bed6b993a6416ced4df17f9a0f1e824"
-  interval_ms: 30000   # push cadence; higher = less CPU/marshal work (was 5000)
+  interval_ms: 10000   # base push cadence; forwarder backs off exponentially on aggregator failure
   idle_interval_ms: 120000   # drained tables re-checked rarely → less idle CPU
-  batch_limit: 1000
+  batch_limit: 100     # 100×50 = 5k metrics/POST (not 50k) — keeps the aggregator from being overwhelmed
   org_id:      "faber"
   network_id:  "net-prod"
   group_id:    "grp-core"

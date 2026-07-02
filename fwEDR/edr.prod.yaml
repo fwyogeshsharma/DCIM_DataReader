@@ -12,7 +12,7 @@ dcs:
     insecure: true
 
 queue:
-  max_bytes: 536870912  # 512 MB
+  max_bytes: 134217728  # 128 MB — bounds EDR memory; backpressure pauses collection at 75% usage before it fills
 
 publisher:
   batch_size:        512
@@ -31,15 +31,12 @@ discovery:
   snmp_agent: "127.0.0.1"
   seed_ip:    "192.168.0.7"
   interval_hours: 0
-  enrich:         true
 
 snmp:
   community:           "public"
   version:             2
   poll_interval_ms:    60000
   fast_interval_ms:     60000   # liveness Get cadence
-  medium_interval_ms:   180000  # interface state walks — slower = less CPU
-  slow_interval_ms:     600000  # heavy counter/HR walks (mostly off here)
   topology_interval_ms: 900000  # LLDP refresh — rarely changes
   timeout_ms:          5000
   retries:             0

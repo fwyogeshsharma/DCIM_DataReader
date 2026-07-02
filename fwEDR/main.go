@@ -129,6 +129,39 @@ func run(cfgPath string, forceRediscover bool) error {
 	pub := publisher.New(q, cfg.DCS, cfg.Publisher, gate, log)
 	go pub.Run(ctx)
 
+	// Backpressure monitor: pause collection when the local queue is filling faster
+	// than it drains (slow/overwhelmed DCS or aggregator), resume when it drains.
+	// This closes the gap where a slow-but-successful DCS never trips the down
+	// streak, letting the queue grow until EDR ran out of resources. High/low
+	// watermarks give hysteresis so it doesn't flap. Independent of the DCS-down
+	// signal — either one pauses the poller (gate.ShouldPause).
+	go func() {
+		const hiWater, loWater = 0.75, 0.40
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
+		paused := false
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			u := q.Usage()
+			switch {
+			case !paused && u >= hiWater:
+				paused = true
+				gate.SetBackpressure(true)
+				log.Warn("backpressure engaged — pausing collection (queue filling)",
+					zap.Float64("queue_usage", u))
+			case paused && u <= loWater:
+				paused = false
+				gate.SetBackpressure(false)
+				log.Info("backpressure released — resuming collection",
+					zap.Float64("queue_usage", u))
+			}
+		}
+	}()
+
 	// Batched enqueue goroutine: accumulates packets in memory and flushes to
 	// the bbolt queue either when the buffer is full or when flush_interval_ms
 	// elapses. Single bbolt fsync per flush amortizes write cost across many
@@ -319,12 +352,21 @@ func run(cfgPath string, forceRediscover bool) error {
 					topoIv = 10 * time.Minute
 				}
 				// The JSON link set is static for a run, so re-emitting all of it every
-				// interval is pure waste (DCS now ignores unchanged links). But we DO
-				// need a few early re-emits so links whose endpoint device registered
-				// late still resolve, plus a sparse re-assert to heal a DCS restart.
-				// warmupCycles: re-emit each interval at first (catch late registrations).
-				// reassertEvery: afterwards, re-emit only every Nth interval.
-				const warmupCycles = 3
+				// interval is pure waste (DCS ignores unchanged links). But links whose
+				// endpoint device registers LATE are dropped DCS-side until re-emitted,
+				// so we re-emit FAST during a warmup window (catch registrations quickly)
+				// then settle to a sparse re-assert (heals a DCS restart).
+				//
+				// warmupIv is deliberately DECOUPLED from topoIv: a slow topoIv (10 min
+				// default) at startup left topology stuck for minutes whenever device
+				// registration was delayed (slow/ overloaded responder, DCS-down pause,
+				// or a mid-startup restart). Warmup now re-emits every ~30 s so links
+				// converge within seconds of their endpoints registering.
+				warmupIv := 30 * time.Second
+				if warmupIv > topoIv {
+					warmupIv = topoIv // never slower than the reassert cadence
+				}
+				const warmupCycles = 8 // ~4 min of fast (30 s) re-emits
 				const reassertEvery = 12
 				for cycle := 0; ; cycle++ {
 					emit := cycle < warmupCycles || cycle%reassertEvery == 0
@@ -342,10 +384,14 @@ func run(cfgPath string, forceRediscover bool) error {
 					} else {
 						log.Debug("topology links unchanged — skip re-emit", zap.Int("total", len(links)))
 					}
+					iv := topoIv
+					if cycle < warmupCycles {
+						iv = warmupIv // fast during warmup, slow after
+					}
 					select {
 					case <-ctx.Done():
 						return
-					case <-time.After(topoIv):
+					case <-time.After(iv):
 					}
 				}
 			}()

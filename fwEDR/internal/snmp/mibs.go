@@ -5,9 +5,14 @@ package snmp
 const (
 	// SNMPv2-MIB / system group
 	OIDSysDescr    = "1.3.6.1.2.1.1.1.0"
+	OIDSysObjectID = "1.3.6.1.2.1.1.2.0" // sysObjectID → devices.sys_oid
 	OIDSysUpTime   = "1.3.6.1.2.1.1.3.0"
 	OIDSysName     = "1.3.6.1.2.1.1.5.0"
 	OIDSysLocation = "1.3.6.1.2.1.1.6.0"
+
+	// HOST-RESOURCES-MIB hrSWInstalledName, index 1 = the OS entry (the simulator's
+	// hrSWInstalled row 1). Value "OSName OSVersion" (e.g. "Ubuntu 22.04").
+	OIDHrSWInstalledOSName = "1.3.6.1.2.1.25.6.3.1.2.1"
 
 	// IF-MIB — ifTable (columnar, walk from prefix)
 	OIDIfTable        = "1.3.6.1.2.1.2.2"

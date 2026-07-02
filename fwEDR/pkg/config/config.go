@@ -96,7 +96,6 @@ type DiscoveryConfig struct {
 	IntervalHours    int      `yaml:"interval_hours"`     // background rediscovery interval (hours). 0 = disabled (manual --rediscover only)
 	TargetCacheHours int      `yaml:"target_cache_hours"` // skip sweep on startup if targets.json is younger than this (default 24)
 	EnrichmentPaceMs int      `yaml:"enrichment_pace_ms"` // delay between per-target ipAdEntAddr walks during background enrichment (default 200)
-	Enrich           bool     `yaml:"enrich"`             // run the post-walk ipAdEntAddr enrichment pass (interface IPs + OOB/loopback). default true; set false to stay idle/trap-driven after the one-shot walk
 }
 
 // SNMPConfig holds global SNMP defaults; per-target config can override.
@@ -111,17 +110,60 @@ type DiscoveryConfig struct {
 // PollInterval is kept for backwards compatibility and seeds the FAST tier
 // when FastIntervalMs is unset.
 type SNMPConfig struct {
-	Community          string `yaml:"community"`
-	Version            int    `yaml:"version"`
-	V3                 SNMPV3 `yaml:"v3"`
+	Community string `yaml:"community"`
+	Version   int    `yaml:"version"`
+	V3        SNMPV3 `yaml:"v3"`
 	// ProfilePath points at an SNMP OID profile file that overrides the device-family
 	// enterprise mappings (PDU/generator/UPS trees) for real hardware. Empty = the
 	// built-in "simulator" profile (unchanged behavior). See internal/snmp/profile.go.
 	ProfilePath string `yaml:"profile_path"`
+
+	// Walk-once GET polling (docs/SNMP_POLL_REDESIGN.md). When enabled, fixed-OID
+	// device types (pdu/generator/ups) are polled by a cheap GET of a cached OID
+	// plan on a per-class interval, instead of re-walking tables. A SINGLE worker
+	// polls one device at a time (O(N)/cycle) through the normal pollSNMP guards.
+	// Flag-gated; default OFF so behavior is unchanged until enabled + VM-tested.
+	//
+	//   PlanPollEnabled     — master switch for the plan poller.
+	//   PlanPowerIntervalMs — cadence for the power class (pdu/gen/ups). default 300000.
+	//   OIDCache            — "memory" (default, L1 only) | "redis" (L1 + L2 persist).
+	//   RedisAddr/Password/DB — used only when OIDCache="redis".
+	PlanPollEnabled      bool   `yaml:"plan_poll_enabled"`
+	PlanPowerIntervalMs  int    `yaml:"plan_power_interval_ms"`  // pdu/generator/ups. default 300000
+	PlanServerIntervalMs int    `yaml:"plan_server_interval_ms"` // server cpu/mem/storage. default 300000
+	PlanEnvIntervalMs    int    `yaml:"plan_env_interval_ms"`    // sensor + server temp. default 300000
+	OIDCache             string `yaml:"oid_cache"`
+	RedisAddr            string `yaml:"redis_addr"`
+	RedisPassword        string `yaml:"redis_password"`
+	RedisDB              int    `yaml:"redis_db"`
+
+	// Light-telemetry sweep + daily full walk. Both are driven by a SINGLE
+	// background worker each that polls devices ONE AT A TIME (O(N) per cycle, never
+	// a burst) through the normal pollSNMP guards (rate limiter, socket cap,
+	// breaker, DCS-down gate). 0 disables a loop.
+	//
+	//   TelemetrySweepMs   — cover every environment device (pdu/sensor/ups/
+	//                        generator/server temp+storage) with the light ENVIRONMENT
+	//                        tier once per this window; spacing = window/N. Keeps env
+	//                        metrics a live series and self-heals a device that missed
+	//                        its startup walk (e.g. a generator). default 0 (off).
+	//   FullWalkIntervalMs — run the HEAVY tiers (interface counters + LLDP topology +
+	//                        HR) for every device once per this interval. default 0
+	//                        (off); set 86400000 for once-a-day.
+	//   FullWalkSpreadMs   — spread one daily full walk over this window so it too is a
+	//                        one-at-a-time trickle. default 1800000 (30 min).
+	//   SweepMinSpacingMs  — floor on per-device spacing for both loops so a huge fleet
+	//                        can never exceed a safe per-second rate. default 250.
+	//
+	// Adaptive backoff: the light sweep widens its spacing when polls start failing
+	// (gets LIGHTER under stress) and narrows back to base on recovery — so it can
+	// never spiral the VM. See runTelemetrySweep.
+	TelemetrySweepMs   int    `yaml:"telemetry_sweep_ms"`
+	FullWalkIntervalMs int    `yaml:"full_walk_interval_ms"`
+	FullWalkSpreadMs   int    `yaml:"full_walk_spread_ms"`
+	SweepMinSpacingMs  int    `yaml:"sweep_min_spacing_ms"`
 	PollInterval       int    `yaml:"poll_interval_ms"`     // legacy; seeds fast tier if fast_interval_ms unset
 	FastIntervalMs     int    `yaml:"fast_interval_ms"`     // default 30000
-	MediumIntervalMs   int    `yaml:"medium_interval_ms"`   // default 120000
-	SlowIntervalMs     int    `yaml:"slow_interval_ms"`     // default 300000
 	TopologyIntervalMs int    `yaml:"topology_interval_ms"` // default 600000 — LLDP refresh tier
 	TrapAddr           string `yaml:"trap_addr"`
 	Timeout            int    `yaml:"timeout_ms"`
@@ -378,8 +420,6 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	cfg.SNMP.Version = 2
 	cfg.SNMP.PollInterval = 30000
 	cfg.SNMP.FastIntervalMs = 30000
-	cfg.SNMP.MediumIntervalMs = 120000
-	cfg.SNMP.SlowIntervalMs = 300000
 	cfg.SNMP.TopologyIntervalMs = 600000
 	cfg.SNMP.Timeout = 2000
 	cfg.SNMP.Retries = 1
@@ -394,8 +434,7 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	cfg.Publisher.BatchSize = 512
 	cfg.Publisher.FlushIntervalMs = 200
 	cfg.Publisher.MaxInFlight = 8
-	cfg.Discovery.Enrich = true // default on; YAML "enrich: false" overrides
-	cfg.SNMP.WalkMedium = true  // default on; full walk unless YAML overrides
+	cfg.SNMP.WalkMedium = true // default on; full walk unless YAML overrides
 	cfg.SNMP.WalkSlow = true
 	cfg.SNMP.WalkTopology = true
 	cfg.BACnet.Enabled = true // default on; YAML "enabled: false" overrides
@@ -462,12 +501,6 @@ func LoadEDR(path string) (*EDRConfig, error) {
 			cfg.SNMP.FastIntervalMs = 30000
 		}
 	}
-	if cfg.SNMP.MediumIntervalMs <= 0 {
-		cfg.SNMP.MediumIntervalMs = 120000
-	}
-	if cfg.SNMP.SlowIntervalMs <= 0 {
-		cfg.SNMP.SlowIntervalMs = 300000
-	}
 	if cfg.SNMP.TopologyIntervalMs <= 0 {
 		cfg.SNMP.TopologyIntervalMs = 600000
 	}
@@ -479,6 +512,13 @@ func LoadEDR(path string) (*EDRConfig, error) {
 	}
 	if cfg.SNMP.WalkRetryIntervalMs <= 0 {
 		cfg.SNMP.WalkRetryIntervalMs = 30000
+	}
+	// Sweep defaults (the loops themselves stay off until their interval is set).
+	if cfg.SNMP.FullWalkSpreadMs <= 0 {
+		cfg.SNMP.FullWalkSpreadMs = 1800000 // spread a daily full walk over 30 min
+	}
+	if cfg.SNMP.SweepMinSpacingMs <= 0 {
+		cfg.SNMP.SweepMinSpacingMs = 250
 	}
 	if cfg.SNMP.BreakerCooldownMs <= 0 {
 		cfg.SNMP.BreakerCooldownMs = 30000

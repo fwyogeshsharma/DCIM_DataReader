@@ -11,7 +11,7 @@ dcs:
     insecure: true
 
 queue:
-  max_bytes: 536870912  # 512 MB
+  max_bytes: 134217728  # 128 MB — bounds EDR memory on the 4GB VM; backpressure pauses collection at 75% usage before it fills
 
 # EDR → DCS batching. Higher max_in_flight + batch_size drain the local queue
 # faster than the gNMI/SNMP producers fill it, so it never reaches max_bytes and
@@ -35,7 +35,6 @@ discovery:
   snmp_agent: "127.0.0.1"
   seed_ip:    "192.168.0.7"
   interval_hours: 0      # 0 = no auto-rediscovery; EDR stays idle after the one-shot walk (manual rediscovery via --rediscover)
-  enrich:         true   # one-time post-walk ipAdEntAddr pass — populates interface_addresses + OOB/loopback IPs (its log noise is demoted to Debug)
 
 snmp:
   community:           "public"
@@ -53,9 +52,11 @@ snmp:
   walk_slow:           false  # SKIP heavy counter/HR/UPS/sensor walks — biggest SNMP load, not needed for inventory or link topology
   walk_sensors:        true   # environment sensors ONLY (temperature/humidity from sensor+PDU devices) for the heatmap — light, independent of walk_slow
   walk_server_health:  false  # servers polled via Redfish (see redfish: block), not SNMP
+  telemetry_sweep_ms:    0         # DISABLED — continuous sweep removed (was heavy + triggered a crash); one-shot walk only
+  full_walk_interval_ms: 0         # DISABLED
   breaker_threshold:   3
   breaker_cooldown_ms: 30000
-  metrics_log_interval_ms: 0   # 0 = no periodic "snmp poll metrics" log line (quiet once idle)
+  metrics_log_interval_ms: 60000   # print the per-tier poll summary each minute so the sweep/full-walk load is observable during VM testing
   # DECOUPLED: EDR is a pure external collector. It polls the simulator's OWN
   # snmpsim responder on 127.0.0.1:161 — that process listens on 0.0.0.0:161 and
   # routes each request to the right device by the SNMP community (= device mgmt

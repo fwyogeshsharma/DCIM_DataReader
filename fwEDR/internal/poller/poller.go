@@ -47,6 +47,11 @@ type Poller struct {
 	// when unset. Shared read-only by every per-poll Collector.
 	profile *snmp.Profile
 
+	// planStore caches per-device poll plans for the walk-once GET poller. MemStore
+	// (L1) always; RedisStore (L1+L2) when oid_cache=redis. Nil when plan polling
+	// is disabled.
+	planStore snmp.PlanStore
+
 	// socketSem is the SINGLE global cap on concurrent SNMP UDP sockets. EVERY tier
 	// (fast + heavy) must hold a token before snmp.NewClient or any SNMP UDP op, so
 	// total in-flight sockets never exceeds its size — this is what prevents the
@@ -170,6 +175,18 @@ func New(
 	}
 	log.Info("snmp profile loaded", zap.String("name", profile.Name),
 		zap.String("path", snmpCfg.ProfilePath))
+	// Poll-plan cache for the walk-once GET poller (built only when enabled).
+	var planStore snmp.PlanStore
+	if snmpCfg.PlanPollEnabled {
+		if snmpCfg.OIDCache == "redis" && snmpCfg.RedisAddr != "" {
+			planStore = snmp.NewRedisStore(snmpCfg.RedisAddr, snmpCfg.RedisPassword,
+				snmpCfg.RedisDB, 25*time.Hour, log)
+			log.Info("plan poller: redis oid cache", zap.String("addr", snmpCfg.RedisAddr))
+		} else {
+			planStore = snmp.NewMemStore()
+			log.Info("plan poller: in-memory oid cache")
+		}
+	}
 	p := &Poller{
 		targets:   targets,
 		snmpCfg:   snmpCfg,
@@ -188,6 +205,7 @@ func New(
 		pooled:    pooled,
 		poolSize:  poolSize,
 		profile:   profile,
+		planStore: planStore,
 	}
 	if snmpCfg.RateLimitPerSec > 0 {
 		p.limiter = newRateLimiter(snmpCfg.RateLimitPerSec)
@@ -235,6 +253,14 @@ func (p *Poller) Run(ctx context.Context) {
 
 	// Start gNMI once SNMP discovery has completed (or a safety timeout elapses).
 	go p.startGNMIAfterDiscovery(ctx, &walkWG)
+	// Light-telemetry trickle + daily full walk. Each is a SINGLE background worker
+	// polling one device at a time (O(N)/cycle, no burst); both self-disable when
+	// their interval is 0.
+	go p.runTelemetrySweep(ctx)
+	go p.runDailyFullWalk(ctx)
+	// Walk-once GET poller (flag-gated). Single worker, GET-based, self-disables
+	// when plan_poll_enabled is false.
+	go p.runPlanScheduler(ctx)
 	// Block here until shutdown is signalled.
 	<-ctx.Done()
 
@@ -252,6 +278,137 @@ func (p *Poller) Run(ctx context.Context) {
 
 	// Release reused SNMP sockets.
 	p.closeConns()
+}
+
+// isEnvSweepType reports whether a device type carries light ENVIRONMENT-tier
+// telemetry (scalar/sensor reads) that the trickle sweep should refresh.
+func isEnvSweepType(dt string) bool {
+	switch dt {
+	case "server", "sensor", "pdu", "floor_pdu", "generator", "ups":
+		return true
+	}
+	return false
+}
+
+// runTelemetrySweep keeps the light ENVIRONMENT tier fresh for every environment
+// device by polling them ONE AT A TIME, evenly spread across TelemetrySweepMs.
+//
+// It is a single goroutine: it holds a precomputed device slice and advances a
+// round-robin index, so each full cycle is exactly N polls — O(N) per cycle, never
+// O(N^2), and never more than one sweep poll in flight. Every poll still passes the
+// global rate limiter / socket cap / breaker / DCS-down gate via pollSNMP.
+//
+// Adaptive backoff: on a failed poll the inter-device spacing grows (×1.5, capped),
+// on success it decays back toward base (×0.9). So under stress the sweep slows
+// itself DOWN — it can never spiral the VM. Disabled when TelemetrySweepMs <= 0.
+func (p *Poller) runTelemetrySweep(ctx context.Context) {
+	cycle := time.Duration(p.snmpCfg.TelemetrySweepMs) * time.Millisecond
+	if cycle <= 0 {
+		return
+	}
+	var devs []*target.Target
+	for _, t := range p.targets {
+		if isEnvSweepType(t.DeviceType) {
+			devs = append(devs, t)
+		}
+	}
+	if len(devs) == 0 {
+		return
+	}
+
+	minSpacing := time.Duration(p.snmpCfg.SweepMinSpacingMs) * time.Millisecond
+	if minSpacing <= 0 {
+		minSpacing = 250 * time.Millisecond
+	}
+	base := cycle / time.Duration(len(devs))
+	if base < minSpacing {
+		base = minSpacing
+	}
+	const maxSpacing = 20 * time.Second
+	spacing := base
+
+	p.log.Info("telemetry sweep started",
+		zap.Int("env_devices", len(devs)),
+		zap.Duration("cycle", cycle),
+		zap.Duration("base_spacing", base))
+
+	for i := 0; ; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(spacing):
+		}
+		t := devs[i%len(devs)]
+		ok := p.pollSNMP(ctx, t, snmp.TierEnvironment)
+		// AIMD-style backoff: gentle increase on failure, gentle decay on success.
+		if ok {
+			if spacing > base {
+				if spacing = time.Duration(float64(spacing) * 0.9); spacing < base {
+					spacing = base
+				}
+			}
+		} else {
+			if spacing = time.Duration(float64(spacing) * 1.5); spacing > maxSpacing {
+				spacing = maxSpacing
+			}
+		}
+	}
+}
+
+// runDailyFullWalk runs the HEAVY inventory tiers (interface counters, LLDP
+// topology, HR) for every device once per FullWalkIntervalMs, spread over
+// FullWalkSpreadMs so even the periodic full walk is a one-at-a-time trickle.
+// O(N) per run. Disabled when FullWalkIntervalMs <= 0.
+func (p *Poller) runDailyFullWalk(ctx context.Context) {
+	interval := time.Duration(p.snmpCfg.FullWalkIntervalMs) * time.Millisecond
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.fullWalkOnce(ctx)
+		}
+	}
+}
+
+// fullWalkOnce walks every device's heavy tiers once, one device at a time, spaced
+// across FullWalkSpreadMs. Single loop over the target slice → O(N). Unlike the
+// steady walk_* flags (which govern the one-shot discovery walk), the daily full
+// walk always runs Medium+Topology+Slow — that is the point of a periodic full
+// refresh of counters and topology that are otherwise skipped in steady state.
+func (p *Poller) fullWalkOnce(ctx context.Context) {
+	n := len(p.targets)
+	if n == 0 {
+		return
+	}
+	spread := time.Duration(p.snmpCfg.FullWalkSpreadMs) * time.Millisecond
+	if spread <= 0 {
+		spread = 30 * time.Minute
+	}
+	minSpacing := time.Duration(p.snmpCfg.SweepMinSpacingMs) * time.Millisecond
+	if minSpacing <= 0 {
+		minSpacing = 250 * time.Millisecond
+	}
+	spacing := spread / time.Duration(n)
+	if spacing < minSpacing {
+		spacing = minSpacing
+	}
+	p.log.Info("daily full walk started", zap.Int("devices", n), zap.Duration("spacing", spacing))
+	for _, t := range p.targets {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(spacing):
+		}
+		p.pollSNMP(ctx, t, snmp.TierMedium)
+		p.pollSNMP(ctx, t, snmp.TierTopology)
+		p.pollSNMP(ctx, t, snmp.TierSlow)
+	}
 }
 
 // startGNMIAfterDiscovery blocks until the SNMP discovery walk wave completes
@@ -563,10 +720,12 @@ func (p *Poller) closeConns() {
 // succeeded and its packets were emitted. The boolean lets walkAll know whether
 // the FAST liveness tier answered so the one-shot walker can stop retrying.
 func (p *Poller) pollSNMP(ctx context.Context, t *target.Target, tier snmp.Tier) bool {
-	// DCS down: pause ALL collection (including the FAST heartbeat) so the local
-	// queue can't grow without bound while nothing can be shipped. Resumes
-	// automatically once the publisher's probe sees DCS again.
-	if p.gate != nil && p.gate.DCSDown() {
+	// Pause ALL collection (including the FAST heartbeat) when the pipeline can't
+	// keep up — DCS unreachable OR the local queue is filling faster than it drains
+	// (slow/overwhelmed DCS/aggregator). Prevents the queue growing without bound.
+	// Resumes automatically once DCS recovers / the queue drains below its
+	// low-water mark.
+	if p.gate != nil && p.gate.ShouldPause() {
 		return false
 	}
 	// Global pause applies to heavy walks only. The FAST heartbeat must keep

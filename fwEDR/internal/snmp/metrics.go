@@ -3,6 +3,7 @@ package snmp
 import (
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -176,6 +177,14 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 				pkts = append(pkts, p...)
 			}
 		case "ups":
+			// Core UPS-MIB battery + input/output group (status, charge, runtime,
+			// voltages, currents, load). Placed here — not only the SLOW tier — so
+			// the primary UPS electrical telemetry rides the light tier and is
+			// collected even when walk_slow is off. ~1 GET + 4 small walks; cheap
+			// (few UPS devices).
+			if p, err := c.collectUPS(); err == nil {
+				pkts = append(pkts, p...)
+			}
 			if p, err := c.collectUPSTemp(); err == nil {
 				pkts = append(pkts, p...)
 			}
@@ -220,7 +229,13 @@ func (c *Collector) Collect(tier Tier) ([]*v1.TelemetryPacket, error) {
 // ─── system ──────────────────────────────────────────────────────────────────
 
 func (c *Collector) collectSystem() ([]*v1.TelemetryPacket, error) {
-	pkt, err := c.client.Get([]string{OIDSysUpTime, OIDSysName, OIDSysDescr})
+	// One GET fetches liveness (uptime), identity (sysName), and the device
+	// metadata columns: sysDescr → sys_description, sysObjectID → sys_oid, and
+	// hrSWInstalledName (index 1) → os_name/os_version. Non-OS devices return
+	// NoSuchInstance for the hrSW OID — harmless, just skipped.
+	pkt, err := c.client.Get([]string{
+		OIDSysUpTime, OIDSysName, OIDSysDescr, OIDSysObjectID, OIDHrSWInstalledOSName,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -229,10 +244,19 @@ func (c *Collector) collectSystem() ([]*v1.TelemetryPacket, error) {
 	// (e.g. in the simulator) thus propagates to the DB without an EDR restart or
 	// a topology-file edit. DCS keys identity on mgmt_ip, so the row is renamed
 	// in place rather than duplicated.
-	var sysName string
+	var sysName, sysDescr, sysOID, osFull string
 	for _, p := range pkt.Variables {
-		if strings.TrimPrefix(p.Name, ".") == OIDSysName {
+		switch strings.TrimPrefix(p.Name, ".") {
+		case OIDSysName:
 			sysName = PDUString(p)
+		case OIDSysDescr:
+			sysDescr = PDUString(p)
+		case OIDSysObjectID:
+			sysOID = PDUString(p)
+		case OIDHrSWInstalledOSName:
+			if p.Type != gosnmp.NoSuchInstance && p.Type != gosnmp.NoSuchObject && p.Type != gosnmp.Null {
+				osFull = PDUString(p)
+			}
 		}
 	}
 	// Simulator: the 161 .snmprec sysName is patched lazily (rename-time patch is
@@ -249,16 +273,95 @@ func (c *Collector) collectSystem() ([]*v1.TelemetryPacket, error) {
 	if sysName != "" {
 		c.target.SetHostname(sysName)
 	}
+	// Enrich the uptime packet's meta with the device-metadata columns DCS keys on
+	// (registration/upsert reads these). Empty values are omitted so a device that
+	// doesn't serve one keeps its existing column.
+	meta := c.hostMeta()
+	if sysOID != "" {
+		meta["sys_oid"] = sysOID
+	}
+	if sysDescr != "" {
+		meta["sys_description"] = sysDescr
+		// Parse sysDescr for the OS name + version — the way an enterprise poller
+		// does. Network gear (e.g. SONiC switches) carries the OS in sysDescr and
+		// has no hrSWInstalled entry, so this populates devices.os_name/os_version
+		// for those devices too.
+		osName, osVer := parseSysDescr(sysDescr)
+		// hrSWInstalledName (servers) gives a cleaner OS name/version when present.
+		if osFull != "" {
+			osName, osVer = splitOSName(osFull)
+		}
+		setMeta(meta, "os_name", osName)
+		setMeta(meta, "platform_version", osVer) // DCS maps platform_version → os_version
+	} else if osFull != "" {
+		osName, osVer := splitOSName(osFull)
+		setMeta(meta, "os_name", osName)
+		setMeta(meta, "platform_version", osVer)
+	}
 	var pkts []*v1.TelemetryPacket
 	for _, p := range pkt.Variables {
 		// gosnmp PDU names have a leading "." — strip before comparing.
 		name := strings.TrimPrefix(p.Name, ".")
 		switch OIDColumn(name) {
 		case strings.TrimSuffix(OIDSysUpTime, ".0"), OIDSysUpTime:
-			pkts = append(pkts, c.newMetric("system.uptime_centiseconds", "", ToFloat64(p), c.hostMeta()))
+			pkts = append(pkts, c.newMetric("system.uptime_centiseconds", "", ToFloat64(p), meta))
 		}
 	}
 	return pkts, nil
+}
+
+// splitOSName splits an hrSWInstalledName like "Ubuntu 22.04" into name + version
+// on the last space. No space → the whole string is the name, version empty.
+func splitOSName(full string) (name, version string) {
+	if i := strings.LastIndex(full, " "); i >= 0 {
+		return full[:i], full[i+1:]
+	}
+	return full, ""
+}
+
+var (
+	reKernel  = regexp.MustCompile(`(?i)\bkernel:\s*[^\s,]+`)
+	reVersion = regexp.MustCompile(`\b\d+\.\d+(?:\.\d+)*(?:\([0-9A-Za-z.]+\))?\b`)
+)
+
+// parseSysDescr derives the OS name + version from an SNMP sysDescr string, the
+// way an enterprise poller does. sysDescr is free-form and vendor-specific, so
+// this is best-effort: the version is the first version-like token (excluding the
+// kernel version), and the name is the text before it with vendor/distribution
+// boilerplate trimmed. Examples:
+//
+//	"Enterprise SONiC Distribution by Dell Technologies - 4.2.0 - HwSku: ... - Kernel: 5.10.0-18-2-amd64"
+//	  → "Enterprise SONiC", "4.2.0"
+//	"Cisco IOS Software, ..., Version 15.2(4)M ..." → "Cisco IOS Software", "15.2(4)"
+func parseSysDescr(d string) (osName, osVersion string) {
+	// Strip the "Kernel: X.Y.Z" segment first so a kernel version isn't mistaken
+	// for the OS version.
+	osVersion = reVersion.FindString(reKernel.ReplaceAllString(d, ""))
+
+	head := d
+	if osVersion != "" {
+		if i := strings.Index(d, osVersion); i >= 0 {
+			head = d[:i]
+		}
+	}
+	// Cut at the first metadata keyword so distribution/HwSku/Version boilerplate
+	// is dropped ("Enterprise SONiC Distribution by Dell..." → "Enterprise SONiC").
+	low := strings.ToLower(head)
+	for _, kw := range []string{" distribution", " hwsku", " kernel", ",", " version"} {
+		if i := strings.Index(low, kw); i >= 0 {
+			head, low = head[:i], low[:i]
+		}
+	}
+	osName = strings.TrimSpace(strings.Trim(strings.TrimSpace(head), "-"))
+	return
+}
+
+// setMeta sets a meta key only when the value is non-empty (so a device missing a
+// field keeps its existing column value on upsert).
+func setMeta(m map[string]string, k, v string) {
+	if v != "" {
+		m[k] = v
+	}
 }
 
 // ─── interfaces ──────────────────────────────────────────────────────────────
